@@ -4,7 +4,7 @@ use anyhow::{Context, anyhow};
 use bytes::Bytes;
 use futures::StreamExt;
 use retina::{
-    client::{Credentials, PlayOptions, Session, SessionOptions, SetupOptions},
+    client::{PlayOptions, Session, SessionOptions, SetupOptions},
     codec::{CodecItem, FrameFormat},
 };
 use rtc::{
@@ -30,7 +30,6 @@ use rtc::{
 };
 use tokio::sync::Notify;
 use tracing::{info, warn};
-use url::Url;
 use vms_domain::{LiveSessionAnswer, RtcIceServerConfig};
 use webrtc::media_stream::Track;
 use webrtc::{
@@ -238,20 +237,8 @@ async fn forward_rtsp_h264(
     done: Arc<Notify>,
     max_duration: Duration,
 ) -> anyhow::Result<()> {
-    let mut url = Url::parse(&raw_url).context("parse RTSP live URL")?;
-    let embedded_username = (!url.username().is_empty()).then(|| url.username().to_owned());
-    let embedded_password = url.password().map(ToOwned::to_owned);
-    if embedded_username.is_some() {
-        url.set_username("")
-            .map_err(|_| anyhow!("clear RTSP username"))?;
-    }
-    if embedded_password.is_some() {
-        url.set_password(None)
-            .map_err(|_| anyhow!("clear RTSP password"))?;
-    }
-    let username = username.or(embedded_username).unwrap_or_default();
-    let password = password.or(embedded_password).unwrap_or_default();
-    let creds = (!username.is_empty()).then_some(Credentials { username, password });
+    let (url, creds) =
+        crate::rtsp::split_credentials(&raw_url, username.as_deref(), password.as_deref())?;
 
     let mut session = tokio::time::timeout(
         Duration::from_secs(8),
@@ -311,13 +298,13 @@ async fn forward_rtsp_h264(
                     let timestamp = frame.timestamp();
                     let next_data = Bytes::copy_from_slice(frame.data());
                     if let Some((data, previous_timestamp)) = pending.replace((next_data, timestamp)) {
-                        let ticks = timestamp.timestamp().saturating_sub(previous_timestamp.timestamp());
-                        let clock = f64::from(previous_timestamp.clock_rate().get());
-                        let duration = if ticks > 0 {
-                            Duration::from_secs_f64((ticks as f64 / clock).clamp(0.005, 0.5))
-                        } else {
-                            Duration::from_millis(33)
-                        };
+                        let ticks = timestamp
+                            .timestamp()
+                            .saturating_sub(previous_timestamp.timestamp());
+                        let duration = crate::rtsp::frame_duration(
+                            ticks,
+                            previous_timestamp.clock_rate().get(),
+                        );
                         track.sample_writer(track_ssrc, payload_type).write_sample(&Sample {
                             data, duration, ..Default::default()
                         }).await?;

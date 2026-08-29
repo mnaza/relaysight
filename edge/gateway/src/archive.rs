@@ -3,7 +3,7 @@ use std::{num::NonZeroU32, time::Duration};
 use anyhow::{Context, anyhow};
 use futures::StreamExt;
 use retina::{
-    client::{Credentials, PlayOptions, Session, SessionOptions, SetupOptions},
+    client::{PlayOptions, Session, SessionOptions, SetupOptions},
     codec::{CodecItem, FrameFormat, ParametersRef},
 };
 use shiguredo_mp4::{
@@ -12,7 +12,6 @@ use shiguredo_mp4::{
     mux::{Fmp4SegmentMuxer, Sample},
 };
 use tokio::time::timeout;
-use url::Url;
 
 #[derive(Debug, Clone)]
 pub struct CmafSegment {
@@ -55,7 +54,7 @@ pub async fn record_h264_cmaf(
     total_duration: Duration,
     target_segment_duration: Duration,
 ) -> anyhow::Result<CmafRecording> {
-    let (url, creds) = clean_rtsp_url(raw_url, username, password)?;
+    let (url, creds) = crate::rtsp::split_credentials(raw_url, username, password)?;
     let options = SessionOptions::default()
         .creds(creds)
         .user_agent(format!("vms-gateway/{}", env!("CARGO_PKG_VERSION")));
@@ -253,34 +252,6 @@ pub async fn record_h264_cmaf(
     })
 }
 
-fn clean_rtsp_url(
-    raw_url: &str,
-    username: Option<&str>,
-    password: Option<&str>,
-) -> anyhow::Result<(Url, Option<Credentials>)> {
-    let mut url = Url::parse(raw_url).context("parse RTSP URL")?;
-    let embedded_username = (!url.username().is_empty()).then(|| url.username().to_owned());
-    let embedded_password = url.password().map(ToOwned::to_owned);
-    if embedded_username.is_some() {
-        url.set_username("")
-            .map_err(|_| anyhow!("unable to clear RTSP username"))?;
-    }
-    if embedded_password.is_some() {
-        url.set_password(None)
-            .map_err(|_| anyhow!("unable to clear RTSP password"))?;
-    }
-    let username = username
-        .map(ToOwned::to_owned)
-        .or(embedded_username)
-        .unwrap_or_default();
-    let password = password
-        .map(ToOwned::to_owned)
-        .or(embedded_password)
-        .unwrap_or_default();
-    let creds = (!username.is_empty()).then_some(Credentials { username, password });
-    Ok((url, creds))
-}
-
 fn split_on_keyframes(frames: &[EncodedFrame], target_ticks: i64) -> Vec<(usize, usize)> {
     let mut groups = Vec::new();
     let mut start = 0_usize;
@@ -392,7 +363,8 @@ fn read_avcc_nal(data: &[u8], cursor: &mut usize) -> anyhow::Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{EncodedFrame, parse_avcc, split_on_keyframes};
+    use super::{EncodedFrame, parse_avcc, split_on_keyframes, ticks_to_ms};
+    use std::num::NonZeroU32;
 
     #[test]
     fn parses_avcc_sps_pps() {
@@ -429,5 +401,50 @@ mod tests {
             split_on_keyframes(&frames, 8000),
             vec![(0, 3), (3, 6), (6, 7)]
         );
+    }
+
+    #[test]
+    fn an_empty_frame_list_produces_no_segments() {
+        assert!(split_on_keyframes(&[], 90_000).is_empty());
+    }
+
+    #[test]
+    fn a_long_gop_still_yields_one_segment_rather_than_none() {
+        // Segments may only start on a keyframe. A camera with a GOP longer than
+        // the target must produce one long segment, never zero — dropping the
+        // recording entirely is the worse failure.
+        let frames: Vec<_> = (0..10)
+            .map(|i| EncodedFrame {
+                timestamp: i * 3000,
+                keyframe: i == 0,
+                data: Vec::new(),
+            })
+            .collect();
+        let groups = split_on_keyframes(&frames, 9_000);
+        assert_eq!(groups, vec![(0, 10)]);
+    }
+
+    #[test]
+    fn a_trailing_partial_segment_is_kept() {
+        // Frames after the last split must still be written out.
+        let frames: Vec<_> = [(0, true), (90_000, true), (93_000, false)]
+            .into_iter()
+            .map(|(timestamp, keyframe)| EncodedFrame {
+                timestamp,
+                keyframe,
+                data: Vec::new(),
+            })
+            .collect();
+        let groups = split_on_keyframes(&frames, 90_000);
+        assert_eq!(groups, vec![(0, 1), (1, 3)]);
+    }
+
+    #[test]
+    fn ticks_convert_without_overflowing_at_long_durations() {
+        // ticks * 1000 exceeds u64 well inside a plausible recording, hence the
+        // u128 widening; this pins it.
+        let clock = NonZeroU32::new(90_000).unwrap();
+        assert_eq!(ticks_to_ms(90_000, clock), 1_000);
+        assert_eq!(ticks_to_ms(u64::MAX / 1000, clock), (u64::MAX / 1000) / 90);
     }
 }

@@ -1,9 +1,8 @@
 use std::time::Duration;
 
-use anyhow::{Context, anyhow};
+use anyhow::Context;
 use digest_auth::AuthContext;
 use reqwest::{Client, StatusCode, header::WWW_AUTHENTICATE};
-use url::Url;
 
 pub struct Snapshot {
     pub bytes: Vec<u8>,
@@ -18,17 +17,8 @@ pub async fn fetch(
     configured_username: Option<&str>,
     configured_password: Option<&str>,
 ) -> anyhow::Result<Snapshot> {
-    let mut url = Url::parse(raw_url).context("parse ONVIF snapshot URL")?;
-    let embedded_username = (!url.username().is_empty()).then(|| url.username().to_owned());
-    let embedded_password = url.password().map(ToOwned::to_owned);
-    if embedded_username.is_some() {
-        url.set_username("")
-            .map_err(|_| anyhow!("clear snapshot username"))?;
-    }
-    if embedded_password.is_some() {
-        url.set_password(None)
-            .map_err(|_| anyhow!("clear snapshot password"))?;
-    }
+    let (url, embedded_username, embedded_password) =
+        crate::rtsp::strip_userinfo(raw_url, "ONVIF snapshot")?;
 
     let username = configured_username
         .map(ToOwned::to_owned)

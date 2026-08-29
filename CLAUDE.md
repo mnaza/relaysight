@@ -39,8 +39,10 @@ node --check web/theme.js && node --check web/landing.js && node --check web/das
 
 - **Compiles.** Whole workspace plus `commercial/control-plane`.
 - `clippy -- -D warnings` **clean**; `cargo fmt` clean.
-- **5 tests, all passing — for ~3,300 lines of Rust.** This is the largest gap in the
-  repository. Nothing in the media path, the gateway protocol or the API has a test.
+- **27 tests, all passing.** The media path now has coverage where the logic is pure:
+  ONVIF profile selection, credential handling, RTP frame duration, keyframe
+  segmentation, avcC parsing, telemetry redaction. **The API and the gateway command
+  protocol still have none**, and nothing exercises an actual RTSP session.
 - Never run against a real camera. Never run under Docker Compose.
 
 The three fixes that made it build, all in `edge/gateway/src/live.rs`, are worth knowing
@@ -66,7 +68,15 @@ because the same mistake will recur:
    start, or out of band, will break it. Hikvision and Dahua at minimum need real
    hardware testing. This tail is the actual moat in this market and it is ground out one
    vendor at a time.
-3. **No tests.** See above.
+3. **Thin coverage where it cannot be pure.** The API, the gateway's command loop and
+   any real RTSP session are untested; that needs a fake camera (an RTSP server serving a
+   canned H.264 file) rather than more unit tests.
+
+**Every path that touches a camera URL goes through `rtsp::strip_userinfo`.** Live,
+archive and the HTTP snapshot each used to carry their own copy, and `redacted_endpoint`
+had a fourth that discarded the errors from `set_username`/`set_password` — which meant a
+URL like `admin:pw@junk`, which parses but cannot hold a host, was published to telemetry
+with the password intact. Keep it one implementation.
 
 Fields marked `#[allow(dead_code)]` in `onvif.rs` and `rtsp.rs` are parsed off the wire
 and kept deliberately — each comment names the feature that would consume them. They are
