@@ -307,4 +307,69 @@ mod tests {
         // hold a host, so clearing fails. Erroring beats passing it through.
         assert!(strip_userinfo("admin:hunter2@junk", "test").is_err());
     }
+
+    // ---- end to end, against the fake camera in `fake_camera.rs` ----
+
+    #[tokio::test]
+    async fn probe_reads_a_real_rtsp_session() {
+        // Everything above this line is pure logic. This is the first test that
+        // actually speaks RTSP, negotiates interleaved transport and depacketises
+        // H.264 — the part that could not be covered without hardware.
+        let camera = crate::fake_camera::FakeCamera::start(false).await.unwrap();
+        let metrics = super::probe(&camera.url, None, None, Duration::from_millis(400))
+            .await
+            .expect("probe a reachable camera");
+        // Retina normalises the encoding name, so telemetry carries "h264"
+        // lowercase. Anything comparing it must do so case-insensitively.
+        assert!(
+            metrics
+                .codec
+                .as_deref()
+                .is_some_and(|c| c.eq_ignore_ascii_case("h264")),
+            "unexpected codec {:?}",
+            metrics.codec
+        );
+        assert!(metrics.frames > 0, "no frames arrived");
+        assert!(metrics.bytes > 0);
+    }
+
+    #[tokio::test]
+    async fn probe_authenticates_when_the_camera_demands_it() {
+        let camera = crate::fake_camera::FakeCamera::start(true).await.unwrap();
+        let metrics = super::probe(
+            &camera.url,
+            Some("admin"),
+            Some("hunter2"),
+            Duration::from_millis(400),
+        )
+        .await
+        .expect("probe with credentials");
+        assert!(
+            metrics
+                .codec
+                .as_deref()
+                .is_some_and(|c| c.eq_ignore_ascii_case("h264"))
+        );
+    }
+
+    #[tokio::test]
+    async fn credentials_embedded_in_the_url_reach_the_camera() {
+        // The scrubbing must move them into the session, not drop them. A camera
+        // demanding auth is the only way to tell those two apart.
+        let camera = crate::fake_camera::FakeCamera::start(true).await.unwrap();
+        let with_creds = camera.url.replace("rtsp://", "rtsp://admin:hunter2@");
+        super::probe(&with_creds, None, None, Duration::from_millis(400))
+            .await
+            .expect("embedded credentials must still authenticate");
+    }
+
+    #[tokio::test]
+    async fn a_camera_demanding_auth_rejects_an_anonymous_probe() {
+        let camera = crate::fake_camera::FakeCamera::start(true).await.unwrap();
+        assert!(
+            super::probe(&camera.url, None, None, Duration::from_millis(400))
+                .await
+                .is_err()
+        );
+    }
 }

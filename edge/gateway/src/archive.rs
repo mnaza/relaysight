@@ -447,4 +447,72 @@ mod tests {
         assert_eq!(ticks_to_ms(90_000, clock), 1_000);
         assert_eq!(ticks_to_ms(u64::MAX / 1000, clock), (u64::MAX / 1000) / 90);
     }
+
+    // ---- end to end, against the fake camera in `fake_camera.rs` ----
+
+    #[tokio::test]
+    async fn recording_a_real_stream_produces_playable_fragments() {
+        // Exercises the whole archive path against genuine H.264: RTSP session,
+        // depacketisation, avcC construction from in-band parameter sets, and
+        // fMP4 segmenting. None of it was reachable before the fake camera.
+        let camera = crate::fake_camera::FakeCamera::start(false).await.unwrap();
+        let recording = super::record_h264_cmaf(
+            &camera.url,
+            None,
+            None,
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect("record from a reachable camera");
+
+        assert_eq!(recording.width, 320, "dimensions come from the SPS");
+        assert_eq!(recording.height, 240);
+        assert!(
+            recording.codec.starts_with("avc1."),
+            "codec string must be an RFC 6381 one for the player, got {}",
+            recording.codec
+        );
+        assert!(!recording.init.is_empty(), "no init segment");
+
+        // The fixture is three seconds with a keyframe every half second, so a
+        // one-second target must split it rather than emit a single blob.
+        assert!(
+            recording.segments.len() >= 2,
+            "expected several segments, got {}",
+            recording.segments.len()
+        );
+        assert!(recording.segments.iter().all(|s| !s.bytes.is_empty()));
+
+        // Segments must run in order and abut, or the player seeks into gaps.
+        for pair in recording.segments.windows(2) {
+            assert!(
+                pair[1].start_offset_ms >= pair[0].start_offset_ms,
+                "segments out of order"
+            );
+            assert_eq!(
+                pair[1].sequence,
+                pair[0].sequence + 1,
+                "sequence must be dense"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn recording_reports_failure_rather_than_an_empty_recording() {
+        // A camera that refuses the session must surface as an error; an empty
+        // recording would be stored as a successful one.
+        let camera = crate::fake_camera::FakeCamera::start(true).await.unwrap();
+        assert!(
+            super::record_h264_cmaf(
+                &camera.url,
+                None,
+                None,
+                std::time::Duration::from_secs(2),
+                std::time::Duration::from_secs(1),
+            )
+            .await
+            .is_err()
+        );
+    }
 }

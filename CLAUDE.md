@@ -39,10 +39,17 @@ node --check web/theme.js && node --check web/landing.js && node --check web/das
 
 - **Compiles.** Whole workspace plus `commercial/control-plane`.
 - `clippy -- -D warnings` **clean**; `cargo fmt` clean.
-- **27 tests, all passing.** The media path now has coverage where the logic is pure:
-  ONVIF profile selection, credential handling, RTP frame duration, keyframe
-  segmentation, avcC parsing, telemetry redaction. **The API and the gateway command
-  protocol still have none**, and nothing exercises an actual RTSP session.
+- **37 tests, all passing**, including six that speak real RTSP.
+  `src/fake_camera.rs` is a test-only RTSP server that serves
+  `fixtures/camera.h264` — three seconds of genuine H.264 made once with ffmpeg and
+  committed, so the build needs no encoder — over RTP interleaved on the TCP control
+  connection, with FU-A fragmentation and optional Basic auth. `rtsp::probe` and
+  `archive::record_h264_cmaf` are covered end to end against it: session negotiation,
+  depacketisation, avcC from in-band parameter sets, fMP4 segmenting, and the
+  credential paths including a camera that refuses anonymous access.
+  **Still uncovered: `live::start_h264`'s WebRTC half** — its RTSP half shares the
+  tested code, but nothing drives a peer connection. **The API and the gateway command
+  protocol have no tests at all.**
 - Never run against a real camera. Never run under Docker Compose.
 
 The three fixes that made it build, all in `edge/gateway/src/live.rs`, are worth knowing
@@ -68,9 +75,9 @@ because the same mistake will recur:
    start, or out of band, will break it. Hikvision and Dahua at minimum need real
    hardware testing. This tail is the actual moat in this market and it is ground out one
    vendor at a time.
-3. **Thin coverage where it cannot be pure.** The API, the gateway's command loop and
-   any real RTSP session are untested; that needs a fake camera (an RTSP server serving a
-   canned H.264 file) rather than more unit tests.
+3. **The API and the gateway command loop have no tests**, and neither does the WebRTC
+   side of the live path. The fake camera covers the RTSP side; the peer connection
+   needs a webrtc-rs peer standing in for the browser.
 
 **Every path that touches a camera URL goes through `rtsp::strip_userinfo`.** Live,
 archive and the HTTP snapshot each used to carry their own copy, and `redacted_endpoint`

@@ -1,4 +1,6 @@
 mod archive;
+#[cfg(test)]
+mod fake_camera;
 mod live;
 mod onvif;
 mod rtsp;
