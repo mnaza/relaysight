@@ -11,7 +11,7 @@ use tokio::{
     net::UdpSocket,
     time::{Instant, timeout},
 };
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 const WS_DISCOVERY_ADDR: &str = "239.255.255.250:3702";
@@ -65,7 +65,91 @@ pub struct CameraCandidate {
     pub firmware: Option<String>,
     pub profile: OnvifProfile,
     pub rtsp_uri: String,
+    /// RTSP URI of `live_profile`. Equals `rtsp_uri` when they are the same profile.
+    pub live_rtsp_uri: String,
     pub snapshot_uri: Option<String>,
+}
+
+async fn stream_uri(
+    client: &reqwest::Client,
+    media_service: &str,
+    credentials: Option<&Credentials>,
+    token: &str,
+) -> anyhow::Result<String> {
+    let body = format!(
+        "<trt:GetStreamUri><trt:StreamSetup><tt:Stream>RTP-Unicast</tt:Stream><tt:Transport><tt:Protocol>TCP</tt:Protocol></tt:Transport></trt:StreamSetup><trt:ProfileToken>{}</trt:ProfileToken></trt:GetStreamUri>",
+        xml_escape(token),
+    );
+    let xml = soap_post(
+        client,
+        media_service,
+        credentials,
+        MEDIA_WSDL,
+        "GetStreamUri",
+        &body,
+    )
+    .await?;
+    parse_first_text(&xml, "Uri").ok_or_else(|| anyhow!("camera returned no RTSP Uri"))
+}
+
+/// Pixel ceiling for a live substream: 1280x720. Above this a profile is a second
+/// main stream rather than a preview, and relaying it defeats the point.
+const LIVE_PIXEL_CEILING: u64 = 1280 * 720;
+
+fn pixels(p: &OnvifProfile) -> u64 {
+    u64::from(p.width.unwrap_or(0)) * u64::from(p.height.unwrap_or(0))
+}
+
+/// True when the profile can travel the H.264 passthrough path. Cameras that omit
+/// the encoding are treated as usable — excluding them would leave the substream
+/// unused on hardware that supports it, and the RTSP session fails loudly anyway.
+fn carries_h264(p: &OnvifProfile) -> bool {
+    match &p.encoding {
+        None => true,
+        Some(e) => {
+            let normalised: String = e
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric())
+                .collect::<String>()
+                .to_ascii_uppercase();
+            normalised == "H264" || normalised == "AVC"
+        }
+    }
+}
+
+/// Choose the profile to record from and the profile to show live.
+///
+/// Recording wants detail, so it takes the highest resolution the camera offers.
+/// Live view is relayed through TURN whenever the site cannot hold a direct path,
+/// and that traffic is metered, so it takes the best substream that still saves
+/// real bandwidth. See `docs/TURN-COSTS.md` — the difference is roughly 5.7x.
+///
+/// Both must be carriable by the H.264 passthrough path; neither the live nor the
+/// archive writer transcodes. A camera offering nothing usable falls back to its
+/// largest profile so the failure surfaces at RTSP rather than here.
+fn select_profiles(mut profiles: Vec<OnvifProfile>) -> (OnvifProfile, OnvifProfile) {
+    profiles.sort_by_key(|p| std::cmp::Reverse(pixels(p)));
+
+    let main = profiles
+        .iter()
+        .find(|p| carries_h264(p))
+        .cloned()
+        .unwrap_or_else(|| profiles[0].clone());
+
+    let candidates: Vec<&OnvifProfile> = profiles
+        .iter()
+        .filter(|p| p.token != main.token && carries_h264(p))
+        .collect();
+
+    // `candidates` is still ordered largest-first.
+    let live = candidates
+        .iter()
+        .find(|p| pixels(p) <= LIVE_PIXEL_CEILING)
+        .or_else(|| candidates.last())
+        .map(|p| (*p).clone())
+        .unwrap_or_else(|| main.clone());
+
+    (main, live)
 }
 
 pub async fn discover(wait: Duration) -> anyhow::Result<Vec<DiscoveredDevice>> {
@@ -177,30 +261,41 @@ pub async fn resolve_camera(
         "<trt:GetProfiles/>",
     )
     .await?;
-    let mut profiles = parse_profiles(&profiles_xml)?;
+    let profiles = parse_profiles(&profiles_xml)?;
     if profiles.is_empty() {
         return Err(anyhow!("camera returned no ONVIF media profiles"));
     }
 
-    profiles.sort_by_key(|p| {
-        std::cmp::Reverse(p.width.unwrap_or(0) as u64 * p.height.unwrap_or(0) as u64)
-    });
-    let profile = profiles.remove(0);
-    let stream_body = format!(
-        "<trt:GetStreamUri><trt:StreamSetup><tt:Stream>RTP-Unicast</tt:Stream><tt:Transport><tt:Protocol>TCP</tt:Protocol></tt:Transport></trt:StreamSetup><trt:ProfileToken>{}</trt:ProfileToken></trt:GetStreamUri>",
-        xml_escape(&profile.token),
-    );
-    let stream_xml = soap_post(
-        client,
-        &media_service,
-        credentials,
-        MEDIA_WSDL,
-        "GetStreamUri",
-        &stream_body,
-    )
-    .await?;
-    let rtsp_uri = parse_first_text(&stream_xml, "Uri")
-        .ok_or_else(|| anyhow!("camera returned no RTSP Uri"))?;
+    let (profile, live_profile) = select_profiles(profiles);
+    if live_profile.token == profile.token {
+        info!(
+            profile = %profile.token,
+            "no usable substream; live view will relay the main stream"
+        );
+    } else {
+        info!(
+            main = %profile.token,
+            main_res = ?(profile.width, profile.height),
+            live = %live_profile.token,
+            live_res = ?(live_profile.width, live_profile.height),
+            "live view will use the substream"
+        );
+    }
+    let rtsp_uri = stream_uri(client, &media_service, credentials, &profile.token).await?;
+    // Same token means the camera offers no usable substream; do not ask twice.
+    let live_rtsp_uri = if live_profile.token == profile.token {
+        rtsp_uri.clone()
+    } else {
+        match stream_uri(client, &media_service, credentials, &live_profile.token).await {
+            Ok(uri) => uri,
+            Err(error) => {
+                // A camera that lists a substream but will not hand out its URI is
+                // not a reason to have no live view at all.
+                warn!(%error, token = %live_profile.token, "substream URI unavailable; live falls back to the main stream");
+                rtsp_uri.clone()
+            }
+        }
+    };
 
     let snapshot_body = format!(
         "<trt:GetSnapshotUri><trt:ProfileToken>{}</trt:ProfileToken></trt:GetSnapshotUri>",
@@ -237,6 +332,7 @@ pub async fn resolve_camera(
         firmware: info.firmware,
         profile,
         rtsp_uri,
+        live_rtsp_uri,
         snapshot_uri,
     })
 }
@@ -486,7 +582,86 @@ fn xml_escape(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_media_xaddr, parse_probe_match, parse_profiles};
+    use super::{
+        OnvifProfile, parse_media_xaddr, parse_probe_match, parse_profiles, select_profiles,
+    };
+
+    fn profile(token: &str, w: u32, h: u32, encoding: Option<&str>) -> OnvifProfile {
+        OnvifProfile {
+            token: token.into(),
+            width: Some(w),
+            height: Some(h),
+            encoding: encoding.map(Into::into),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn live_takes_the_substream_and_main_takes_the_highest() {
+        let (main, live) = select_profiles(vec![
+            profile("sub", 704, 576, Some("H264")),
+            profile("main", 1920, 1080, Some("H264")),
+        ]);
+        assert_eq!(main.token, "main");
+        assert_eq!(live.token, "sub");
+    }
+
+    #[test]
+    fn live_takes_the_best_substream_under_the_ceiling() {
+        // 1280x720 is the best quality that still saves real bandwidth; the
+        // 1600x1200 profile is a second main stream, not a substream.
+        let (_, live) = select_profiles(vec![
+            profile("main", 2592, 1944, Some("H264")),
+            profile("second-main", 1600, 1200, Some("H264")),
+            profile("sub-720", 1280, 720, Some("H264")),
+            profile("sub-cif", 352, 288, Some("H264")),
+        ]);
+        assert_eq!(live.token, "sub-720");
+    }
+
+    #[test]
+    fn live_never_selects_a_codec_the_passthrough_path_cannot_carry() {
+        // The live path is H.264 passthrough. An MJPEG or H.265 substream would
+        // negotiate and then produce nothing.
+        let (main, live) = select_profiles(vec![
+            profile("main", 1920, 1080, Some("H264")),
+            profile("mjpeg", 640, 480, Some("JPEG")),
+            profile("h265", 704, 576, Some("H265")),
+        ]);
+        assert_eq!(main.token, "main");
+        assert_eq!(
+            live.token, "main",
+            "no usable substream means fall back to the main stream"
+        );
+    }
+
+    #[test]
+    fn a_single_profile_camera_uses_it_for_both() {
+        let (main, live) = select_profiles(vec![profile("only", 1280, 720, Some("H264"))]);
+        assert_eq!(main.token, "only");
+        assert_eq!(live.token, "only");
+    }
+
+    #[test]
+    fn unknown_encoding_is_not_excluded() {
+        // Some cameras omit the encoding in GetProfiles. Excluding them would
+        // leave the substream unused on hardware that supports it.
+        let (main, live) = select_profiles(vec![
+            profile("main", 1920, 1080, None),
+            profile("sub", 640, 480, None),
+        ]);
+        assert_eq!(main.token, "main");
+        assert_eq!(live.token, "sub");
+    }
+
+    #[test]
+    fn falls_back_to_the_smallest_when_every_other_profile_is_large() {
+        let (_, live) = select_profiles(vec![
+            profile("main", 3840, 2160, Some("H264")),
+            profile("big", 2560, 1440, Some("H264")),
+        ]);
+        assert_eq!(live.token, "big", "still better than relaying 4K");
+    }
 
     #[test]
     fn parses_xaddrs_and_endpoint() {

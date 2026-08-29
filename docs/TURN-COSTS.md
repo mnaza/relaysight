@@ -91,11 +91,27 @@ let profile = profiles.remove(0);
 **Every path therefore uses the highest-resolution stream the camera offers, including
 live preview.** Almost all ONVIF cameras publish a substream precisely for this purpose.
 
-Selecting it for live view is a **5.7× reduction** in relay bandwidth and turns 31 sites
-per box into 179. It is not a one-line change, because it needs a policy rather than a
-sort order: main stream for recording and for analytics that need detail, substream for
-live view, with a fallback when a camera exposes only one profile. That decision belongs
-to whoever owns the product, so it is written down here rather than made unilaterally.
+**Implemented 2026-08-29.** `select_profiles` in `onvif.rs` now returns a pair: the
+highest-resolution profile for recording, and the best substream at or below 1280×720 for
+live. Discovery fetches a stream URI for each, `CameraSource` carries both, and only
+`live::start_h264` uses the live one — `archive::record_h264_cmaf` still records the main
+stream.
+
+Three cases the policy has to survive, each pinned by a test:
+
+- **The codec must be carriable.** Live is H.264 passthrough, so an MJPEG or H.265
+  substream would negotiate and then deliver nothing. Those profiles are excluded, and a
+  camera with no usable substream falls back to the main stream rather than failing.
+- **A profile can be a second main stream.** A 1600×1200 profile alongside a 2592×1944 one
+  is not a preview; relaying it saves almost nothing. Hence the ceiling, above which the
+  next-best candidate is taken only if nothing fits under it.
+- **Encoding is often absent** from `GetProfiles`. Treating that as unusable would leave
+  the substream unused on hardware that supports it, so unknown encoding is accepted; the
+  RTSP session fails loudly if it turns out to be wrong.
+
+Discovery logs which pair it chose, at INFO, including both resolutions. **That line is
+how you confirm in the field that the 5.7× is actually being taken** — a camera that
+quietly offers no substream looks identical from the outside.
 
 ## What is not yet known
 
@@ -113,5 +129,6 @@ to whoever owns the product, so it is written down here rather than made unilate
 
 1. Instrument relay share per site from the first pilot. It is the number everything else
    depends on and it cannot be guessed.
-2. Decide the profile policy above; it is the cheapest 5.7× available.
+2. ~~Decide the profile policy above~~ — done 2026-08-29. Confirm against real cameras
+   that the substream is being selected, using the discovery log line.
 3. Stand up coturn on flat-rate hosting. Do not put the relay on metered egress.

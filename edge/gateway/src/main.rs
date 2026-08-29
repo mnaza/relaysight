@@ -82,6 +82,9 @@ impl Config {
 #[derive(Clone, Debug)]
 struct CameraSource {
     rtsp_uri: String,
+    /// Stream used for live view — the camera's substream where it has one, so a
+    /// TURN-relayed session carries a fraction of the bytes. See docs/TURN-COSTS.md.
+    live_rtsp_uri: String,
     snapshot_uri: Option<String>,
     username: Option<String>,
     password: Option<String>,
@@ -205,6 +208,7 @@ async fn probe_loop(
                                 candidate.camera_id.clone(),
                                 CameraSource {
                                     rtsp_uri: candidate.rtsp_uri.clone(),
+                                    live_rtsp_uri: candidate.live_rtsp_uri.clone(),
                                     snapshot_uri: candidate.snapshot_uri.clone(),
                                     username: config.camera_username.clone(),
                                     password: config.camera_password.clone(),
@@ -258,6 +262,9 @@ async fn probe_loop(
                     id.clone(),
                     CameraSource {
                         rtsp_uri: url.clone(),
+                        // An explicitly configured URL names one stream; there is
+                        // no profile list to pick a substream from.
+                        live_rtsp_uri: url.clone(),
                         snapshot_uri: None,
                         username: config.camera_username.clone(),
                         password: config.camera_password.clone(),
@@ -640,7 +647,7 @@ async fn execute_command(
             let source = camera_source(sources, camera_id).await?;
             info!(command_id = %command.id, camera_id, "starting outbound-signaled WebRTC live session");
             let answer = live::start_h264(
-                source.rtsp_uri,
+                source.live_rtsp_uri,
                 source.username,
                 source.password,
                 offer_sdp.clone(),
