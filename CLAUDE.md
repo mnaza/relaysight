@@ -39,8 +39,8 @@ node --check web/theme.js && node --check web/landing.js && node --check web/das
 
 - **Compiles.** Whole workspace plus `commercial/control-plane`.
 - `clippy -- -D warnings` **clean**; `cargo fmt` clean.
-- **53 tests, all passing**, including nine that speak real RTSP, three that negotiate
-  a real peer connection, and thirteen that drive the HTTP surface.
+- **53 Rust tests and 17 web tests, all passing.** Nine speak real RTSP, three
+  negotiate a real peer connection, thirteen drive the HTTP surface.
   `src/fake_camera.rs` is a test-only RTSP server that serves
   `fixtures/camera.h264` — three seconds of genuine H.264 made once with ffmpeg and
   committed, so the build needs no encoder — over RTP interleaved on the TCP control
@@ -85,13 +85,25 @@ because the same mistake will recur:
    start, or out of band, will break it. Hikvision and Dahua at minimum need real
    hardware testing. This tail is the actual moat in this market and it is ground out one
    vendor at a time.
-3. **The web front-end has no tests**, and neither does the plugin runtime beyond what
-   the API tests reach through it.
+3. **Nothing renders the UI.** The web tests cover the pure half — locales, `t()`,
+   `mergeBrand`, brand.json against its schema — but every function touching `document`
+   is unexercised, and so is the plugin runtime beyond what the API tests reach through
+   it. Rendering needs a headless browser, which is a dependency this repo does not
+   have yet.
 
 The two fakes are the way to test anything in the media path: `FakeCamera::start(bool)`
 for the camera end (the flag makes it demand Basic auth), `FakeBrowser::offer()` for the
 viewer end. Both bind loopback on an ephemeral port and need no network. The suite was
 run five times over to confirm the sockets and ICE do not flake.
+
+Web tests run on Node's built-in runner, no dependencies: `node --test "web/tests/*.test.mjs"`.
+They replaced `scripts/check-i18n.py`, which scanned only the HTML and therefore left all
+79 `t()` calls in `dashboard.js` unchecked. **A missing translation key never throws** —
+`t()` falls back to the key itself, so the user is shown `app.live.connecting` where a
+sentence should be and nothing reports a fault. Those tests are the only thing that
+notices, which is why they also check interpolation parity: if English says `{count}
+cameras` and another locale drops the placeholder, the number silently vanishes for
+those users.
 
 ⚠️ **`GATEWAY_TOKEN` authorises any `gateway_id`.** That is the bootstrap path before a
 gateway enrols, and a test pins it so nobody assumes otherwise — but it means anyone

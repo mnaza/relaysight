@@ -28,7 +28,8 @@ jobs:
       - run: node --check web/theme.js
       - run: node --check web/landing.js
       - run: node --check web/dashboard.js
-      - run: python3 -m json.tool web/brand.json >/dev/null
-      - run: for f in web/locales/*.json; do python3 -m json.tool "$f" >/dev/null; done
-      - run: python3 scripts/check-i18n.py
+      # Replaces scripts/check-i18n.py, which scanned only the HTML and so left
+      # every t() call in dashboard.js unchecked. Also covers interpolation
+      # parity across locales and brand.json against its own schema.
+      - run: node --test "web/tests/*.test.mjs"
       - run: python3 -m py_compile plugins/examples/ai-http-adapter/plugin.py plugins/examples/storage-s3/plugin.py
