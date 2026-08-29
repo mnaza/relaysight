@@ -1,0 +1,117 @@
+# TURN — what it costs, and what actually decides it
+
+Worked 2026-08-29. The conclusion reverses the assumption it started from.
+
+## Why this document exists
+
+Live video goes gateway → browser directly over WebRTC, and the cloud never touches the
+media. That is the decision the whole economic case rests on. It holds until the
+customer's network is behind symmetric NAT or blocks UDP, at which point the session
+needs a TURN relay — and a TURN relay carries the full stream through your server, which
+is exactly the cost the architecture was designed to avoid.
+
+**TURN is not implemented.** Without it those sessions do not degrade, they fail.
+
+## The thing to understand before any number
+
+**TURN need is a property of the site, not of the session.** A network either permits a
+direct path or it does not. If a customer's firewall blocks UDP, every session from that
+site relays, forever. So "10–15% of WebRTC sessions need TURN", the figure usually quoted
+from consumer deployments, is the wrong model here: plan for a *fraction of sites at
+100%*, not all sites at 15%. And premises that install security cameras skew toward
+restrictive egress rules, so that fraction is higher than consumer averages, not lower.
+
+Capacity planning follows from the number of relaying **sites**, not sessions.
+
+## Assumptions
+
+Typical, not measured — no camera has ever been connected to this code.
+
+| | bitrate |
+|---|---|
+| Main stream, 1080p @ 15 fps H.264 | 4 Mbit/s |
+| Substream, D1/720p | 0.7 Mbit/s |
+
+A relay costs one unit of billable egress per viewer (ingress from the gateway is
+normally free). Two people watching the same camera cost twice.
+
+## Per site, per month
+
+| Usage pattern | main stream | substream |
+|---|---|---|
+| On demand — 20 cameras, 30 min of viewing a day | 27 GB | 5 GB |
+| Alarm monitoring — 4 cameras watched continuously | **5,184 GB** | 907 GB |
+
+**On-demand viewing is a rounding error.** 27 GB a month is nothing on any host. The
+entire question is the monitoring tier — the always-on video wall, which is a product
+3dEYE sells and which is where continuous relay lives.
+
+## What that costs, and this is the whole finding
+
+One alarm-monitoring site, main stream, 5.18 TB a month:
+
+| Host | Cost |
+|---|---|
+| Hetzner dedicated, €97/mo, unmetered 1 Gbit | **€0 marginal** — the box is flat-rate |
+| Hetzner Cloud, 20 TB included then €1/TB | **€0** — one site fits inside the allowance |
+| AWS egress at $0.09/GB | **$467 per month, for one site** |
+
+Against a plan priced near 3dEYE's entry $200/month, AWS egress alone is more than twice
+the revenue. On Hetzner the same traffic is free at the margin.
+
+**So TURN does not decide whether this business works. The hosting decision does, and the
+gap between the two answers is roughly a hundredfold.** The original worry — that video
+makes a solo-built VSaaS unaffordable — is true on a hyperscaler and false on flat-rate
+bandwidth.
+
+## Capacity on flat-rate hosting
+
+With a flat-rate box the binding constraint is not monthly volume, it is **concurrent
+bandwidth**. Allowing 500 Mbit/s of a 1 Gbit uplink as usable:
+
+| Relaying monitoring sites, 4 cameras each | per site | sites per €97 box |
+|---|---|---|
+| main stream | 16 Mbit/s | **31** |
+| substream | 2.8 Mbit/s | **179** |
+
+At $100/month per site that is $3,125 of revenue against €97 of relay cost — **3.1%** on
+the main stream, **0.5%** on the substream. On-demand-only sites are not a constraint at
+all; hundreds fit.
+
+## The lever that is currently pulled the wrong way
+
+`edge/gateway/src/onvif.rs:185` sorts the camera's ONVIF media profiles by descending
+pixel count and takes the first:
+
+```rust
+profiles.sort_by_key(|p| Reverse(p.width.unwrap_or(0) as u64 * p.height.unwrap_or(0) as u64));
+let profile = profiles.remove(0);
+```
+
+**Every path therefore uses the highest-resolution stream the camera offers, including
+live preview.** Almost all ONVIF cameras publish a substream precisely for this purpose.
+
+Selecting it for live view is a **5.7× reduction** in relay bandwidth and turns 31 sites
+per box into 179. It is not a one-line change, because it needs a policy rather than a
+sort order: main stream for recording and for analytics that need detail, substream for
+live view, with a fallback when a camera exposes only one profile. That decision belongs
+to whoever owns the product, so it is written down here rather than made unilaterally.
+
+## What is not yet known
+
+- Real camera bitrates vary by more than the 5.7× this analysis turns on. The figures
+  above are typical values, not measurements. **Measure before committing to a price.**
+- What fraction of real customer sites will relay. Unknowable without deployments;
+  instrument it from the first pilot, per site, and treat the number as a headline metric.
+- Hetzner's unmetered uplink is subject to fair use. 500 Mbit/s sustained on a €97 box is
+  an assumption that needs confirming with them before it becomes a capacity plan.
+- Whether TURN should be self-hosted (coturn) or bought. At these volumes self-hosting on
+  the same flat-rate box is obviously cheaper; that stops being true if relay share is
+  far above the planning figure.
+
+## The order to do things
+
+1. Instrument relay share per site from the first pilot. It is the number everything else
+   depends on and it cannot be guessed.
+2. Decide the profile policy above; it is the cheapest 5.7× available.
+3. Stand up coturn on flat-rate hosting. Do not put the relay on metered egress.
