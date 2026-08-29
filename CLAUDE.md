@@ -39,7 +39,7 @@ node --check web/theme.js && node --check web/landing.js && node --check web/das
 
 - **Compiles.** Whole workspace plus `commercial/control-plane`.
 - `clippy -- -D warnings` **clean**; `cargo fmt` clean.
-- **67 Rust tests, 17 web tests and 11 Python tests, all passing.** Nine speak real
+- **69 Rust tests, 17 web tests and 11 Python tests, all passing.** Nine speak real
   RTSP, three negotiate a real peer connection, thirteen drive the HTTP surface and
   fourteen cover the plugin runtime.
   `src/fake_camera.rs` is a test-only RTSP server that serves
@@ -106,9 +106,10 @@ through the storage calls whatever id the caller supplies — storage handles re
 video and issues signed URLs. A test asserts the refusal is fast, because a refusal that
 waited on a round trip would mean the body had already been sent.
 
-⚠️ **One unparseable manifest fails the whole reload**, so a typo in a single file
-removes every plugin rather than its own. Pinned by a test; worth fixing if plugin
-counts grow.
+**A bad manifest costs that plugin and no more.** An unreadable or unparseable file is
+warned about by name and skipped, matching how the unreachable-plugin and
+wrong-protocol cases already behave. An unreadable plugin *directory* is still an error,
+because that is a configuration fault rather than a plugin fault.
 
 `object_key` in the S3 example is the only place a client-supplied string becomes a path
 inside the bucket, so its traversal guard is tested — with `boto3` stubbed into

@@ -52,9 +52,26 @@ impl PluginRegistry {
             if file.extension().and_then(|v| v.to_str()) != Some("json") {
                 continue;
             }
-            let raw = std::fs::read_to_string(&file)?;
-            let registration: PluginRegistration =
-                serde_json::from_str(&raw).with_context(|| format!("parse {}", file.display()))?;
+            // A bad file costs that plugin and no more. Failing the whole reload
+            // would turn one editing slip into a fleet-wide outage, and on a
+            // running control plane the previous set would silently stay in
+            // place while the operator believed the change had applied. The
+            // unreachable-plugin and wrong-protocol cases below already skip;
+            // this is the same class of fault.
+            let raw = match std::fs::read_to_string(&file) {
+                Ok(raw) => raw,
+                Err(error) => {
+                    warn!(file = %file.display(), %error, "cannot read plugin manifest; skipping it");
+                    continue;
+                }
+            };
+            let registration: PluginRegistration = match serde_json::from_str(&raw) {
+                Ok(registration) => registration,
+                Err(error) => {
+                    warn!(file = %file.display(), %error, "plugin manifest is not a valid registration; skipping it");
+                    continue;
+                }
+            };
             if !registration.enabled {
                 continue;
             }
@@ -415,14 +432,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn one_malformed_manifest_takes_down_the_whole_reload() {
-        // Pinning current behaviour, which is worth knowing rather than
-        // discovering: a single unparseable file fails the entire load, so a
-        // typo in one manifest removes every plugin, not just its own.
+    async fn one_malformed_manifest_does_not_take_down_the_others() {
+        // A typo in one file must cost that plugin and no more. Failing the
+        // whole reload would turn an editing slip into a fleet-wide outage,
+        // and on a running control plane the previous set would silently stay
+        // in place while the operator believed the change had applied.
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "good.json", &offline("ai-1", &["ai_analyze"]));
+        write(
+            dir.path(),
+            "also-good.json",
+            &offline("store-1", &["storage_blob"]),
+        );
         std::fs::write(dir.path().join("bad.json"), "{ not json").unwrap();
-        assert!(PluginRegistry::load_dir(dir.path()).await.is_err());
+
+        let registry = PluginRegistry::load_dir(dir.path())
+            .await
+            .expect("a bad file must not fail the load");
+        assert!(registry.is_registered("ai-1").await);
+        assert!(registry.is_registered("store-1").await);
+        assert_eq!(registry.list().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_manifest_that_is_valid_json_but_not_a_registration_is_skipped_too() {
+        // Same failure, one layer down: the file parses, the shape is wrong.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "good.json", &offline("ai-1", &["ai_analyze"]));
+        std::fs::write(
+            dir.path().join("wrong-shape.json"),
+            serde_json::json!({"hello": "world"}).to_string(),
+        )
+        .unwrap();
+        let registry = PluginRegistry::load_dir(dir.path()).await.unwrap();
+        assert_eq!(registry.list().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_directory_that_cannot_be_read_is_still_an_error() {
+        // Skipping individual bad files must not turn an unreadable directory
+        // into a silent empty registry — that is a configuration fault, not a
+        // plugin fault, and it should be loud.
+        let dir = tempfile::tempdir().unwrap();
+        let unreadable = dir.path().join("locked");
+        std::fs::create_dir(&unreadable).unwrap();
+        let mut perms = std::fs::metadata(&unreadable).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o000);
+        std::fs::set_permissions(&unreadable, perms.clone()).unwrap();
+
+        let result = PluginRegistry::load_dir(&unreadable).await;
+
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&unreadable, perms).unwrap();
+        assert!(
+            result.is_err(),
+            "an unreadable plugin directory must be reported"
+        );
     }
 
     #[tokio::test]
