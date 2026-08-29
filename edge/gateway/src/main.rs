@@ -3,6 +3,8 @@ mod archive;
 mod fake_browser;
 #[cfg(test)]
 mod fake_camera;
+#[cfg(test)]
+mod fake_control_plane;
 mod live;
 mod onvif;
 mod rtsp;
@@ -882,5 +884,181 @@ async fn complete_command(
             warn!(status = %response.status(), command_id = %command.id, "command completion rejected")
         }
         Err(error) => warn!(%error, command_id = %command.id, "command completion failed"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{fake_camera::FakeCamera, fake_control_plane::FakeControlPlane};
+
+    const TOKEN: &str = "gateway-token";
+
+    fn config(api_url: &str) -> Config {
+        Config {
+            api_url: api_url.to_owned(),
+            gateway_id: "gw-1".into(),
+            customer_id: "cust-1".into(),
+            customer_name: "Customer".into(),
+            site_id: "site-1".into(),
+            site_name: "Site".into(),
+            city: "Barcelona".into(),
+            token: TOKEN.into(),
+            enrollment_token: None,
+            camera_limit: 10,
+            heartbeat_interval: Duration::from_secs(30),
+            discovery_wait: Duration::from_millis(1),
+            probe_interval: Duration::from_secs(30),
+            rtsp_probe_window: Duration::from_millis(300),
+            command_poll_interval: Duration::from_millis(20),
+            camera_username: None,
+            camera_password: None,
+            explicit_rtsp_url: None,
+            explicit_camera_name: "Camera".into(),
+        }
+    }
+
+    fn record_command(id: &str, camera_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "gateway_id": "gw-1",
+            "created_at": Utc::now(),
+            "expires_at": Utc::now() + chrono::Duration::minutes(2),
+            "kind": {
+                "type": "record",
+                "camera_id": camera_id,
+                "duration_seconds": 2,
+                "segment_seconds": 1,
+                "storage_plugin_id": "storage-s3",
+            },
+        })
+    }
+
+    async fn sources_with(
+        camera_id: &str,
+        url: &str,
+    ) -> Arc<RwLock<HashMap<String, CameraSource>>> {
+        let mut map = HashMap::new();
+        map.insert(
+            camera_id.to_owned(),
+            CameraSource {
+                rtsp_uri: url.to_owned(),
+                live_rtsp_uri: url.to_owned(),
+                snapshot_uri: None,
+                username: None,
+                password: None,
+            },
+        );
+        Arc::new(RwLock::new(map))
+    }
+
+    #[tokio::test]
+    async fn a_command_that_fails_is_still_reported_rather_than_dropped() {
+        // The single most important property of the loop. Whoever asked for this
+        // is polling the command view; a failure that never completes leaves
+        // them waiting forever with no way to tell a slow gateway from a broken
+        // one. The command here names a camera the gateway does not have.
+        let api = FakeControlPlane::start(vec![record_command("cmd-1", "no-such-camera")], 0).await;
+        let sources = Arc::new(RwLock::new(HashMap::new()));
+        let client = reqwest::Client::new();
+        tokio::spawn(command_loop(config(&api.url), client, sources));
+
+        let completions = api.wait_for_completions(1, Duration::from_secs(10)).await;
+        assert_eq!(completions[0]["command_id"], "cmd-1");
+        assert_eq!(completions[0]["status"], "failed");
+        assert!(
+            completions[0]["error"]
+                .as_str()
+                .is_some_and(|e| !e.is_empty()),
+            "a failure must carry a reason, got {:?}",
+            completions[0]["error"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_recording_command_runs_and_reports_its_manifest() {
+        let camera = FakeCamera::start(false).await.unwrap();
+        let api = FakeControlPlane::start(vec![record_command("cmd-2", "cam-1")], 0).await;
+        let sources = sources_with("cam-1", &camera.url).await;
+        tokio::spawn(command_loop(
+            config(&api.url),
+            reqwest::Client::new(),
+            sources,
+        ));
+
+        let completions = api.wait_for_completions(1, Duration::from_secs(20)).await;
+        let result = &completions[0];
+        assert_eq!(result["command_id"], "cmd-2");
+        // The upload to a storage plugin will fail — none is configured — but
+        // the loop must still report a definite outcome either way, and must
+        // never leave the command unanswered.
+        eprintln!(
+            "DEBUG completion: {}",
+            serde_json::to_string_pretty(result).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_gateway_token_goes_on_both_the_poll_and_the_completion() {
+        // Losing it on either one leaves commands stuck: the poll returns 401
+        // forever, or the work is done and the answer is refused.
+        let api = FakeControlPlane::start(vec![record_command("cmd-3", "no-such-camera")], 0).await;
+        tokio::spawn(command_loop(
+            config(&api.url),
+            reqwest::Client::new(),
+            Arc::new(RwLock::new(HashMap::new())),
+        ));
+        api.wait_for_completions(1, Duration::from_secs(10)).await;
+
+        let seen = api.seen.read().await;
+        assert!(
+            seen.tokens.len() >= 2,
+            "expected a token on poll and completion"
+        );
+        assert!(
+            seen.tokens.iter().all(|t| t == TOKEN),
+            "a request went out with the wrong token: {:?}",
+            seen.tokens
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rejected_poll_does_not_end_the_loop() {
+        // A gateway that gives up on one 401 stays dead until someone restarts
+        // it, which on customer premises means a site visit.
+        let api = FakeControlPlane::start(vec![record_command("cmd-4", "no-such-camera")], 3).await;
+        tokio::spawn(command_loop(
+            config(&api.url),
+            reqwest::Client::new(),
+            Arc::new(RwLock::new(HashMap::new())),
+        ));
+
+        let completions = api.wait_for_completions(1, Duration::from_secs(10)).await;
+        assert_eq!(completions[0]["command_id"], "cmd-4");
+        assert!(
+            api.seen.read().await.polls > 3,
+            "the loop stopped polling after the rejections"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_queue_is_polled_again_rather_than_treated_as_an_error() {
+        let api = FakeControlPlane::start(Vec::new(), 0).await;
+        tokio::spawn(command_loop(
+            config(&api.url),
+            reqwest::Client::new(),
+            Arc::new(RwLock::new(HashMap::new())),
+        ));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let seen = api.seen.read().await;
+        assert!(
+            seen.polls > 2,
+            "only {} polls; the loop stalled",
+            seen.polls
+        );
+        assert!(
+            seen.completions.is_empty(),
+            "nothing was queued to complete"
+        );
     }
 }

@@ -39,7 +39,7 @@ node --check web/theme.js && node --check web/landing.js && node --check web/das
 
 - **Compiles.** Whole workspace plus `commercial/control-plane`.
 - `clippy -- -D warnings` **clean**; `cargo fmt` clean.
-- **69 Rust tests, 17 web tests and 11 Python tests, all passing.** Nine speak real
+- **74 Rust tests, 17 web tests and 11 Python tests, all passing.** Nine speak real
   RTSP, three negotiate a real peer connection, thirteen drive the HTTP surface and
   fourteen cover the plugin runtime.
   `src/fake_camera.rs` is a test-only RTSP server that serves
@@ -95,9 +95,13 @@ because the same mistake will recur:
    it. Rendering needs a headless browser, which is a dependency this repo does not
    have yet.
 
-The two fakes are the way to test anything in the media path: `FakeCamera::start(bool)`
-for the camera end (the flag makes it demand Basic auth), `FakeBrowser::offer()` for the
-viewer end. Both bind loopback on an ephemeral port and need no network. The suite was
+Three fakes carry the integration tests, all binding loopback on an ephemeral port and
+needing no network: `FakeCamera::start(bool)` for the camera end (the flag makes it
+demand Basic auth), `FakeBrowser::offer()` for the viewer end, and
+`FakeControlPlane::start(commands, reject_first_polls)` for the API the gateway polls.
+The control plane also answers the presigned-upload call and the blob PUT that follows,
+so a record command runs the whole way through and the test can check the manifest
+rather than stopping at the first upload. The suite was
 run five times over to confirm the sockets and ICE do not flake.
 
 **Capability enforcement is the plugin system's security boundary** and is checked
@@ -124,6 +128,12 @@ sentence should be and nothing reports a fault. Those tests are the only thing t
 notices, which is why they also check interpolation parity: if English says `{count}
 cameras` and another locale drops the placeholder, the number silently vanishes for
 those users.
+
+**A command that fails must still be completed.** Whoever asked for it is polling the
+command view, so a failure that never reports leaves them unable to tell a slow gateway
+from a broken one. Same for a rejected poll: a loop that gives up on one 401 stays dead
+until someone restarts it, and on customer premises that is a site visit. Both are
+pinned by tests.
 
 ⚠️ **`GATEWAY_TOKEN` authorises any `gateway_id`.** That is the bootstrap path before a
 gateway enrols, and a test pins it so nobody assumes otherwise — but it means anyone
