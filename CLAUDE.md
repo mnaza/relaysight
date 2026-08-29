@@ -39,7 +39,7 @@ node --check web/theme.js && node --check web/landing.js && node --check web/das
 
 - **Compiles.** Whole workspace plus `commercial/control-plane`.
 - `clippy -- -D warnings` **clean**; `cargo fmt` clean.
-- **74 Rust tests, 37 web tests and 11 Python tests, all passing.** Nine speak real
+- **74 Rust tests, 45 web tests and 11 Python tests, all passing.** Nine speak real
   RTSP, three negotiate a real peer connection, thirteen drive the HTTP surface and
   fourteen cover the plugin runtime.
   `src/fake_camera.rs` is a test-only RTSP server that serves
@@ -89,14 +89,10 @@ because the same mistake will recur:
 3. **Nothing renders the UI, and no plugin is run for real.** The Python example
    plugins are tested only where they are pure; their HTTP handlers, and the boto3 and
    upstream calls behind them, are not exercised.
-4. **`dashboard.js` itself is untestable as written.** It exports nothing and runs
-   `await loadRuntime()` at module scope, so importing it from a test fetches
-   `brand.json` and fails; and 16 of its 32 functions close over the module-level
-   `brand`, `dict` and `locale`. Reaching them means splitting the bootstrap from the
-   render functions and threading that state through — a real refactor of 639 lines of
-   working UI with no runtime test to catch a regression. **Worth doing, but as its own
-   change, not as a side effect of adding tests.** Until then the page tests below cover
-   the part that actually breaks in practice.
+4. **`dashboard-app.js` is still at its pre-split indentation.** The body was moved
+   out of `dashboard.js` unchanged and deliberately not re-indented, because the file
+   holds 51 template literals whose contents whitespace changes. Now that the render
+   tests exist, re-indenting is safe to do as its own change — and should be.
 
 Three fakes carry the integration tests, all binding loopback on an ephemeral port and
 needing no network: `FakeCamera::start(bool)` for the camera end (the flag makes it
@@ -127,12 +123,27 @@ Web tests run with `npm test --prefix web`. **jsdom is the repository's only Jav
 dependency and it is test-only** — the shipped page loads no bundler and no framework,
 and that is worth keeping.
 
-`tests/page.test.mjs` checks the contract between the scripts and the markup: every one
-of the 38 selectors `dashboard.js` hands to `querySelector` must match something in
-`app.html`. The script checks none of them, so a renamed id makes the first
-`appendChild` throw during module evaluation, which stops the whole file — the page
-loads and stays blank, with one line in a console nobody has open. Nothing else in this
-repository can see that, and it is one rename away.
+**`dashboard.js` is bootstrap only; the page lives in `dashboard-app.js` as
+`startDashboard({ brand, locale, dict })`.** It was split so it could be tested: before,
+it awaited `loadRuntime()` at module scope and read module bindings, so importing it
+from a test fetched `brand.json` and failed. `tests/dashboard.test.mjs` now renders the
+real `app.html` in jsdom with the API stubbed and checks what appeared — rows matching
+the fleet, counters agreeing with the data behind them, search narrowing and restoring,
+and that a camera name cannot inject markup, since names come from whatever the camera
+reports over ONVIF.
+
+The list of files the i18n and selector scans read is derived from the markup
+(`tests/sources.mjs`), not hardcoded. When the split happened the hardcoded list quietly
+dropped a quarter of the translation keys and the suite still passed; the threshold
+guarding it was too loose to notice. Deriving it means a new module is covered as soon
+as a page loads it.
+
+`tests/page.test.mjs` checks the contract between the scripts and the markup: every id
+selector the page's scripts hand to `querySelector` must match something in the page. The scripts check none of them, so a renamed id makes the first unguarded call throw
+during module evaluation, which stops the whole file — the page loads and stays blank,
+with one line in a console nobody has open. Renaming one id in `app.html` was used to
+confirm the suite actually bites: five tests fail, and the dashboard stops rendering
+entirely, which is the failure being guarded against.
 The i18n tests replaced `scripts/check-i18n.py`, which scanned only the HTML and therefore left all
 79 `t()` calls in `dashboard.js` unchecked. **A missing translation key never throws** —
 `t()` falls back to the key itself, so the user is shown `app.live.connecting` where a

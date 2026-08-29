@@ -4,10 +4,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, readdirSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
-import { dirname, join } from 'node:path';
-
-const web = join(dirname(fileURLToPath(import.meta.url)), '..');
+import { join } from 'node:path';
+import { allSources, web } from './sources.mjs';
 const localeNames = readdirSync(join(web, 'locales')).filter(f => f.endsWith('.json'));
 const locales = Object.fromEntries(
   localeNames.map(f => [f.replace('.json', ''), JSON.parse(readFileSync(join(web, 'locales', f), 'utf8'))]),
@@ -49,8 +47,9 @@ test('interpolation variables match across locales', () => {
 });
 
 test('every key the UI asks for exists in every locale', () => {
-  const sources = ['index.html', 'app.html', 'dashboard.js', 'landing.js', 'theme.js']
-    .map(f => readFileSync(join(web, f), 'utf8'));
+  // Derived from the markup rather than listed here — see sources.mjs for why.
+  const scanned = allSources();
+  const sources = scanned.map(f => readFileSync(join(web, f), 'utf8'));
   const referenced = new Set();
   let dynamic = 0;
   for (const source of sources) {
@@ -63,10 +62,14 @@ test('every key the UI asks for exists in every locale', () => {
     // than let the pass rate look complete when it is not.
     for (const _ of source.matchAll(/\bt\(\s*\w+\s*,\s*[`a-zA-Z]/g)) dynamic += 1;
   }
-  assert.ok(referenced.size > 100, `only found ${referenced.size} literal keys; the scan is probably broken`);
+  assert.ok(
+    scanned.some(f => f.endsWith('.js')) && scanned.some(f => f.endsWith('.html')),
+    `the scan found no scripts or no pages: ${scanned}`,
+  );
+  assert.ok(referenced.size > 180, `only found ${referenced.size} literal keys across ${scanned.length} files; the scan is probably missing a module`);
   for (const [name, dict] of Object.entries(locales)) {
     const missing = [...referenced].filter(key => !(key in dict));
     assert.deepEqual(missing, [], `${name} lacks keys the UI references`);
   }
-  console.log(`  checked ${referenced.size} literal keys; ${dynamic} runtime-built keys are not statically checkable`);
+  console.log(`  checked ${referenced.size} literal keys across ${scanned.length} files; ${dynamic} runtime-built keys are not statically checkable`);
 });

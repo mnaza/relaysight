@@ -25,9 +25,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - run: node --check web/theme.js
-      - run: node --check web/landing.js
-      - run: node --check web/dashboard.js
+      - run: for f in web/*.js; do node --check "$f"; done
       # Replaces scripts/check-i18n.py, which scanned only the HTML and so left
       # every t() call in dashboard.js unchecked. Also covers interpolation
       # parity across locales and brand.json against its own schema.
