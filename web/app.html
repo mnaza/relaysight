@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <link rel="stylesheet" href="styles.css" />
+  <title>Dashboard</title>
+</head>
+<body class="app-body">
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div id="app-brand"></div>
+      <nav class="sidebar-nav">
+        <a class="sidebar-link active" href="#"><span class="nav-icon">⌂</span><span data-i18n="app.overview"></span></a>
+        <a class="sidebar-link" href="#"><span class="nav-icon">◎</span><span data-i18n="app.customers"></span></a>
+        <a class="sidebar-link" href="#"><span class="nav-icon">◇</span><span data-i18n="app.sites"></span></a>
+        <a class="sidebar-link" href="#"><span class="nav-icon">◉</span><span data-i18n="app.cameras"></span></a>
+        <a class="sidebar-link" href="#"><span class="nav-icon">△</span><span data-i18n="app.events"></span></a>
+        <a class="sidebar-link" href="#"><span class="nav-icon">⇄</span><span data-i18n="app.gateways"></span></a>
+        <a id="plugins-link" class="sidebar-link" href="#plugins"><span class="nav-icon">✦</span><span data-i18n="app.plugins"></span></a>
+        <a id="brand-settings-link" class="sidebar-link" href="#branding"><span class="nav-icon">⚙</span><span data-i18n="app.settings"></span></a>
+      </nav>
+      <div id="plan-card" class="free-card">
+        <strong id="plan-title" data-i18n="app.freePlan"></strong>
+        <span id="free-usage" data-i18n="app.freeUsage"></span>
+        <div id="usage-wrap" class="usage-bar"><i id="free-usage-bar"></i></div>
+        <button id="upgrade-button" class="button small" data-i18n="app.upgrade"></button>
+      </div>
+    </aside>
+
+    <main class="app-main">
+      <header class="topbar">
+        <div class="search"><input id="fleet-search" data-i18n-placeholder="app.search" /></div>
+        <div class="top-spacer"></div>
+        <span id="app-locale"></span>
+        <button id="add-gateway" class="button primary small" data-i18n="app.addGateway"></button>
+        <div class="avatar">OP</div>
+      </header>
+
+      <div class="dashboard">
+        <div class="page-title-row">
+          <div><h1 data-i18n="app.title"></h1><p data-i18n="app.subtitle"></p></div>
+          <span id="fleet-source" class="demo-tag" data-i18n="app.demo"></span>
+        </div>
+
+        <section class="stats">
+          <div class="stat-card"><div class="stat-label" data-i18n="app.stat.online"></div><div id="stat-online" class="stat-value">—</div><div class="stat-delta" data-i18n="app.delta.online"></div></div>
+          <div class="stat-card"><div class="stat-label" data-i18n="app.stat.alerts"></div><div id="stat-alerts" class="stat-value">—</div><div class="stat-delta" style="color:var(--warning)" data-i18n="app.delta.alerts"></div></div>
+          <div class="stat-card"><div class="stat-label" data-i18n="app.stat.sites"></div><div id="stat-sites" class="stat-value">—</div><div class="stat-delta" data-i18n="app.delta.sites"></div></div>
+          <div class="stat-card"><div class="stat-label" data-i18n="app.stat.uptime"></div><div class="stat-value">99.72%</div><div class="stat-delta" data-i18n="app.delta.uptime"></div></div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head"><strong data-i18n="app.title"></strong><span class="demo-tag" data-i18n="app.demoNote"></span></div>
+          <div style="overflow-x:auto">
+            <table class="fleet-table">
+              <thead><tr><th data-i18n="app.table.customer"></th><th data-i18n="app.table.health"></th><th data-i18n="app.table.cameras"></th><th data-i18n="app.table.activity"></th><th data-i18n="app.table.action"></th></tr></thead>
+              <tbody id="fleet-body"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section id="plugins" class="panel">
+          <div class="panel-head">
+            <div><strong data-i18n="app.plugins.title"></strong><div class="metric-sub" data-i18n="app.plugins.subtitle"></div></div>
+            <button id="reload-plugins" class="button small" data-i18n="app.plugins.reload"></button>
+          </div>
+          <div id="plugins-grid" class="plugins-grid"></div>
+        </section>
+      </div>
+    </main>
+  </div>
+
+  <div id="onboarding-modal" class="modal-backdrop">
+    <div class="modal onboarding-modal">
+      <h2 data-i18n="app.onboarding.title"></h2><p data-i18n="app.onboarding.subtitle"></p>
+
+      <div class="onboarding-step">
+        <strong data-i18n="app.onboarding.step1"></strong>
+        <form id="enrollment-form" class="onboarding-form">
+          <label class="field"><span data-i18n="app.onboarding.customer"></span><input name="customerName" required autocomplete="organization" /></label>
+          <label class="field"><span data-i18n="app.onboarding.site"></span><input name="siteName" required /></label>
+          <label class="field"><span data-i18n="app.onboarding.city"></span><input name="city" /></label>
+          <button id="create-enrollment" class="button primary" type="submit" data-i18n="app.onboarding.generate"></button>
+        </form>
+        <div id="enrollment-error" class="form-error" hidden></div>
+        <div id="enrollment-result" class="enrollment-result" hidden>
+          <div class="token-row"><span data-i18n="app.onboarding.token"></span><strong id="enrollment-token"></strong></div>
+          <div id="enrollment-expiry" class="metric-sub"></div>
+        </div>
+      </div>
+
+      <div class="onboarding-step">
+        <strong data-i18n="app.onboarding.step2"></strong>
+        <p class="step-note" data-i18n="app.onboarding.credentialsNote"></p>
+        <div class="codebox"><span id="install-command" data-i18n="app.onboarding.commandPending"></span><button id="copy-command" class="button small" disabled data-i18n="app.onboarding.copy"></button></div>
+      </div>
+
+      <div class="onboarding-step">
+        <strong data-i18n="app.onboarding.step3"></strong>
+        <div id="gateway-waiting" class="gateway-waiting" data-i18n="app.onboarding.waiting"></div>
+        <div id="discovery-list" class="discovery-list"></div>
+      </div>
+      <div class="modal-actions"><span id="enrollment-limit-note" class="free-limit-note" data-i18n="app.onboarding.freeLimit"></span><button class="button" data-close-modal data-i18n="app.onboarding.close"></button></div>
+    </div>
+  </div>
+
+  <div id="live-modal" class="modal-backdrop">
+    <div class="modal telemetry-modal">
+      <h2 data-i18n="app.telemetryTitle"></h2><p data-i18n="app.telemetryBody"></p>
+      <video id="live-player" class="live-player" autoplay muted controls playsinline hidden></video>
+      <div id="live-player-status" class="camera-placeholder compact"><span data-i18n="app.live.playerHint"></span></div>
+      <div id="camera-telemetry-list" class="telemetry-list"></div>
+      <video id="archive-player" class="archive-player" controls playsinline hidden></video>
+      <div id="archive-player-status" class="camera-placeholder compact"><span data-i18n="app.archive.playerHint"></span></div>
+      <div style="display:flex;justify-content:flex-end"><button class="button" data-close-live data-i18n="app.close"></button></div>
+    </div>
+  </div>
+
+
+  <div id="brand-modal" class="modal-backdrop">
+    <form id="brand-form" class="modal">
+      <h2 data-i18n="app.brand.title"></h2><p data-i18n="app.brand.subtitle"></p>
+      <div class="brand-form-grid">
+        <label class="field"><span data-i18n="app.brand.name"></span><input name="name" autocomplete="off" /></label>
+        <label class="field"><span data-i18n="app.brand.legalName"></span><input name="legalName" autocomplete="off" /></label>
+        <label class="field"><span data-i18n="app.brand.logo"></span><input name="logoUrl" type="url" placeholder="https://…" /></label>
+        <label class="field"><span data-i18n="app.brand.favicon"></span><input name="faviconUrl" type="url" placeholder="https://…/favicon.svg" /></label>
+        <label class="field"><span data-i18n="app.brand.primary"></span><input name="primary" type="color" /></label>
+        <label class="field"><span data-i18n="app.brand.accent"></span><input name="accent" type="color" /></label>
+        <label class="field"><span data-i18n="app.brand.background"></span><input name="background" type="color" /></label>
+        <label class="field"><span data-i18n="app.brand.surface"></span><input name="surface" type="color" /></label>
+        <label class="field"><span data-i18n="app.brand.text"></span><input name="text" type="color" /></label>
+        <label class="field"><span data-i18n="app.brand.muted"></span><input name="muted" type="color" /></label>
+        <label class="field"><span data-i18n="app.brand.radius"></span><input name="radius" type="number" min="0" max="40" /></label>
+        <label class="field"><span data-i18n="app.brand.freeCameras"></span><input name="freeCameras" type="number" min="0" max="100" /></label>
+        <label class="field field-wide"><span data-i18n="app.brand.locales"></span><input name="supportedLocales" placeholder="en, es, ru" /></label>
+        <label class="field field-wide"><span data-i18n="app.brand.gatewayImage"></span><input name="gatewayImage" placeholder="registry.example.com/vms-gateway:latest" /></label>
+        <label class="field field-wide"><span data-i18n="app.brand.apiBase"></span><input name="apiBaseUrl" type="url" placeholder="https://app.example.com" /></label>
+        <label class="field field-wide"><span data-i18n="app.brand.commandTemplate"></span><textarea name="installCommandTemplate" rows="7"></textarea></label>
+        <label class="field field-wide"><span data-i18n="app.brand.css"></span><input name="customCssUrl" type="url" placeholder="https://…/brand.css" /></label>
+      </div>
+      <div class="modal-actions">
+        <button id="brand-reset" type="button" class="button" data-i18n="app.brand.reset"></button>
+        <button type="button" class="button" data-close-brand data-i18n="app.close"></button>
+        <button type="submit" class="button primary" data-i18n="app.brand.save"></button>
+      </div>
+    </form>
+  </div>
+
+  <script type="module" src="dashboard.js"></script>
+</body>
+</html>

@@ -1,0 +1,48 @@
+{
+  "generated_at": "2026-08-27T10:00:00Z",
+  "customers": [
+    {
+      "id": "acme-retail",
+      "name": "ACME Retail",
+      "sites": [
+        {
+          "id": "madrid-centro",
+          "customer_id": "acme-retail",
+          "name": "Madrid Centro",
+          "city": "Madrid",
+          "cameras": [
+            {"id":"cam-001","name":"Entrance","site_id":"madrid-centro","status":"healthy","fps":25,"bitrate_kbps":1840,"last_seen":"2026-08-27T10:00:00Z"},
+            {"id":"cam-002","name":"Checkout 01","site_id":"madrid-centro","status":"healthy","fps":25,"bitrate_kbps":2110,"last_seen":"2026-08-27T10:00:00Z"},
+            {"id":"cam-003","name":"Stock room","site_id":"madrid-centro","status":"warning","fps":12,"bitrate_kbps":620,"last_seen":"2026-08-27T09:59:42Z"}
+          ]
+        },
+        {
+          "id": "valencia-russafa",
+          "customer_id": "acme-retail",
+          "name": "Valencia Russafa",
+          "city": "Valencia",
+          "cameras": [
+            {"id":"cam-004","name":"Entrance","site_id":"valencia-russafa","status":"healthy","fps":20,"bitrate_kbps":1520,"last_seen":"2026-08-27T10:00:00Z"},
+            {"id":"cam-005","name":"Warehouse","site_id":"valencia-russafa","status":"offline","fps":null,"bitrate_kbps":null,"last_seen":"2026-08-27T09:43:11Z"}
+          ]
+        }
+      ]
+    },
+    {
+      "id": "hotel-group",
+      "name": "Hotel Group",
+      "sites": [
+        {
+          "id": "alicante-marina",
+          "customer_id": "hotel-group",
+          "name": "Alicante Marina",
+          "city": "Alicante",
+          "cameras": [
+            {"id":"cam-006","name":"Reception","site_id":"alicante-marina","status":"healthy","fps":25,"bitrate_kbps":2040,"last_seen":"2026-08-27T10:00:00Z"},
+            {"id":"cam-007","name":"Parking","site_id":"alicante-marina","status":"healthy","fps":15,"bitrate_kbps":940,"last_seen":"2026-08-27T10:00:00Z"}
+          ]
+        }
+      ]
+    }
+  ]
+}

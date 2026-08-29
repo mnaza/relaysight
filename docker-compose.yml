@@ -1,0 +1,121 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: services/api/Dockerfile
+    environment:
+      API_BIND: 0.0.0.0:8080
+      GATEWAY_TOKEN: ${GATEWAY_TOKEN:-demo-local-token}
+      STALE_CAMERA_SECONDS: 75
+      PLUGIN_DIR: /config/plugins.d
+      DEFAULT_STORAGE_PLUGIN: ${DEFAULT_STORAGE_PLUGIN:-storage-s3}
+      DEFAULT_AI_PLUGIN: ${DEFAULT_AI_PLUGIN:-ai-http-adapter}
+      DEFAULT_RETENTION_DAYS: ${DEFAULT_RETENTION_DAYS:-30}
+      RTC_ICE_SERVERS_JSON: ${RTC_ICE_SERVERS_JSON:-}
+      AI_PLUGIN_TOKEN: ${AI_PLUGIN_TOKEN:-demo-ai-plugin-token}
+      STORAGE_PLUGIN_TOKEN: ${STORAGE_PLUGIN_TOKEN:-demo-storage-plugin-token}
+      RUST_LOG: info
+    volumes:
+      - ./plugins.d:/config/plugins.d:ro
+    ports:
+      - "8080:8080"
+
+  web:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./web:/usr/share/nginx/html:ro
+      - ./web/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      - "8081:80"
+    depends_on:
+      - api
+
+  gateway:
+    profiles: ["edge"]
+    build:
+      context: .
+      dockerfile: edge/gateway/Dockerfile
+    network_mode: host
+    environment:
+      API_URL: http://127.0.0.1:8080
+      GATEWAY_ID: demo-gateway-01
+      GATEWAY_TOKEN: demo-local-token
+      ENROLLMENT_TOKEN: ${ENROLLMENT_TOKEN:-}
+      # 0 = unlimited. Enrollment may replace this with a hosted commercial entitlement.
+      CAMERA_LIMIT: ${CAMERA_LIMIT:-0}
+      CUSTOMER_ID: pilot-customer
+      CUSTOMER_NAME: Pilot customer
+      SITE_ID: madrid-demo
+      SITE_NAME: Madrid demo
+      SITE_CITY: Madrid
+      HEARTBEAT_INTERVAL_SECONDS: 10
+      ONVIF_DISCOVERY_SECONDS: 3
+      CAMERA_PROBE_INTERVAL_SECONDS: 30
+      RTSP_PROBE_SECONDS: 5
+      COMMAND_POLL_INTERVAL_SECONDS: ${COMMAND_POLL_INTERVAL_SECONDS:-1}
+      CAMERA_USERNAME: ${CAMERA_USERNAME:-admin}
+      CAMERA_PASSWORD: ${CAMERA_PASSWORD:-}
+      CAMERA_RTSP_URL: ${CAMERA_RTSP_URL:-}
+      RUST_LOG: info
+    depends_on:
+      - api
+
+  ai-plugin:
+    profiles: ["plugins"]
+    build: ./plugins/examples/ai-http-adapter
+    environment:
+      PLUGIN_TOKEN: ${AI_PLUGIN_TOKEN:-demo-ai-plugin-token}
+      UPSTREAM_AI_URL: ${UPSTREAM_AI_URL:-}
+      UPSTREAM_AI_TOKEN: ${UPSTREAM_AI_TOKEN:-}
+      # Explicitly synthetic demo boxes when no upstream model is configured. Disable outside local demos.
+      SIMULATED_AI: ${SIMULATED_AI:-true}
+    ports:
+      - "9001:9001"
+
+  minio:
+    profiles: ["plugins"]
+    image: minio/minio:latest
+    command: server /data --console-address :9001
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+    volumes:
+      - minio-data:/data
+    ports:
+      - "9100:9000"
+      - "9101:9001"
+
+  minio-init:
+    profiles: ["plugins"]
+    image: minio/mc:latest
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "until mc alias set local http://minio:9000 ${MINIO_ROOT_USER:-minioadmin} ${MINIO_ROOT_PASSWORD:-minioadmin123}; do sleep 1; done;
+      mc mb --ignore-existing local/${S3_BUCKET:-vms};
+      echo '<CORSConfiguration><CORSRule><AllowedOrigin>*</AllowedOrigin><AllowedMethod>GET</AllowedMethod><AllowedMethod>HEAD</AllowedMethod><AllowedMethod>PUT</AllowedMethod><AllowedHeader>*</AllowedHeader><ExposeHeader>ETag</ExposeHeader><MaxAgeSeconds>3600</MaxAgeSeconds></CORSRule></CORSConfiguration>' | mc cors set local/${S3_BUCKET:-vms} -;
+      exit 0"
+
+  storage-plugin:
+    profiles: ["plugins"]
+    build: ./plugins/examples/storage-s3
+    depends_on:
+      - minio-init
+    environment:
+      PLUGIN_TOKEN: ${STORAGE_PLUGIN_TOKEN:-demo-storage-plugin-token}
+      S3_ENDPOINT: http://minio:9000
+      # Signed URLs are consumed from the host/browser, so the signing host is public.
+      S3_PUBLIC_ENDPOINT: ${S3_PUBLIC_ENDPOINT:-http://localhost:9100}
+      # Edge gateway in this compose profile uses host networking. Services use Docker DNS.
+      S3_EDGE_ENDPOINT: ${S3_EDGE_ENDPOINT:-http://localhost:9100}
+      S3_SERVICE_ENDPOINT: ${S3_SERVICE_ENDPOINT:-http://minio:9000}
+      S3_BUCKET: ${S3_BUCKET:-vms}
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+      AWS_REGION: us-east-1
+      S3_ADDRESSING_STYLE: path
+    ports:
+      - "9002:9002"
+
+volumes:
+  minio-data:

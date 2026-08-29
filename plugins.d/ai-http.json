@@ -1,0 +1,17 @@
+{
+  "endpoint": "http://ai-plugin:9001",
+  "enabled": true,
+  "token_env": "AI_PLUGIN_TOKEN",
+  "manifest": {
+    "id": "ai-http-adapter",
+    "name": "AI HTTP Adapter",
+    "version": "0.1.0",
+    "protocol_version": 1,
+    "vendor": "example",
+    "description": "Connect a custom HTTP AI inference service.",
+    "capabilities": [
+      "ai_analyze"
+    ]
+  },
+  "placement": "either"
+}

@@ -1,0 +1,21 @@
+services:
+  commercial-control-plane:
+    build:
+      context: .
+      dockerfile: commercial/control-plane/Dockerfile
+    environment:
+      CONTROL_PLANE_BIND: 0.0.0.0:8090
+      ENTITLEMENTS_TOKEN: ${ENTITLEMENTS_TOKEN:-commercial-demo-token}
+      COMMERCIAL_FREE_CAMERA_LIMIT: ${COMMERCIAL_FREE_CAMERA_LIMIT:-3}
+      # Comma-separated customer IDs that should receive the paid/unlimited entitlement in this prototype.
+      PAID_CUSTOMERS: ${PAID_CUSTOMERS:-}
+      RUST_LOG: info
+    ports:
+      - "8090:8090"
+
+  api:
+    environment:
+      ENTITLEMENTS_URL: http://commercial-control-plane:8090
+      ENTITLEMENTS_TOKEN: ${ENTITLEMENTS_TOKEN:-commercial-demo-token}
+    depends_on:
+      - commercial-control-plane

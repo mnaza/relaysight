@@ -1,0 +1,36 @@
+{
+  "name": "RelaySight",
+  "legalName": "RelaySight Demo",
+  "logoUrl": "",
+  "faviconUrl": "",
+  "customCssUrl": "",
+  "defaultLocale": "en",
+  "supportedLocales": [
+    "en",
+    "es",
+    "ru"
+  ],
+  "freeTier": {
+    "cameras": 3,
+    "sites": 1,
+    "requiresCard": false
+  },
+  "theme": {
+    "mode": "system",
+    "primary": "#6675f7",
+    "accent": "#23c6a8",
+    "background": "#09111f",
+    "surface": "#111c2f",
+    "text": "#eef4ff",
+    "muted": "#91a0b8",
+    "radius": 18
+  },
+  "gateway": {
+    "image": "vms-gateway:latest",
+    "apiBaseUrl": "",
+    "installCommandTemplate": "docker run --rm --network host \\\n  -e API_URL='{apiUrl}' \\\n  -e ENROLLMENT_TOKEN='{enrollmentToken}' \\\n  -e GATEWAY_ID='{gatewayId}' \\\n  -e CAMERA_LIMIT='{cameraLimit}' \\\n  -e CAMERA_USERNAME='admin' \\\n  -e CAMERA_PASSWORD='YOUR_CAMERA_PASSWORD' \\\n  {image}"
+  },
+  "contact": {
+    "salesEmail": "hello@example.com"
+  }
+}

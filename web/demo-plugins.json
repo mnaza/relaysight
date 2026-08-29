@@ -1,0 +1,32 @@
+[
+  {
+    "endpoint": "http://ai-plugin:9001",
+    "enabled": true,
+    "reachable": true,
+    "manifest": {
+      "id": "ai-http-adapter",
+      "name": "AI HTTP Adapter",
+      "version": "0.1.0",
+      "protocol_version": 1,
+      "vendor": "example",
+      "description": "Connect your own AI inference HTTP service.",
+      "capabilities": ["ai_analyze"]
+    },
+    "last_error": null
+  },
+  {
+    "endpoint": "http://storage-plugin:9002",
+    "enabled": true,
+    "reachable": true,
+    "manifest": {
+      "id": "storage-s3",
+      "name": "S3 Compatible Storage",
+      "version": "0.1.0",
+      "protocol_version": 1,
+      "vendor": "example",
+      "description": "S3, MinIO, B2 and compatible object storage via presigned transfers.",
+      "capabilities": ["storage_blob"]
+    },
+    "last_error": null
+  }
+]
