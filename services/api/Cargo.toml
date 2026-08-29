@@ -19,3 +19,8 @@ uuid.workspace = true
 vms-domain = { path = "../../crates/domain" }
 vms-plugin-sdk = { path = "../../crates/plugin-sdk" }
 vms-plugin-runtime = { path = "../../crates/plugin-runtime" }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+tempfile = "3"

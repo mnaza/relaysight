@@ -179,6 +179,16 @@ impl PluginRegistry {
         .await
     }
 
+    /// Whether a plugin with this id is registered at all.
+    ///
+    /// Handlers need this to answer "no such plugin" with 404 rather than the
+    /// 502 that a reachable-but-failing plugin earns. Collapsing the two makes a
+    /// typo look like an outage, and clients that retry on 502 retry forever
+    /// against something that will never exist.
+    pub async fn is_registered(&self, id: &str) -> bool {
+        self.plugins.read().await.contains_key(id)
+    }
+
     async fn entry(&self, id: &str) -> anyhow::Result<PluginEntry> {
         self.plugins
             .read()

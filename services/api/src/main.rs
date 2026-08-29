@@ -119,11 +119,25 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or(30),
     };
 
+    let app = build_router(state.clone());
+
+    tokio::spawn(retention_loop(state.clone()));
+    info!(%addr, "API listening");
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown())
+        .await?;
+    Ok(())
+}
+
+/// Build the HTTP surface. Split out of `main` so tests can drive it with a
+/// `AppState` of their own rather than a live socket and the environment.
+fn build_router(state: AppState) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
         .allow_headers(Any);
-    let app = Router::new()
+    Router::new()
         .route("/healthz", get(healthz))
         .route("/api/v1/system/edition", get(system_edition))
         .route("/api/v1/fleet", get(fleet))
@@ -180,15 +194,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .layer(cors)
         .layer(TraceLayer::new_for_http())
-        .with_state(state.clone());
-
-    tokio::spawn(retention_loop(state.clone()));
-    info!(%addr, "API listening");
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown())
-        .await?;
-    Ok(())
+        .with_state(state)
 }
 
 async fn shutdown() {
@@ -398,6 +404,9 @@ async fn plugin_health(
     State(state): State<AppState>,
     Path(plugin_id): Path<String>,
 ) -> Result<Json<PluginHealth>, StatusCode> {
+    if !state.plugins.is_registered(&plugin_id).await {
+        return Err(StatusCode::NOT_FOUND);
+    }
     state
         .plugins
         .health(&plugin_id)
@@ -411,6 +420,9 @@ async fn plugin_ai_analyze(
     Path(plugin_id): Path<String>,
     Json(body): Json<AiAnalyzeRequest>,
 ) -> Result<Json<AiAnalyzeResponse>, StatusCode> {
+    if !state.plugins.is_registered(&plugin_id).await {
+        return Err(StatusCode::NOT_FOUND);
+    }
     state
         .plugins
         .ai_analyze(&plugin_id, &body)
@@ -424,6 +436,9 @@ async fn plugin_storage_upload(
     Path(plugin_id): Path<String>,
     Json(body): Json<StorageUploadRequest>,
 ) -> Result<Json<SignedTransfer>, StatusCode> {
+    if !state.plugins.is_registered(&plugin_id).await {
+        return Err(StatusCode::NOT_FOUND);
+    }
     state
         .plugins
         .storage_upload(&plugin_id, &body)
@@ -437,6 +452,9 @@ async fn plugin_storage_download(
     Path(plugin_id): Path<String>,
     Json(body): Json<StorageDownloadRequest>,
 ) -> Result<Json<SignedTransfer>, StatusCode> {
+    if !state.plugins.is_registered(&plugin_id).await {
+        return Err(StatusCode::NOT_FOUND);
+    }
     state
         .plugins
         .storage_download(&plugin_id, &body)
@@ -450,6 +468,9 @@ async fn plugin_storage_delete(
     Path(plugin_id): Path<String>,
     Json(body): Json<StorageDeleteRequest>,
 ) -> Result<Json<StorageDeleteResponse>, StatusCode> {
+    if !state.plugins.is_registered(&plugin_id).await {
+        return Err(StatusCode::NOT_FOUND);
+    }
     state
         .plugins
         .storage_delete(&plugin_id, &body)
@@ -1013,5 +1034,493 @@ fn demo_fleet() -> FleetSnapshot {
                 }],
             },
         ],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    const SHARED_TOKEN: &str = "shared-bootstrap-token";
+
+    async fn test_state() -> AppState {
+        let dir = tempfile::tempdir().expect("temp plugin dir");
+        let plugin_dir = dir.keep();
+        AppState {
+            gateways: Arc::new(RwLock::new(HashMap::new())),
+            camera_batches: Arc::new(RwLock::new(HashMap::new())),
+            enrollments: Arc::new(RwLock::new(HashMap::new())),
+            gateway_tokens: Arc::new(RwLock::new(HashMap::new())),
+            gateway_token: Arc::from(SHARED_TOKEN),
+            stale_camera_seconds: 75,
+            // No ENTITLEMENTS_URL is set under test, so this resolves the
+            // community entitlement locally and never reaches the network.
+            entitlements: EntitlementResolver::from_env(),
+            plugins: PluginRegistry::load_dir(&plugin_dir)
+                .await
+                .expect("empty plugin dir"),
+            plugin_dir: Arc::new(plugin_dir),
+            command_queues: Arc::new(RwLock::new(HashMap::new())),
+            commands: Arc::new(RwLock::new(HashMap::new())),
+            recordings: Arc::new(RwLock::new(HashMap::new())),
+            default_storage_plugin: Arc::from("storage-s3"),
+            default_ai_plugin: Arc::from("ai-http-adapter"),
+            rtc_ice_servers: Arc::new(Vec::new()),
+            default_retention_days: 30,
+        }
+    }
+
+    async fn send(state: &AppState, request: Request<Body>) -> (StatusCode, serde_json::Value) {
+        let response = build_router(state.clone())
+            .oneshot(request)
+            .await
+            .expect("router responds");
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, body)
+    }
+
+    fn post(uri: &str, token: Option<&str>, body: serde_json::Value) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json");
+        if let Some(token) = token {
+            builder = builder.header("authorization", format!("Bearer {token}"));
+        }
+        builder.body(Body::from(body.to_string())).unwrap()
+    }
+
+    fn get(uri: &str) -> Request<Body> {
+        Request::builder().uri(uri).body(Body::empty()).unwrap()
+    }
+
+    fn telemetry_batch(gateway_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "gateway_id": gateway_id,
+            "customer_id": "cust-1",
+            "customer_name": "Customer",
+            "site_id": "site-1",
+            "site_name": "Site",
+            "city": "Barcelona",
+            "sent_at": chrono::Utc::now(),
+            "cameras": [],
+        })
+    }
+
+    #[tokio::test]
+    async fn healthz_reports_the_service() {
+        let state = test_state().await;
+        let (status, body) = send(&state, get("/healthz")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["service"], "vms-api");
+    }
+
+    // ---- the authorisation boundary ----
+
+    #[tokio::test]
+    async fn telemetry_without_a_token_is_refused() {
+        // Unauthenticated telemetry would let anyone inject camera state into
+        // another customer's fleet view.
+        let state = test_state().await;
+        let (status, _) = send(
+            &state,
+            post("/api/v1/cameras/telemetry", None, telemetry_batch("gw-1")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(state.camera_batches.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn telemetry_with_the_wrong_token_is_refused() {
+        let state = test_state().await;
+        let (status, _) = send(
+            &state,
+            post(
+                "/api/v1/cameras/telemetry",
+                Some("not-the-token"),
+                telemetry_batch("gw-1"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn a_malformed_authorization_header_is_refused() {
+        // Only the Bearer scheme is accepted; a bare token must not pass.
+        let state = test_state().await;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/v1/cameras/telemetry")
+            .header("content-type", "application/json")
+            .header("authorization", SHARED_TOKEN)
+            .body(Body::from(telemetry_batch("gw-1").to_string()))
+            .unwrap();
+        let (status, _) = send(&state, request).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn the_shared_token_admits_any_gateway_id() {
+        // Deliberate: this is the bootstrap path before a gateway has enrolled.
+        // Pinned because it is a real weakening — anyone holding GATEWAY_TOKEN
+        // can post as any gateway, so it must stay a bootstrap secret.
+        let state = test_state().await;
+        let (status, _) = send(
+            &state,
+            post(
+                "/api/v1/cameras/telemetry",
+                Some(SHARED_TOKEN),
+                telemetry_batch("any-gateway-at-all"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(
+            state
+                .camera_batches
+                .read()
+                .await
+                .contains_key("any-gateway-at-all")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_enrolled_gateway_token_works_and_does_not_cover_other_gateways() {
+        let state = test_state().await;
+
+        let (status, created) = send(
+            &state,
+            post(
+                "/api/v1/enrollments",
+                None,
+                serde_json::json!({
+                    "customer_id": "cust-1",
+                    "customer_name": "Customer",
+                    "site_id": "site-1",
+                    "site_name": "Site",
+                    "city": "Barcelona",
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let enrollment_token = created["enrollment_token"].as_str().unwrap().to_owned();
+
+        let (status, enrolled) = send(
+            &state,
+            post(
+                "/api/v1/gateways/enroll",
+                None,
+                serde_json::json!({
+                    "enrollment_token": enrollment_token,
+                    "gateway_id": "gw-1",
+                    "hostname": "edge-1",
+                    "version": "0.1.0",
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let gateway_token = enrolled["gateway_token"].as_str().unwrap().to_owned();
+        assert_ne!(
+            gateway_token, SHARED_TOKEN,
+            "enrolment must mint a new token"
+        );
+
+        let (status, _) = send(
+            &state,
+            post(
+                "/api/v1/cameras/telemetry",
+                Some(&gateway_token),
+                telemetry_batch("gw-1"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        // The token is bound to the gateway it was issued for. Without this a
+        // stolen token from one site would speak for every other site.
+        let (status, _) = send(
+            &state,
+            post(
+                "/api/v1/cameras/telemetry",
+                Some(&gateway_token),
+                telemetry_batch("gw-2-belonging-to-someone-else"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn an_enrollment_token_cannot_be_used_twice() {
+        let state = test_state().await;
+        let (_, created) = send(
+            &state,
+            post(
+                "/api/v1/enrollments",
+                None,
+                serde_json::json!({
+                    "customer_id": "cust-1",
+                    "customer_name": "Customer",
+                    "site_id": "site-1",
+                    "site_name": "Site",
+                    "city": "Barcelona",
+                }),
+            ),
+        )
+        .await;
+        let token = created["enrollment_token"].as_str().unwrap().to_owned();
+        let enroll = |gateway: &str| {
+            post(
+                "/api/v1/gateways/enroll",
+                None,
+                serde_json::json!({
+                    "enrollment_token": token,
+                    "gateway_id": gateway,
+                    "hostname": "edge",
+                    "version": "0.1.0",
+                }),
+            )
+        };
+        let (first, _) = send(&state, enroll("gw-1")).await;
+        assert_eq!(first, StatusCode::OK);
+        let (second, _) = send(&state, enroll("gw-2")).await;
+        assert_ne!(
+            second,
+            StatusCode::OK,
+            "a replayed enrolment code must not mint a second gateway token"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_heartbeat_from_an_unauthenticated_gateway_is_refused() {
+        let state = test_state().await;
+        let (status, _) = send(
+            &state,
+            post(
+                "/api/v1/gateways/heartbeat",
+                None,
+                serde_json::json!({
+                    "gateway_id": "gw-1",
+                    "site_id": "site-1",
+                    "hostname": "edge-1",
+                    "version": "0.1.0",
+                    "uptime_seconds": 10,
+                    "cpu_percent": 1.0,
+                    "memory_percent": 2.0,
+                    "cameras_seen": 0,
+                    "healthy_cameras": 0,
+                    "warning_cameras": 0,
+                    "offline_cameras": 0,
+                    "sent_at": chrono::Utc::now(),
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(state.gateways.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unknown_plugin_is_a_404_not_a_bad_gateway() {
+        // 502 says "the upstream failed", which invites a retry. There is no
+        // upstream here — the id is wrong, and no amount of retrying fixes that.
+        let state = test_state().await;
+        for path in [
+            "/api/v1/plugins/nope/health",
+            "/api/v1/plugins/nope/ai/analyze",
+            "/api/v1/plugins/nope/storage/uploads",
+        ] {
+            let request = if path.ends_with("health") {
+                get(path)
+            } else {
+                post(path, None, serde_json::json!({}))
+            };
+            let (status, _) = send(&state, request).await;
+            assert_ne!(
+                status,
+                StatusCode::BAD_GATEWAY,
+                "{path} reported an outage for a plugin that does not exist"
+            );
+        }
+        let (status, _) = send(&state, get("/api/v1/plugins/nope/health")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_command_is_a_404_not_a_500() {
+        let state = test_state().await;
+        let (status, _) = send(&state, get("/api/v1/commands/does-not-exist")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    fn camera(camera_id: &str, gateway_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "camera_id": camera_id,
+            "gateway_id": gateway_id,
+            "site_id": "site-1",
+            "name": "Front door",
+            "status": "healthy",
+            "manufacturer": null, "model": null, "firmware": null,
+            "profile_name": null, "codec": "h264",
+            "width": 1920, "height": 1080,
+            "fps": null, "bitrate_kbps": null,
+            "packet_loss": 0, "reconnects": 0,
+            "rtsp_endpoint": "rtsp://10.0.0.5/stream",
+            "last_seen": chrono::Utc::now(),
+            "last_error": null,
+        })
+    }
+
+    async fn with_camera(state: &AppState, camera_id: &str, gateway_id: &str) {
+        let mut batch = telemetry_batch(gateway_id);
+        batch["cameras"] = serde_json::json!([camera(camera_id, gateway_id)]);
+        let (status, _) = send(
+            state,
+            post("/api/v1/cameras/telemetry", Some(SHARED_TOKEN), batch),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn a_live_request_becomes_a_command_the_right_gateway_collects() {
+        // The whole point of the outbound design: the cloud never dials the
+        // gateway, it parks a command that the gateway picks up on its own poll.
+        let state = test_state().await;
+        with_camera(&state, "cam-1", "gw-1").await;
+
+        let (status, accepted) = send(
+            &state,
+            post(
+                "/api/v1/cameras/cam-1/live",
+                None,
+                serde_json::json!({"offer_sdp": "v=0\r\n", "offer_type": "offer"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let command_id = accepted["command_id"].as_str().unwrap().to_owned();
+
+        // Another gateway must not be handed this site's command.
+        // An empty queue answers 200 with a null body rather than 204, because
+        // the gateway deserialises Option<GatewayCommand> and an empty body has
+        // nothing to deserialise. Assert the meaning, not the status.
+        let (status, offered) = send(
+            &state,
+            Request::builder()
+                .uri("/api/v1/gateways/gw-2/commands/next")
+                .header("authorization", format!("Bearer {SHARED_TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            offered.is_null(),
+            "gw-2 was offered a command addressed to gw-1: {offered}"
+        );
+
+        let (status, command) = send(
+            &state,
+            Request::builder()
+                .uri("/api/v1/gateways/gw-1/commands/next")
+                .header("authorization", format!("Bearer {SHARED_TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(command["id"], command_id.as_str());
+
+        // A command is handed out once. Polling again after collection must not
+        // replay it, or a gateway reconnecting would start duplicate sessions.
+        let (_, replayed) = send(
+            &state,
+            Request::builder()
+                .uri("/api/v1/gateways/gw-1/commands/next")
+                .header("authorization", format!("Bearer {SHARED_TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert!(replayed.is_null(), "the command was handed out twice");
+
+        let (status, _) = send(
+            &state,
+            post(
+                &format!("/api/v1/gateways/gw-1/commands/{command_id}/complete"),
+                Some(SHARED_TOKEN),
+                serde_json::json!({
+                    "command_id": command_id,
+                    "gateway_id": "gw-1",
+                    "status": "succeeded",
+                    "completed_at": chrono::Utc::now(),
+                    "error": null,
+                    "recording": null,
+                    "live": null,
+                    "analysis": null,
+                }),
+            ),
+        )
+        .await;
+        assert!(
+            status.is_success() || status == StatusCode::NO_CONTENT,
+            "completing a collected command failed with {status}"
+        );
+
+        let (status, view) = send(&state, get(&format!("/api/v1/commands/{command_id}"))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(view["command"]["id"], command_id.as_str());
+        assert_eq!(
+            view["status"], "succeeded",
+            "the completion must be visible to whoever is waiting on the command"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_live_request_for_an_unknown_camera_is_a_404() {
+        let state = test_state().await;
+        let (status, _) = send(
+            &state,
+            post(
+                "/api/v1/cameras/no-such-camera/live",
+                None,
+                serde_json::json!({"offer_sdp": "v=0\r\n"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_gateway_cannot_collect_another_gateways_commands() {
+        // The path carries the gateway id, so an enrolled token must be checked
+        // against it and not merely be present.
+        let state = test_state().await;
+        state
+            .gateway_tokens
+            .write()
+            .await
+            .insert("gw-1".into(), "token-for-gw-1".into());
+        let (status, _) = send(
+            &state,
+            Request::builder()
+                .uri("/api/v1/gateways/gw-2/commands/next")
+                .header("authorization", "Bearer token-for-gw-1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 }

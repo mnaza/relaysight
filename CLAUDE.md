@@ -39,8 +39,8 @@ node --check web/theme.js && node --check web/landing.js && node --check web/das
 
 - **Compiles.** Whole workspace plus `commercial/control-plane`.
 - `clippy -- -D warnings` **clean**; `cargo fmt` clean.
-- **40 tests, all passing**, including nine that speak real RTSP and three that
-  negotiate a real peer connection.
+- **53 tests, all passing**, including nine that speak real RTSP, three that negotiate
+  a real peer connection, and thirteen that drive the HTTP surface.
   `src/fake_camera.rs` is a test-only RTSP server that serves
   `fixtures/camera.h264` — three seconds of genuine H.264 made once with ffmpeg and
   committed, so the build needs no encoder — over RTP interleaved on the TCP control
@@ -53,7 +53,13 @@ node --check web/theme.js && node --check web/landing.js && node --check web/das
   accepts the answer and counts the RTP that arrives. `live::start_h264` is covered end
   to end through it: camera to RTSP to gateway to peer connection, asserting real
   payload rather than merely that packets appeared.
-  **The API and the gateway command protocol still have no tests at all.**
+  The API is covered by driving `build_router` with `tower`'s `oneshot` — no socket, no
+  environment. The tests concentrate on the authorisation boundary and the command
+  protocol, because those are where a mistake is a security or correctness failure
+  rather than a cosmetic one: telemetry and heartbeats refused without a Bearer token,
+  an enrolled gateway token bound to the gateway it was issued for, an enrolment code
+  that cannot be replayed, and a command queue that hands each command to one gateway
+  once.
 - Never run against a real camera. Never run under Docker Compose.
 
 The three fixes that made it build, all in `edge/gateway/src/live.rs`, are worth knowing
@@ -79,13 +85,18 @@ because the same mistake will recur:
    start, or out of band, will break it. Hikvision and Dahua at minimum need real
    hardware testing. This tail is the actual moat in this market and it is ground out one
    vendor at a time.
-3. **The API and the gateway command loop have no tests.** The media path is now
-   covered on both sides; this is what is left.
+3. **The web front-end has no tests**, and neither does the plugin runtime beyond what
+   the API tests reach through it.
 
 The two fakes are the way to test anything in the media path: `FakeCamera::start(bool)`
 for the camera end (the flag makes it demand Basic auth), `FakeBrowser::offer()` for the
 viewer end. Both bind loopback on an ephemeral port and need no network. The suite was
 run five times over to confirm the sockets and ICE do not flake.
+
+⚠️ **`GATEWAY_TOKEN` authorises any `gateway_id`.** That is the bootstrap path before a
+gateway enrols, and a test pins it so nobody assumes otherwise — but it means anyone
+holding that value can post telemetry as any gateway on the deployment. Treat it as a
+provisioning secret with a short life, not a service credential.
 
 **Every path that touches a camera URL goes through `rtsp::strip_userinfo`.** Live,
 archive and the HTTP snapshot each used to carry their own copy, and `redacted_endpoint`
