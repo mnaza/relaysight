@@ -89,10 +89,9 @@ because the same mistake will recur:
 3. **Nothing renders the UI, and no plugin is run for real.** The Python example
    plugins are tested only where they are pure; their HTTP handlers, and the boto3 and
    upstream calls behind them, are not exercised.
-4. **`dashboard-app.js` is still at its pre-split indentation.** The body was moved
-   out of `dashboard.js` unchanged and deliberately not re-indented, because the file
-   holds 51 template literals whose contents whitespace changes. Now that the render
-   tests exist, re-indenting is safe to do as its own change — and should be.
+4. **Nothing checks the CSS**, and no test opens a real browser — jsdom has no
+   layout, so a rule that hides an element or a grid that collapses on a phone would
+   pass everything here.
 
 Three fakes carry the integration tests, all binding loopback on an ephemeral port and
 needing no network: `FakeCamera::start(bool)` for the camera end (the flag makes it
@@ -122,6 +121,13 @@ requiring the SDK in CI to test twenty lines of string handling is a poor trade.
 Web tests run with `npm test --prefix web`. **jsdom is the repository's only JavaScript
 dependency and it is test-only** — the shipped page loads no bundler and no framework,
 and that is worth keeping.
+
+⚠️ **In `dashboard-app.js`, the four `innerHTML` template literals are indented one
+level out from the code around them, on purpose.** Everything between the backticks is
+literal content, the leading whitespace included, so indenting those lines changes what
+the browser receives — the continuation lines *and* the line holding the closing
+backtick. The rest of the file was re-indented after the split and checked against a
+hash of the rendered page; it comes out identical. Keep that shape.
 
 **`dashboard.js` is bootstrap only; the page lives in `dashboard-app.js` as
 `startDashboard({ brand, locale, dict })`.** It was split so it could be tested: before,
