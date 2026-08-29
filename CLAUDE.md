@@ -39,7 +39,7 @@ node --check web/theme.js && node --check web/landing.js && node --check web/das
 
 - **Compiles.** Whole workspace plus `commercial/control-plane`.
 - `clippy -- -D warnings` **clean**; `cargo fmt` clean.
-- **74 Rust tests, 45 web tests and 11 Python tests, all passing.** Nine speak real
+- **74 Rust tests, 53 web tests and 11 Python tests, all passing.** Nine speak real
   RTSP, three negotiate a real peer connection, thirteen drive the HTTP surface and
   fourteen cover the plugin runtime.
   `src/fake_camera.rs` is a test-only RTSP server that serves
@@ -89,9 +89,10 @@ because the same mistake will recur:
 3. **Nothing renders the UI, and no plugin is run for real.** The Python example
    plugins are tested only where they are pure; their HTTP handlers, and the boto3 and
    upstream calls behind them, are not exercised.
-4. **Nothing checks the CSS**, and no test opens a real browser — jsdom has no
-   layout, so a rule that hides an element or a grid that collapses on a phone would
-   pass everything here.
+4. **No test opens a real browser.** jsdom has no layout engine, so the CSS tests
+   check the theme contract and not the result: a grid that collapses, an element that
+   ends up off screen or a rule that hides something would pass everything here. That
+   needs Playwright and a browser download in CI, which has not been judged worth it.
 
 Three fakes carry the integration tests, all binding loopback on an ephemeral port and
 needing no network: `FakeCamera::start(bool)` for the camera end (the flag makes it
@@ -121,6 +122,19 @@ requiring the SDK in CI to test twenty lines of string handling is a poor trade.
 Web tests run with `npm test --prefix web`. **jsdom is the repository's only JavaScript
 dependency and it is test-only** — the shipped page loads no bundler and no framework,
 and that is worth keeping.
+
+🔴 **White-labelling reaches less than the branding panel implies.** Two findings from
+the CSS tests, both pinned so they cannot widen:
+
+- **`--surface` is written by `applyBrand`, offered as a colour picker in the branding
+  modal, and read by no rule.** A customer picks a surface colour, saves, and nothing
+  changes. Wiring it up means deciding which panels it should colour — `--surface` is
+  `#111c2f` while `.panel` and `.stat-card` paint `#0c1727`, so it is a design call on
+  the default theme, not a rename.
+- **Thirteen rules paint the shell with literal hex.** `.app-body`, `.sidebar`,
+  `.panel`, `.stat-card`, `.modal`, the players and the inputs all ignore the theme, so
+  a branded deployment gets the name, the logo and the accents on the shipped dark blue.
+  The test holds an explicit list, so a new one fails until someone decides to add it.
 
 ⚠️ **In `dashboard-app.js`, the four `innerHTML` template literals are indented one
 level out from the code around them, on purpose.** Everything between the backticks is

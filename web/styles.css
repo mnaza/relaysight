@@ -55,7 +55,7 @@ button { cursor: pointer; }
 .hero-product::before { content: ''; position: absolute; inset: -1px; background: linear-gradient(135deg, color-mix(in srgb, var(--primary) 24%, transparent), transparent 38%, color-mix(in srgb, var(--accent) 12%, transparent)); pointer-events: none; }
 .browser-bar { height: 34px; display: flex; align-items: center; gap: 6px; position: relative; }
 .browser-dot { width: 8px; height: 8px; border-radius: 50%; background: rgba(255,255,255,.22); }
-.mini-app { position: relative; display: grid; grid-template-columns: 112px 1fr; min-height: 400px; background: #09111f; border: 1px solid rgba(255,255,255,.08); border-radius: 16px; overflow: hidden; }
+.mini-app { position: relative; display: grid; grid-template-columns: 112px 1fr; min-height: 400px; background: var(--background); border: 1px solid rgba(255,255,255,.08); border-radius: 16px; overflow: hidden; }
 .mini-sidebar { background: rgba(255,255,255,.035); padding: 18px 12px; border-right: 1px solid rgba(255,255,255,.06); }
 .mini-nav { height: 9px; border-radius: 10px; background: rgba(255,255,255,.11); margin: 18px 0; }
 .mini-main { padding: 20px; }
