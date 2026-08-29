@@ -31,7 +31,10 @@ jobs:
       # Replaces scripts/check-i18n.py, which scanned only the HTML and so left
       # every t() call in dashboard.js unchecked. Also covers interpolation
       # parity across locales and brand.json against its own schema.
-      - run: node --test "web/tests/*.test.mjs"
+      # jsdom is the repository's only JavaScript dependency and it is
+      # test-only — the shipped page loads no bundler and no framework.
+      - run: npm ci --prefix web
+      - run: npm test --prefix web
       - run: python3 -m py_compile plugins/examples/ai-http-adapter/plugin.py plugins/examples/storage-s3/plugin.py
       # object_key is the only place a client-supplied string becomes a path
       # inside the bucket, so it is tested. boto3 is stubbed rather than

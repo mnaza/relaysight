@@ -39,7 +39,7 @@ node --check web/theme.js && node --check web/landing.js && node --check web/das
 
 - **Compiles.** Whole workspace plus `commercial/control-plane`.
 - `clippy -- -D warnings` **clean**; `cargo fmt` clean.
-- **74 Rust tests, 17 web tests and 11 Python tests, all passing.** Nine speak real
+- **74 Rust tests, 37 web tests and 11 Python tests, all passing.** Nine speak real
   RTSP, three negotiate a real peer connection, thirteen drive the HTTP surface and
   fourteen cover the plugin runtime.
   `src/fake_camera.rs` is a test-only RTSP server that serves
@@ -89,11 +89,14 @@ because the same mistake will recur:
 3. **Nothing renders the UI, and no plugin is run for real.** The Python example
    plugins are tested only where they are pure; their HTTP handlers, and the boto3 and
    upstream calls behind them, are not exercised.
-4. **Nothing renders the UI.** The web tests cover the pure half — locales, `t()`,
-   `mergeBrand`, brand.json against its schema — but every function touching `document`
-   is unexercised, and so is the plugin runtime beyond what the API tests reach through
-   it. Rendering needs a headless browser, which is a dependency this repo does not
-   have yet.
+4. **`dashboard.js` itself is untestable as written.** It exports nothing and runs
+   `await loadRuntime()` at module scope, so importing it from a test fetches
+   `brand.json` and fails; and 16 of its 32 functions close over the module-level
+   `brand`, `dict` and `locale`. Reaching them means splitting the bootstrap from the
+   render functions and threading that state through — a real refactor of 639 lines of
+   working UI with no runtime test to catch a regression. **Worth doing, but as its own
+   change, not as a side effect of adding tests.** Until then the page tests below cover
+   the part that actually breaks in practice.
 
 Three fakes carry the integration tests, all binding loopback on an ephemeral port and
 needing no network: `FakeCamera::start(bool)` for the camera end (the flag makes it
@@ -120,8 +123,17 @@ inside the bucket, so its traversal guard is tested — with `boto3` stubbed int
 `sys.modules` rather than installed, since the module builds clients at import time and
 requiring the SDK in CI to test twenty lines of string handling is a poor trade.
 
-Web tests run on Node's built-in runner, no dependencies: `node --test "web/tests/*.test.mjs"`.
-They replaced `scripts/check-i18n.py`, which scanned only the HTML and therefore left all
+Web tests run with `npm test --prefix web`. **jsdom is the repository's only JavaScript
+dependency and it is test-only** — the shipped page loads no bundler and no framework,
+and that is worth keeping.
+
+`tests/page.test.mjs` checks the contract between the scripts and the markup: every one
+of the 38 selectors `dashboard.js` hands to `querySelector` must match something in
+`app.html`. The script checks none of them, so a renamed id makes the first
+`appendChild` throw during module evaluation, which stops the whole file — the page
+loads and stays blank, with one line in a console nobody has open. Nothing else in this
+repository can see that, and it is one rename away.
+The i18n tests replaced `scripts/check-i18n.py`, which scanned only the HTML and therefore left all
 79 `t()` calls in `dashboard.js` unchecked. **A missing translation key never throws** —
 `t()` falls back to the key itself, so the user is shown `app.live.connecting` where a
 sentence should be and nothing reports a fault. Those tests are the only thing that

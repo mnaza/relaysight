@@ -1,0 +1,12 @@
+{
+  "name": "relaysight-web",
+  "private": true,
+  "type": "module",
+  "description": "Front-end for RelaySight VMS. jsdom is the only dependency and it is test-only; the shipped page loads no bundler and no framework.",
+  "scripts": {
+    "test": "node --test \"tests/*.test.mjs\""
+  },
+  "devDependencies": {
+    "jsdom": "^26.0.0"
+  }
+}
