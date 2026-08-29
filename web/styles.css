@@ -3,12 +3,10 @@
   --primary: #6675f7;
   --accent: #23c6a8;
   --background: #09111f;
-  --surface: #111c2f;
-  --surface-2: #17243a;
+  --surface: #0c1727;   /* what .panel and .stat-card have always painted */
   --text: #eef4ff;
   --muted: #91a0b8;
   --border: rgba(160, 180, 210, .14);
-  --glass: rgba(17, 28, 47, .72);
   --danger: #ff647c;
   --warning: #f3b64d;
   --radius: 18px;
@@ -131,11 +129,11 @@ button { cursor: pointer; }
 .page-title-row h1 { margin: 0; font-size: 29px; letter-spacing: -.035em; }
 .page-title-row p { color: var(--muted); margin: 8px 0 0; font-size: 14px; }
 .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin: 28px 0; }
-.stat-card { border: 1px solid var(--border); background: #0c1727; border-radius: 15px; padding: 20px; }
+.stat-card { border: 1px solid var(--border); background: var(--surface); border-radius: 15px; padding: 20px; }
 .stat-label { color: var(--muted); font-size: 12px; }
 .stat-value { font-size: 29px; font-weight: 780; letter-spacing: -.035em; margin-top: 9px; }
 .stat-delta { font-size: 11px; color: var(--accent); margin-top: 5px; }
-.panel { border: 1px solid var(--border); background: #0c1727; border-radius: 16px; overflow: hidden; }
+.panel { border: 1px solid var(--border); background: var(--surface); border-radius: 16px; overflow: hidden; }
 .panel-head { display: flex; align-items: center; justify-content: space-between; padding: 18px 20px; border-bottom: 1px solid var(--border); }
 .panel-head strong { font-size: 14px; }
 .demo-tag { font-size: 11px; color: var(--muted); border: 1px solid var(--border); border-radius: 999px; padding: 5px 8px; }

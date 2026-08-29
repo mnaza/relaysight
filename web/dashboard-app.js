@@ -619,7 +619,7 @@ export async function startDashboard({ brand, locale, dict }) {
   const brandFields = {
     name: brand.name || '', legalName: brand.legalName || '', logoUrl: brand.logoUrl || '', faviconUrl: brand.faviconUrl || '',
     primary: brand.theme?.primary || '#6675f7', accent: brand.theme?.accent || '#23c6a8',
-    background: brand.theme?.background || '#09111f', surface: brand.theme?.surface || '#111c2f',
+    background: brand.theme?.background || '#09111f', surface: brand.theme?.surface || '#0c1727',
     text: brand.theme?.text || '#eef4ff', muted: brand.theme?.muted || '#91a0b8', radius: brand.theme?.radius ?? 18,
     freeCameras: brand.freeTier?.cameras ?? 3, supportedLocales: (brand.supportedLocales || ['en']).join(', '),
     gatewayImage: brand.gateway?.image || '', apiBaseUrl: brand.gateway?.apiBaseUrl || '',

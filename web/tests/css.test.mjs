@@ -13,6 +13,7 @@ import { web } from './sources.mjs';
 
 const css = readFileSync(join(web, 'styles.css'), 'utf8');
 const theme = readFileSync(join(web, 'theme.js'), 'utf8');
+const brand = JSON.parse(readFileSync(join(web, 'brand.json'), 'utf8'));
 
 const defined = new Set([...css.matchAll(/(--[\w-]+)\s*:/g)].map(m => m[1]));
 const read = new Set([...css.matchAll(/var\(\s*(--[\w-]+)/g)].map(m => m[1]));
@@ -33,22 +34,30 @@ test('every property the brand can set has a default in the stylesheet', () => {
   assert.deepEqual(missing, []);
 });
 
-test('the brand properties nobody reads are exactly the ones we know about', () => {
-  // ⚠️ `--surface` is written by applyBrand, offered as a colour picker in the
-  // branding panel, and read by no rule at all. A customer picks a surface
-  // colour, saves, and nothing changes. Listing it here rather than hiding it:
-  // wiring it up means deciding which panels it should colour, which is a
-  // design call on the default theme, not a mechanical fix. When that is done
-  // this test fails and the list shrinks.
+test('every property a brand can set is read by at least one rule', () => {
+  // The failure this guards against has no symptom: the value lands on the root
+  // element, no rule reads it, and the customer's colour does nothing. `--surface`
+  // was in exactly that state — written by applyBrand, offered as a colour picker
+  // in the branding modal, consumed nowhere.
   const orphans = [...written].filter(name => !read.has(name)).sort();
-  assert.deepEqual(orphans, ['--surface']);
+  assert.deepEqual(orphans, []);
+});
+
+test('no custom property is defined and then never read', () => {
+  // The other end of the same problem. `--surface-2` and `--glass` sat here as
+  // leftovers of a palette that moved on, which is how a stylesheet accumulates
+  // values nobody can tell are dead.
+  const unread = [...defined].filter(name => !read.has(name)).sort();
+  assert.deepEqual(unread, []);
 });
 
 test('the app chrome that is still hardcoded is exactly this list', () => {
-  // Fourteen rules paint the shell with literal hex instead of a variable, so
-  // white-labelling reaches the name, the logo and the accents but leaves every
-  // panel, card and sidebar the shipped dark blue. Pinned as an explicit set so
-  // a new one cannot appear without someone deciding to add it.
+  // The panels and cards now read --surface, but the rest of the shell still
+  // paints literal hex: the body, the sidebar, the modal, the players and the
+  // inputs. Each is a different shade of the same ladder, and deriving them from
+  // --surface would change how the default theme looks, so they wait for that
+  // decision. Pinned as an explicit set so a new one cannot appear without
+  // someone choosing to add it.
   const body = css.slice(css.indexOf('}') + 1);
   const hardcoded = [...body.matchAll(/([.#][\w-]+)[^{}]*\{[^{}]*background:\s*(#[0-9a-fA-F]{3,8})/g)]
     .map(m => m[1])
@@ -62,12 +71,28 @@ test('the app chrome that is still hardcoded is exactly this list', () => {
     '.field',
     '.live-player',
     '.modal',
-    '.panel',
     '.sidebar',
-    '.stat-card',
     '.telemetry-metric',
     '.timeline-row',
   ]);
+});
+
+test('the shipped brand agrees with the stylesheet defaults', () => {
+  // Two ways to render an unbranded deployment — no brand at all, or the brand
+  // that ships — and they must look the same. If they drift, the page changes
+  // appearance the moment brand.json loads, which reads as a flash of the wrong
+  // theme and is hard to attribute to anything.
+  const root = css.slice(css.indexOf(':root'), css.indexOf('}'));
+  const defaults = Object.fromEntries(
+    [...root.matchAll(/(--[\w-]+):\s*([^;]+);/g)].map(m => [m[1], m[2].trim()]),
+  );
+  for (const [name, value] of Object.entries(brand.theme ?? {})) {
+    if (name === 'mode') continue;
+    const declared = defaults['--' + name];
+    if (declared === undefined) continue;
+    const expected = name === 'radius' ? `${value}px` : String(value);
+    assert.equal(declared, expected, `brand.json ${name} differs from the --${name} default`);
+  }
 });
 
 test('the stylesheet has balanced braces', () => {

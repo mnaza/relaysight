@@ -39,7 +39,7 @@ node --check web/theme.js && node --check web/landing.js && node --check web/das
 
 - **Compiles.** Whole workspace plus `commercial/control-plane`.
 - `clippy -- -D warnings` **clean**; `cargo fmt` clean.
-- **74 Rust tests, 53 web tests and 11 Python tests, all passing.** Nine speak real
+- **74 Rust tests, 55 web tests and 11 Python tests, all passing.** Nine speak real
   RTSP, three negotiate a real peer connection, thirteen drive the HTTP surface and
   fourteen cover the plugin runtime.
   `src/fake_camera.rs` is a test-only RTSP server that serves
@@ -123,18 +123,14 @@ Web tests run with `npm test --prefix web`. **jsdom is the repository's only Jav
 dependency and it is test-only** — the shipped page loads no bundler and no framework,
 and that is worth keeping.
 
-🔴 **White-labelling reaches less than the branding panel implies.** Two findings from
-the CSS tests, both pinned so they cannot widen:
-
-- **`--surface` is written by `applyBrand`, offered as a colour picker in the branding
-  modal, and read by no rule.** A customer picks a surface colour, saves, and nothing
-  changes. Wiring it up means deciding which panels it should colour — `--surface` is
-  `#111c2f` while `.panel` and `.stat-card` paint `#0c1727`, so it is a design call on
-  the default theme, not a rename.
-- **Thirteen rules paint the shell with literal hex.** `.app-body`, `.sidebar`,
-  `.panel`, `.stat-card`, `.modal`, the players and the inputs all ignore the theme, so
-  a branded deployment gets the name, the logo and the accents on the shipped dark blue.
-  The test holds an explicit list, so a new one fails until someone decides to add it.
+⚠️ **White-labelling still stops short of the whole shell.** `--surface` now colours
+the panels and cards, but eleven rules keep painting literal hex: `.app-body`,
+`.sidebar`, `.modal`, the players and the inputs. Each is a different rung of the same
+ladder, and deriving them from `--surface` would change how the default theme looks, so
+they wait on that decision. A test holds the list explicitly, so a twelfth cannot appear
+without someone choosing to add it. Two further tests keep the theme honest in both
+directions: every brand-settable property must be read by some rule, and no property may
+be defined and never read.
 
 ⚠️ **In `dashboard-app.js`, the four `innerHTML` template literals are indented one
 level out from the code around them, on purpose.** Everything between the backticks is
