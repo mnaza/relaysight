@@ -318,3 +318,101 @@ async fn forward_rtsp_h264(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use crate::{fake_browser::FakeBrowser, fake_camera::FakeCamera};
+
+    #[tokio::test]
+    async fn h264_reaches_a_browser_peer_from_a_real_camera() {
+        // The whole live path in one go: RTSP session with the camera, SDP
+        // negotiation with the browser, ICE on loopback, and H.264 forwarded as
+        // encoded samples without transcoding. Every earlier test stopped short
+        // of the peer connection.
+        let camera = FakeCamera::start(false).await.unwrap();
+        let browser = FakeBrowser::offer().await.unwrap();
+
+        let answer = super::start_h264(
+            camera.url.clone(),
+            None,
+            None,
+            browser.offer_sdp().to_owned(),
+            "offer".into(),
+            Vec::new(),
+            10,
+        )
+        .await
+        .expect("gateway answers the offer");
+
+        assert_eq!(answer.sdp_type, "answer");
+        assert_eq!(answer.codec, "H264");
+        assert!(
+            answer.sdp.contains("m=video"),
+            "the answer must carry a video section"
+        );
+
+        browser.accept_answer(&answer.sdp).await.unwrap();
+        let received = browser
+            .wait_for_media(Duration::from_secs(15))
+            .await
+            .expect("media must arrive");
+
+        assert!(received.packets > 0, "no RTP packets arrived");
+        assert!(
+            received.payload_bytes > 1000,
+            "only {} payload bytes arrived, which is padding rather than video",
+            received.payload_bytes
+        );
+    }
+
+    #[tokio::test]
+    async fn an_answer_is_refused_as_an_offer() {
+        // The command carries the SDP type from the browser. Treating an answer
+        // as an offer would produce an unusable session rather than an error.
+        let camera = FakeCamera::start(false).await.unwrap();
+        let browser = FakeBrowser::offer().await.unwrap();
+        let error = super::start_h264(
+            camera.url.clone(),
+            None,
+            None,
+            browser.offer_sdp().to_owned(),
+            "answer".into(),
+            Vec::new(),
+            10,
+        )
+        .await
+        .expect_err("an answer is not an offer");
+        assert!(error.to_string().contains("expected offer"));
+    }
+
+    #[tokio::test]
+    async fn a_camera_that_refuses_the_session_does_not_leave_a_live_answer_pending() {
+        // The gateway answers the browser before it touches the camera, so an
+        // unreachable camera still produces an answer — but no media. Pinning
+        // this stops a later change from quietly making the answer conditional
+        // and breaking the browser's negotiation.
+        let camera = FakeCamera::start(true).await.unwrap();
+        let browser = FakeBrowser::offer().await.unwrap();
+        let answer = super::start_h264(
+            camera.url.clone(),
+            None,
+            None,
+            browser.offer_sdp().to_owned(),
+            "offer".into(),
+            Vec::new(),
+            3,
+        )
+        .await
+        .expect("the answer does not depend on the camera");
+        browser.accept_answer(&answer.sdp).await.unwrap();
+        assert!(
+            browser
+                .wait_for_media(Duration::from_secs(3))
+                .await
+                .is_err(),
+            "media must not arrive from a camera that refused the session"
+        );
+    }
+}

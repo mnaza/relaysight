@@ -1,5 +1,7 @@
 mod archive;
 #[cfg(test)]
+mod fake_browser;
+#[cfg(test)]
 mod fake_camera;
 mod live;
 mod onvif;
