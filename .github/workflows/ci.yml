@@ -33,3 +33,7 @@ jobs:
       # parity across locales and brand.json against its own schema.
       - run: node --test "web/tests/*.test.mjs"
       - run: python3 -m py_compile plugins/examples/ai-http-adapter/plugin.py plugins/examples/storage-s3/plugin.py
+      # object_key is the only place a client-supplied string becomes a path
+      # inside the bucket, so it is tested. boto3 is stubbed rather than
+      # installed — see the test's docstring.
+      - run: python3 -m unittest discover -s plugins/examples/tests -t plugins/examples/tests -p "test_*.py"

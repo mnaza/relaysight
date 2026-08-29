@@ -39,8 +39,9 @@ node --check web/theme.js && node --check web/landing.js && node --check web/das
 
 - **Compiles.** Whole workspace plus `commercial/control-plane`.
 - `clippy -- -D warnings` **clean**; `cargo fmt` clean.
-- **53 Rust tests and 17 web tests, all passing.** Nine speak real RTSP, three
-  negotiate a real peer connection, thirteen drive the HTTP surface.
+- **67 Rust tests, 17 web tests and 11 Python tests, all passing.** Nine speak real
+  RTSP, three negotiate a real peer connection, thirteen drive the HTTP surface and
+  fourteen cover the plugin runtime.
   `src/fake_camera.rs` is a test-only RTSP server that serves
   `fixtures/camera.h264` — three seconds of genuine H.264 made once with ffmpeg and
   committed, so the build needs no encoder — over RTP interleaved on the TCP control
@@ -85,7 +86,10 @@ because the same mistake will recur:
    start, or out of band, will break it. Hikvision and Dahua at minimum need real
    hardware testing. This tail is the actual moat in this market and it is ground out one
    vendor at a time.
-3. **Nothing renders the UI.** The web tests cover the pure half — locales, `t()`,
+3. **Nothing renders the UI, and no plugin is run for real.** The Python example
+   plugins are tested only where they are pure; their HTTP handlers, and the boto3 and
+   upstream calls behind them, are not exercised.
+4. **Nothing renders the UI.** The web tests cover the pure half — locales, `t()`,
    `mergeBrand`, brand.json against its schema — but every function touching `document`
    is unexercised, and so is the plugin runtime beyond what the API tests reach through
    it. Rendering needs a headless browser, which is a dependency this repo does not
@@ -95,6 +99,21 @@ The two fakes are the way to test anything in the media path: `FakeCamera::start
 for the camera end (the flag makes it demand Basic auth), `FakeBrowser::offer()` for the
 viewer end. Both bind loopback on an ephemeral port and need no network. The suite was
 run five times over to confirm the sockets and ICE do not flake.
+
+**Capability enforcement is the plugin system's security boundary** and is checked
+before any network call, so a plugin declaring only `ai_analyze` cannot be reached
+through the storage calls whatever id the caller supplies — storage handles recorded
+video and issues signed URLs. A test asserts the refusal is fast, because a refusal that
+waited on a round trip would mean the body had already been sent.
+
+⚠️ **One unparseable manifest fails the whole reload**, so a typo in a single file
+removes every plugin rather than its own. Pinned by a test; worth fixing if plugin
+counts grow.
+
+`object_key` in the S3 example is the only place a client-supplied string becomes a path
+inside the bucket, so its traversal guard is tested — with `boto3` stubbed into
+`sys.modules` rather than installed, since the module builds clients at import time and
+requiring the SDK in CI to test twenty lines of string handling is a poor trade.
 
 Web tests run on Node's built-in runner, no dependencies: `node --test "web/tests/*.test.mjs"`.
 They replaced `scripts/check-i18n.py`, which scanned only the HTML and therefore left all

@@ -12,3 +12,7 @@ serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 vms-plugin-sdk = { path = "../plugin-sdk" }
+
+[dev-dependencies]
+chrono.workspace = true
+tempfile = "3"

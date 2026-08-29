@@ -255,3 +255,362 @@ impl PluginRegistry {
         Ok(response.json().await?)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write as _;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A plugin endpoint that is guaranteed not to answer. Loading must fall back
+    /// to the embedded manifest rather than hang or drop the plugin.
+    const DEAD_ENDPOINT: &str = "http://127.0.0.1:1";
+
+    fn manifest(id: &str, capabilities: &[&str], protocol: u32) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "name": id,
+            "version": "0.1.0",
+            "protocol_version": protocol,
+            "vendor": "test",
+            "description": null,
+            "capabilities": capabilities,
+        })
+    }
+
+    fn write(dir: &std::path::Path, name: &str, value: &serde_json::Value) {
+        let mut file = std::fs::File::create(dir.join(name)).unwrap();
+        file.write_all(value.to_string().as_bytes()).unwrap();
+    }
+
+    /// Registration for a plugin that is offline but carries its own manifest.
+    fn offline(id: &str, capabilities: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "endpoint": DEAD_ENDPOINT,
+            "enabled": true,
+            "token_env": null,
+            "manifest": manifest(id, capabilities, PLUGIN_PROTOCOL_VERSION),
+            "placement": "either",
+        })
+    }
+
+    fn download_request() -> vms_plugin_sdk::StorageDownloadRequest {
+        vms_plugin_sdk::StorageDownloadRequest {
+            context: Default::default(),
+            object_ref: "obj-1".into(),
+            expires_seconds: 60,
+            audience: Default::default(),
+        }
+    }
+
+    fn delete_request() -> vms_plugin_sdk::StorageDeleteRequest {
+        vms_plugin_sdk::StorageDeleteRequest {
+            context: Default::default(),
+            object_ref: "obj-1".into(),
+        }
+    }
+
+    fn upload_request() -> vms_plugin_sdk::StorageUploadRequest {
+        vms_plugin_sdk::StorageUploadRequest {
+            context: Default::default(),
+            namespace: "recordings".into(),
+            object_key: "obj-1".into(),
+            content_type: "video/mp4".into(),
+            content_length: Some(1),
+            expires_seconds: 60,
+            audience: Default::default(),
+            metadata: Default::default(),
+        }
+    }
+
+    fn analyze_request() -> AiAnalyzeRequest {
+        AiAnalyzeRequest {
+            context: Default::default(),
+            camera_id: "cam-1".into(),
+            captured_at: chrono::Utc::now(),
+            input: vms_plugin_sdk::MediaInput::InlineBase64 {
+                content_type: "image/jpeg".into(),
+                data_base64: String::new(),
+            },
+            tasks: Vec::new(),
+            parameters: serde_json::Value::Null,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_offline_plugin_still_registers_from_its_embedded_manifest() {
+        // The UI has to be able to show a plugin that is merely down, and say so,
+        // rather than pretend it was never configured.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "ai.json", &offline("ai-1", &["ai_analyze"]));
+        let registry = PluginRegistry::load_dir(dir.path()).await.unwrap();
+
+        let listed = registry.list().await;
+        assert_eq!(listed.len(), 1);
+        assert!(registry.is_registered("ai-1").await);
+        assert!(!listed[0].reachable, "an unreachable plugin must say so");
+        assert!(
+            listed[0].last_error.is_some(),
+            "and must carry the reason, or the operator has nothing to act on"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_offline_plugin_with_no_embedded_manifest_is_dropped() {
+        // Nothing is known about it, so there is nothing to show or to call.
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "ai.json",
+            &serde_json::json!({"endpoint": DEAD_ENDPOINT, "enabled": true, "manifest": null}),
+        );
+        let registry = PluginRegistry::load_dir(dir.path()).await.unwrap();
+        assert!(registry.list().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_disabled_plugin_is_not_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut reg = offline("ai-1", &["ai_analyze"]);
+        reg["enabled"] = serde_json::json!(false);
+        write(dir.path(), "ai.json", &reg);
+        let registry = PluginRegistry::load_dir(dir.path()).await.unwrap();
+        assert!(!registry.is_registered("ai-1").await);
+    }
+
+    #[tokio::test]
+    async fn a_plugin_speaking_another_protocol_version_is_refused() {
+        // Loading it would mean calling it with a contract it does not implement.
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "ai.json",
+            &serde_json::json!({
+                "endpoint": DEAD_ENDPOINT,
+                "enabled": true,
+                "manifest": manifest("ai-future", &["ai_analyze"], PLUGIN_PROTOCOL_VERSION + 1),
+            }),
+        );
+        let registry = PluginRegistry::load_dir(dir.path()).await.unwrap();
+        assert!(!registry.is_registered("ai-future").await);
+    }
+
+    #[tokio::test]
+    async fn files_that_are_not_manifests_are_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "ai.json", &offline("ai-1", &["ai_analyze"]));
+        std::fs::write(dir.path().join("README.md"), "not a manifest").unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "{ nonsense").unwrap();
+        let registry = PluginRegistry::load_dir(dir.path()).await.unwrap();
+        assert_eq!(registry.list().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_missing_plugin_directory_is_empty_rather_than_fatal() {
+        // A deployment with no plugins configured must still start.
+        let registry = PluginRegistry::load_dir("/nonexistent/plugins.d")
+            .await
+            .unwrap();
+        assert!(registry.list().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn one_malformed_manifest_takes_down_the_whole_reload() {
+        // Pinning current behaviour, which is worth knowing rather than
+        // discovering: a single unparseable file fails the entire load, so a
+        // typo in one manifest removes every plugin, not just its own.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "good.json", &offline("ai-1", &["ai_analyze"]));
+        std::fs::write(dir.path().join("bad.json"), "{ not json").unwrap();
+        assert!(PluginRegistry::load_dir(dir.path()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn reload_replaces_the_set_rather_than_merging_into_it() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "ai.json", &offline("ai-1", &["ai_analyze"]));
+        let registry = PluginRegistry::load_dir(dir.path()).await.unwrap();
+        assert!(registry.is_registered("ai-1").await);
+
+        std::fs::remove_file(dir.path().join("ai.json")).unwrap();
+        write(
+            dir.path(),
+            "store.json",
+            &offline("store-1", &["storage_blob"]),
+        );
+        registry.reload(dir.path()).await.unwrap();
+
+        assert!(
+            !registry.is_registered("ai-1").await,
+            "a removed manifest must stop being served"
+        );
+        assert!(registry.is_registered("store-1").await);
+    }
+
+    // ---- capability enforcement ----
+
+    #[tokio::test]
+    async fn a_plugin_cannot_be_used_for_a_capability_it_does_not_declare() {
+        // The security boundary of the plugin system. Storage handles recorded
+        // video and hands out signed URLs; an AI plugin declaring only
+        // ai_analyze must never be reachable through the storage calls, whatever
+        // id the caller supplies.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "ai.json", &offline("ai-only", &["ai_analyze"]));
+        let registry = PluginRegistry::load_dir(dir.path()).await.unwrap();
+
+        let error = registry
+            .storage_download("ai-only", &download_request())
+            .await
+            .expect_err("an ai plugin must not serve storage");
+        assert!(
+            error.to_string().contains("does not provide"),
+            "refusal must name the missing capability, got: {error}"
+        );
+
+        assert!(
+            registry
+                .storage_delete("ai-only", &delete_request())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_storage_plugin_cannot_be_used_for_inference() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "s.json",
+            &offline("store-only", &["storage_blob"]),
+        );
+        let registry = PluginRegistry::load_dir(dir.path()).await.unwrap();
+        assert!(
+            registry
+                .ai_analyze("store-only", &analyze_request())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_capability_check_happens_before_the_network_call() {
+        // Otherwise a wrongly-declared plugin would still receive the payload —
+        // for storage that means the recording itself — before being refused.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "ai.json", &offline("ai-only", &["ai_analyze"]));
+        let registry = PluginRegistry::load_dir(dir.path()).await.unwrap();
+        let started = std::time::Instant::now();
+        let _ = registry.storage_upload("ai-only", &upload_request()).await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(200),
+            "the refusal waited on a network round trip, so the body was already sent"
+        );
+    }
+
+    // ---- the HTTP path, against a plugin that actually answers ----
+
+    /// Minimal plugin server: answers the manifest, echoes back whether it saw a
+    /// bearer token, and can be told to fail.
+    async fn fake_plugin(id: &'static str, fail: bool) -> (String, Arc<RwLock<Option<String>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let seen_token: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
+        let recorder = Arc::clone(&seen_token);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let recorder = Arc::clone(&recorder);
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let Ok(read) = socket.read(&mut buf).await else {
+                        return;
+                    };
+                    let request = String::from_utf8_lossy(&buf[..read]).to_string();
+                    if let Some(token) = request.lines().find_map(|line| {
+                        line.strip_prefix("authorization: Bearer ")
+                            .or_else(|| line.strip_prefix("Authorization: Bearer "))
+                    }) {
+                        *recorder.write().await = Some(token.trim().to_owned());
+                    }
+                    let body = if fail {
+                        None
+                    } else if request.contains("/v1/plugin/manifest") {
+                        Some(manifest(id, &["ai_analyze"], PLUGIN_PROTOCOL_VERSION).to_string())
+                    } else if request.contains("/v1/plugin/health") {
+                        Some(serde_json::json!({"healthy": true, "detail": null}).to_string())
+                    } else {
+                        Some(serde_json::json!({"detections": []}).to_string())
+                    };
+                    let response = match body {
+                        Some(body) => format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                            body.len()
+                        ),
+                        None => "HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_owned(),
+                    };
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        (endpoint, seen_token)
+    }
+
+    #[tokio::test]
+    async fn a_reachable_plugin_is_loaded_from_its_own_manifest_and_marked_reachable() {
+        let (endpoint, _) = fake_plugin("live-ai", false).await;
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "ai.json",
+            &serde_json::json!({"endpoint": endpoint, "enabled": true, "manifest": null}),
+        );
+        let registry = PluginRegistry::load_dir(dir.path()).await.unwrap();
+        let listed = registry.list().await;
+        assert_eq!(listed.len(), 1, "the manifest was served, so it must load");
+        assert!(listed[0].reachable);
+        assert!(listed[0].last_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn the_configured_token_is_sent_to_the_plugin() {
+        // A plugin that requires auth is unreachable if the header is dropped,
+        // and nothing else would show which side lost it.
+        let (endpoint, seen) = fake_plugin("tok-ai", false).await;
+        unsafe { env::set_var("TEST_PLUGIN_TOKEN_A", "s3cr3t") };
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "ai.json",
+            &serde_json::json!({
+                "endpoint": endpoint,
+                "enabled": true,
+                "token_env": "TEST_PLUGIN_TOKEN_A",
+                "manifest": null,
+            }),
+        );
+        let registry = PluginRegistry::load_dir(dir.path()).await.unwrap();
+        assert!(registry.is_registered("tok-ai").await);
+        assert_eq!(seen.read().await.as_deref(), Some("s3cr3t"));
+    }
+
+    #[tokio::test]
+    async fn a_plugin_returning_an_error_status_surfaces_as_an_error() {
+        // Not as an empty result that a caller would store as a success.
+        let (endpoint, _) = fake_plugin("bad-ai", true).await;
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "ai.json",
+            &serde_json::json!({
+                "endpoint": endpoint,
+                "enabled": true,
+                "manifest": manifest("bad-ai", &["ai_analyze"], PLUGIN_PROTOCOL_VERSION),
+            }),
+        );
+        let registry = PluginRegistry::load_dir(dir.path()).await.unwrap();
+        assert!(registry.health("bad-ai").await.is_err());
+    }
+}
