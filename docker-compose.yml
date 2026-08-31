@@ -62,7 +62,10 @@ services:
 
   ai-plugin:
     profiles: ["plugins"]
-    build: ./plugins/examples/ai-http-adapter
+    # Reference plugins live in their own repository now. Build them there and
+    # point this at the image, or drop a manifest into plugins.d/ for a plugin
+    # running anywhere else — the core reaches them over HTTP either way.
+    image: ${AI_PLUGIN_IMAGE:-relaysight/ai-http-adapter:latest}
     environment:
       PLUGIN_TOKEN: ${AI_PLUGIN_TOKEN:-demo-ai-plugin-token}
       UPSTREAM_AI_URL: ${UPSTREAM_AI_URL:-}
@@ -98,7 +101,7 @@ services:
 
   storage-plugin:
     profiles: ["plugins"]
-    build: ./plugins/examples/storage-s3
+    image: ${STORAGE_PLUGIN_IMAGE:-relaysight/storage-s3:latest}
     depends_on:
       - minio-init
     environment:

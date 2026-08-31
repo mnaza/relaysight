@@ -31,13 +31,12 @@ anything:
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-cargo check --manifest-path commercial/control-plane/Cargo.toml   # excluded from the workspace
 node --check web/theme.js && node --check web/landing.js && node --check web/dashboard.js
 ```
 
 ## State as of 2026-08-29
 
-- **Compiles.** Whole workspace plus `commercial/control-plane`.
+- **Compiles.** Whole workspace.
 - `clippy -- -D warnings` **clean**; `cargo fmt` clean.
 - **95 Rust tests, 55 web tests and 11 Python tests, all passing.** Nine speak real
   RTSP, three negotiate a real peer connection, thirteen drive the HTTP surface and
@@ -195,6 +194,27 @@ with the password intact. Keep it one implementation.
 Fields marked `#[allow(dead_code)]` in `onvif.rs` and `rtsp.rs` are parsed off the wire
 and kept deliberately — each comment names the feature that would consume them. They are
 a to-do list, not clutter.
+
+## Three repositories
+
+Split 2026-08-31, along the boundary `docs/EDITIONS.md` already described.
+
+- **`relaysight`** (this one) — Community Core. A complete self-hosted VMS on its own:
+  gateway, API, plugin host, web UI. GPL-3.0 intended. **Removing the commercial service
+  must leave a useful product rather than a crippled trial**, which is the whole reason
+  the split is at a service boundary and not behind `if paid` checks.
+- **`relaysight-platform`** (private) — the entitlement control plane. Plans, billing,
+  licences, reseller hierarchy, SSO. It knows nothing about the VMS; the core knows only
+  the versioned `EditionEntitlement` response. It depends on `vms-domain` over git rather
+  than copying the type, because two copies of a contract drift and nothing tells you.
+- **`relaysight-plugins`** (private for now) — the reference AI and storage plugins. The
+  core reaches a plugin over HTTP and knows nothing else about it, so they do not need to
+  share a tree. **Note the tension worth revisiting: plugins are advertised as a Community
+  feature, and the reference implementations being private undercuts that.** They are
+  private at Andrey's request, for now.
+
+When the API is run from this repository alone, `ENTITLEMENTS_URL` is unset and the
+Community entitlement is returned locally. That path is the default and is tested.
 
 ## Boundaries
 

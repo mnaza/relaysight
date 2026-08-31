@@ -17,9 +17,7 @@ crates/plugin-runtime/     plugin registry + HTTP dispatcher (open source)
 services/api/              open-source control API
 edge/gateway/              open-source Rust camera gateway
 plugins.d/                 plugin registrations
-plugins/examples/          AI adapter + S3-compatible storage examples
 web/                       language-agnostic white-label landing/dashboard
-commercial/control-plane/  proprietary entitlement overlay prototype
 ```
 
 See `docs/EDITIONS.md`, `docs/PLUGIN-SDK.md` and `docs/ARCHIVE.md`.
@@ -139,7 +137,7 @@ Edit `web/brand.json`. UI copy remains in `web/locales/*.json`; brand name, logo
 
 ## Licensing
 
-Community Core currently carries GPL-3.0 as the working open-source license (`LICENSE`). `commercial/` is separated under a proprietary notice. Review the final licensing model before accepting external contributions or public launch.
+This repository is Community Core and carries GPL-3.0 as the working open-source license (`LICENSE`). The commercial control plane and the reference plugins live in separate repositories. Review the final licensing model before accepting external contributions or public launch.
 
 ## v6 media/action checkpoint
 

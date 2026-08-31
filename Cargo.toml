@@ -6,7 +6,6 @@ members = [
   "services/api",
   "edge/gateway",
 ]
-exclude = ["commercial/control-plane"]
 resolver = "2"
 
 [workspace.package]

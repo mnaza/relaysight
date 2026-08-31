@@ -87,7 +87,7 @@
 
 ## Commercial productionization
 
-- [ ] Move `commercial/` into private repository/package registry
+- [x] Move `commercial/` into a private repository — done 2026-08-31. The control plane is now `relaysight-platform`, the reference plugins are `relaysight-plugins`, and this repository is Community Core alone.
 - [ ] Billing provider integration
 - [ ] Signed license / subscription validation
 - [ ] Reseller hierarchy and multi-tenancy

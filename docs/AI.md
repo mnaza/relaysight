@@ -17,7 +17,7 @@ The AI plugin does not need direct connectivity to the camera or to the customer
 
 ## Demo adapter
 
-`plugins/examples/ai-http-adapter` has three modes:
+The reference `ai-http-adapter` plugin, in the plugins repository, has three modes:
 
 1. `UPSTREAM_AI_URL` configured: forwards requests to the user's model endpoint.
 2. No upstream + `SIMULATED_AI=false`: safe no-op result.

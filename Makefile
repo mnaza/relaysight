@@ -1,4 +1,4 @@
-.PHONY: web community commercial plugins edge demo gateway-image check-web
+.PHONY: web community plugins edge demo gateway-image check-web
 
 web:
 	cd web && python3 -m http.server 8081
@@ -6,8 +6,6 @@ web:
 community:
 	docker compose up --build
 
-commercial:
-	docker compose -f docker-compose.yml -f docker-compose.commercial.yml up --build
 
 plugins:
 	docker compose --profile plugins up --build
