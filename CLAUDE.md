@@ -75,12 +75,15 @@ because the same mistake will recur:
 
 ## Real blockers, in the order they will bite
 
-1. **NAT traversal is not implemented.** Direct gateway → browser WebRTC works until the
-   customer's network is behind symmetric NAT or a strict egress firewall — and premises
-   with security cameras are exactly those networks. Without TURN those sessions simply
-   fail; with TURN the media relays through your server and the bandwidth cost the
-   architecture was designed to avoid comes straight back. **Decide and measure this
-   before anything else**, because it changes the hosting model.
+1. **TURN credentials are implemented; a TURN server is not deployed.** `services/api/src/turn.rs`
+   mints ephemeral coturn credentials — username is an expiry timestamp, password is an
+   HMAC of it under a shared secret — so nothing long-lived is ever handed to a browser.
+   Configure `RTC_TURN_URLS` and `RTC_TURN_SECRET`; without them the API warns at startup
+   and only STUN is offered. **What remains is operational: stand up coturn with
+   `use-auth-secret` and the same secret, on flat-rate bandwidth.** Relayed media costs
+   the bandwidth the architecture exists to avoid, so see `docs/TURN-COSTS.md` — and
+   instrument relay share per site from the first pilot, because it is the number the
+   hosting model depends on and it cannot be guessed.
 2. **Camera interoperability is untested.** The passthrough path depends on H.264
    parameter sets (SPS/PPS) arriving on keyframes. Vendors that send them once at session
    start, or out of band, will break it. Hikvision and Dahua at minimum need real

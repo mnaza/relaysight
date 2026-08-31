@@ -1,3 +1,12 @@
+mod turn;
+
+/// Seconds since the epoch. Used for TURN credential expiry.
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 mod entitlements;
 
 use std::{
@@ -22,7 +31,7 @@ use tower_http::{
     cors::{Any, CorsLayer},
     trace::TraceLayer,
 };
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
 use vms_domain::{
     AiAnalysisRequest as CameraAiAnalysisRequest, CameraSummary, CameraTelemetry,
@@ -31,7 +40,7 @@ use vms_domain::{
     GatewayCommandResult, GatewayCommandStatus, GatewayCommandView, GatewayEnrollmentRequest,
     GatewayEnrollmentResponse, GatewayHeartbeat, HealthStatus, LiveSessionRequest,
     PlaybackManifest, PlaybackSegment, RecordingManifest, RecordingRequest, RecordingTimeline,
-    RtcConfigResponse, RtcIceServerConfig, SiteSummary,
+    RtcConfigResponse, SiteSummary,
 };
 use vms_plugin_runtime::PluginRegistry;
 use vms_plugin_sdk::{
@@ -58,7 +67,7 @@ struct AppState {
     recordings: Arc<RwLock<HashMap<String, RecordingManifest>>>,
     default_storage_plugin: Arc<str>,
     default_ai_plugin: Arc<str>,
-    rtc_ice_servers: Arc<Vec<RtcIceServerConfig>>,
+    rtc: Arc<crate::turn::RtcConfig>,
     default_retention_days: i64,
 }
 
@@ -86,6 +95,22 @@ async fn main() -> anyhow::Result<()> {
 
     let bind = env::var("API_BIND").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
     let addr: SocketAddr = bind.parse()?;
+
+    // Say this at startup. Without a relay, sites behind symmetric NAT or a strict
+    // egress firewall never connect, and the symptom is a live session that simply
+    // never starts — with nothing in the logs to point at the cause.
+    let rtc = crate::turn::RtcConfig::from_env();
+    if rtc.turn_enabled() {
+        info!(
+            relays = rtc.turn_urls.len(),
+            ttl_secs = rtc.ttl_secs,
+            "TURN configured; credentials are minted per session"
+        );
+    } else {
+        warn!(
+            "no TURN relay configured: sites that cannot hold a direct path will fail to connect"
+        );
+    }
     let plugin_dir = PathBuf::from(env::var("PLUGIN_DIR").unwrap_or_else(|_| "plugins.d".into()));
     let plugins = PluginRegistry::load_dir(&plugin_dir).await?;
     let state = AppState {
@@ -112,7 +137,7 @@ async fn main() -> anyhow::Result<()> {
         default_ai_plugin: Arc::from(
             env::var("DEFAULT_AI_PLUGIN").unwrap_or_else(|_| "ai-http-adapter".into()),
         ),
-        rtc_ice_servers: Arc::new(rtc_ice_servers_from_env()),
+        rtc: Arc::new(rtc),
         default_retention_days: env::var("DEFAULT_RETENTION_DAYS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -479,25 +504,11 @@ async fn plugin_storage_delete(
         .map_err(|_| StatusCode::BAD_GATEWAY)
 }
 
-fn rtc_ice_servers_from_env() -> Vec<RtcIceServerConfig> {
-    let raw = env::var("RTC_ICE_SERVERS_JSON")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| {
-            r#"[{"urls":["stun:stun.l.google.com:19302"],"username":"","credential":""}]"#.into()
-        });
-    match serde_json::from_str::<Vec<RtcIceServerConfig>>(&raw) {
-        Ok(value) => value,
-        Err(error) => {
-            tracing::warn!(%error, "invalid RTC_ICE_SERVERS_JSON; WebRTC will start without configured ICE servers");
-            vec![]
-        }
-    }
-}
-
 async fn rtc_config(State(state): State<AppState>) -> Json<RtcConfigResponse> {
+    // Minted per request, never stored. See turn.rs for why static credentials
+    // in the ICE config are the same as publishing them.
     Json(RtcConfigResponse {
-        ice_servers: state.rtc_ice_servers.as_ref().clone(),
+        ice_servers: state.rtc.ice_servers(now_unix(), "browser"),
     })
 }
 
@@ -547,6 +558,9 @@ async fn create_live_session(
     let gateway_id = gateway_for_camera(&state, &camera_id).await?;
     let now = Utc::now();
     let session_seconds = request.session_seconds.clamp(30, 3600);
+    // Credentials are minted for this gateway and this moment, so a relay log can
+    // be tied back to a site without a second lookup.
+    let ice_servers = state.rtc.ice_servers(now_unix(), &gateway_id);
     let command = GatewayCommand {
         id: Uuid::new_v4().to_string(),
         gateway_id,
@@ -557,7 +571,7 @@ async fn create_live_session(
             offer_sdp: request.offer_sdp,
             offer_type: request.offer_type,
             session_seconds,
-            ice_servers: state.rtc_ice_servers.as_ref().clone(),
+            ice_servers,
         },
     };
     Ok((
@@ -1069,7 +1083,7 @@ mod tests {
             recordings: Arc::new(RwLock::new(HashMap::new())),
             default_storage_plugin: Arc::from("storage-s3"),
             default_ai_plugin: Arc::from("ai-http-adapter"),
-            rtc_ice_servers: Arc::new(Vec::new()),
+            rtc: Arc::new(crate::turn::RtcConfig::default()),
             default_retention_days: 30,
         }
     }

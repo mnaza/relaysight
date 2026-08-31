@@ -132,3 +132,24 @@ quietly offers no substream looks identical from the outside.
 2. ~~Decide the profile policy above~~ — done 2026-08-29. Confirm against real cameras
    that the substream is being selected, using the discovery log line.
 3. Stand up coturn on flat-rate hosting. Do not put the relay on metered egress.
+
+## Credentials, implemented 2026-08-31
+
+A relay costs bandwidth, which makes its credentials worth stealing, and the ICE
+configuration is sent to the browser by design. A fixed username and password there is
+the same as publishing them, and the relay becomes an open proxy billed to us.
+
+So they are derived instead: username is `<expiry>:<label>`, password is
+`base64(HMAC-SHA1(secret, username))`. coturn validates this in `use-auth-secret` mode
+and stores nothing. A leaked pair expires in ten minutes by default and nothing has to be
+revoked. The label is the gateway id, so a relay log ties back to a site without a second
+lookup.
+
+`RTC_TURN_URLS` and `RTC_TURN_SECRET` enable it. Both are required — URLs without a
+secret are treated as no relay at all, because a browser that tries a relay it cannot
+authenticate to spends the whole ICE timeout doing it, which is worse than not offering
+one. The API warns at startup when no relay is configured, since the failure it causes is
+otherwise silent: sessions that never start, with nothing in the logs to point at.
+
+A test asserts the secret does not appear in the serialised ICE configuration. That is
+the one mistake in this file which would be invisible in review.
