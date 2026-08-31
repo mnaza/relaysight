@@ -82,8 +82,8 @@ because the same mistake will recur:
    and only STUN is offered. **What remains is operational: stand up coturn with
    `use-auth-secret` and the same secret, on flat-rate bandwidth.** Relayed media costs
    the bandwidth the architecture exists to avoid, so see `docs/TURN-COSTS.md` — and
-   instrument relay share per site from the first pilot, because it is the number the
-   hosting model depends on and it cannot be guessed.
+   relay share is now measured rather than guessed: every session resolves its own ICE
+   candidate pair and logs `path=` and `relayed=` (`edge/gateway/src/icepath.rs`).
 2. **Camera interoperability is untested.** The passthrough path depends on H.264
    parameter sets (SPS/PPS) arriving on keyframes. Vendors that send them once at session
    start, or out of band, will break it. Hikvision and Dahua at minimum need real

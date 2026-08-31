@@ -168,6 +168,12 @@ impl FakeBrowser {
         })
     }
 
+    /// The path this peer settled on, read with the same code the gateway uses.
+    /// On loopback it must be `host`; anything else means the extraction is wrong.
+    pub async fn path(&self) -> crate::icepath::PathKind {
+        crate::icepath::observed(&self.peer).await
+    }
+
     pub fn offer_sdp(&self) -> &str {
         &self.offer_sdp
     }

@@ -184,13 +184,23 @@ pub async fn start_h264(
         .to_owned();
 
     let peer_task = peer.clone();
+    let peer_stats = peer.clone();
     let task_session_id = session_id.clone();
     tokio::spawn(async move {
         let stream = async {
             tokio::time::timeout(Duration::from_secs(20), connected.notified())
                 .await
                 .context("WebRTC peer did not connect")?;
-            info!(session_id = %task_session_id, "WebRTC peer connected; starting RTSP forwarding");
+            // Log the path this session settled on. Relayed sessions are the ones
+            // that cost bandwidth, and their share decides the hosting model — see
+            // docs/TURN-COSTS.md. It cannot be guessed, so every session says.
+            let path = crate::icepath::observed(&peer_stats).await;
+            info!(
+                session_id = %task_session_id,
+                path = %path,
+                relayed = path.is_relayed(),
+                "WebRTC peer connected; starting RTSP forwarding"
+            );
             forward_rtsp_h264(
                 rtsp_uri,
                 username,
@@ -358,6 +368,17 @@ mod tests {
             .wait_for_media(Duration::from_secs(15))
             .await
             .expect("media must arrive");
+
+        // The path is read with the same code the gateway logs from. On loopback
+        // it has to be a host pair, so anything else means the extraction picked
+        // the wrong candidate — and that number feeds a cost model.
+        let path = browser.path().await;
+        assert_eq!(
+            path,
+            crate::icepath::PathKind::Host,
+            "loopback session reported {path}, so the candidate lookup is wrong"
+        );
+        assert!(!path.is_relayed());
 
         assert!(received.packets > 0, "no RTP packets arrived");
         assert!(

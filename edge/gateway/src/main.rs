@@ -5,6 +5,7 @@ mod fake_browser;
 mod fake_camera;
 #[cfg(test)]
 mod fake_control_plane;
+mod icepath;
 mod live;
 mod onvif;
 mod rtsp;

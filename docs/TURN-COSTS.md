@@ -127,8 +127,10 @@ quietly offers no substream looks identical from the outside.
 
 ## The order to do things
 
-1. Instrument relay share per site from the first pilot. It is the number everything else
-   depends on and it cannot be guessed.
+1. ~~Instrument relay share per site~~ — done 2026-08-31. Every live session reads the
+   ICE candidate pair that actually carried the media and logs the path it settled on,
+   with `relayed=true|false`. Counting that per site gives the number directly. See
+   `edge/gateway/src/icepath.rs`.
 2. ~~Decide the profile policy above~~ — done 2026-08-29. Confirm against real cameras
    that the substream is being selected, using the discovery log line.
 3. Stand up coturn on flat-rate hosting. Do not put the relay on metered egress.
@@ -153,3 +155,24 @@ otherwise silent: sessions that never start, with nothing in the logs to point a
 
 A test asserts the secret does not appear in the serialised ICE configuration. That is
 the one mistake in this file which would be invisible in review.
+
+## Measuring it, implemented 2026-08-31
+
+Each session, once connected, reads its own stats, finds the candidate pair that
+actually carried bytes, and resolves that pair's local candidate to a path: host,
+srflx, prflx or relay. Only relay costs bandwidth. The gateway logs it with the session
+id, so relay share per site is a count over the logs rather than an estimate.
+
+Two decisions worth keeping:
+
+- **An unreported candidate type counts as `unknown`, not as relayed.** This number
+  decides how much flat-rate bandwidth to buy. Under-counting shows up when the bill
+  disagrees; over-counting quietly buys capacity nobody needed.
+- **A pair that carried no bytes is never chosen.** ICE leaves failed and unused pairs
+  in the report, and picking one of those would put a wrong label into a cost model.
+
+The extraction was wrong when first written, and looked right. A stats report keys a
+candidate entry as `RTCLocalIceCandidate_candidate:IB9F...` while the pair refers to the
+bare `candidate:IB9F...`, so an equality lookup missed every time and every session
+reported `unknown`. The loopback end-to-end test asserts a real session resolves to
+`host`, which is what caught it.
