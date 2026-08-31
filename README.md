@@ -57,7 +57,7 @@ crates/plugin-runtime/  plugin registry and HTTP dispatch
 services/api/           control API
 edge/gateway/           Rust camera gateway
 plugins.d/              plugin registrations
-web/                    landing and dashboard
+web/                    the dashboard
 ```
 
 ## Plugins
@@ -123,6 +123,11 @@ season in production.
 Edit `web/brand.json`. Copy stays in `web/locales/*.json`.
 Brand name, logo, colors, locales, gateway image and API URL
 are runtime settings.
+
+The marketing site is a separate repository,
+[relaysight-site](https://github.com/mnaza/relaysight-site).
+It is not needed to run this. Nothing here links to it unless
+`brand.pricingUrl` is set.
 
 ## Docs
 

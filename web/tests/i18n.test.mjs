@@ -66,7 +66,10 @@ test('every key the UI asks for exists in every locale', () => {
     scanned.some(f => f.endsWith('.js')) && scanned.some(f => f.endsWith('.html')),
     `the scan found no scripts or no pages: ${scanned}`,
   );
-  assert.ok(referenced.size > 180, `only found ${referenced.size} literal keys across ${scanned.length} files; the scan is probably missing a module`);
+  // Was 180 when this repository also carried the marketing page. The
+  // landing keys moved out with it; this floor still catches a module that
+  // stops being scanned, which is the failure the number exists for.
+  assert.ok(referenced.size > 110, `only found ${referenced.size} literal keys across ${scanned.length} files; the scan is probably missing a module`);
   for (const [name, dict] of Object.entries(locales)) {
     const missing = [...referenced].filter(key => !(key in dict));
     assert.deepEqual(missing, [], `${name} lacks keys the UI references`);

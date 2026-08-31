@@ -21,7 +21,6 @@ gateway-image:
 
 check-web:
 	node --check web/theme.js
-	node --check web/landing.js
 	node --check web/dashboard.js
 	python3 -m json.tool web/brand.json >/dev/null
 	python3 -m json.tool plugins.d/ai-http.json >/dev/null

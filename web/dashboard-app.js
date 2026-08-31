@@ -89,7 +89,10 @@ export async function startDashboard({ brand, locale, dict }) {
     planTitle.textContent = t(dict, 'app.freePlan');
     planUsage.textContent = t(dict, 'app.freeUsage', 'app.freeUsage', { used: freeUsed, freeCameras: freeLimit });
     document.querySelector('#free-usage-bar').style.width = `${freeLimit > 0 ? Math.min(100, (freeUsed / freeLimit) * 100) : 0}%`;
-    upgradeButton.addEventListener('click', () => { location.href = 'index.html#pricing'; });
+    // The marketing page is a separate deployment now, so this cannot be a
+    // relative link. Only the hosted free plan ever reaches here — Community
+    // and paid both hide the button above — but a dead link is still a bug.
+    upgradeButton.addEventListener('click', () => { location.href = brand.pricingUrl || '/'; });
   }
   const limitNote = document.querySelector('#enrollment-limit-note');
   if (limitNote) {

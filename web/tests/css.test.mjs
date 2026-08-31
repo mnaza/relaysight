@@ -131,7 +131,7 @@ test('every class the stylesheet styles is one the app can produce', () => {
   // usually the leftover of a rename that half happened. This is a substring
   // match, so it is deliberately lenient: it catches a class name that appears
   // nowhere at all, not one that survives only inside a longer word.
-  const markup = ['index.html', 'app.html', 'dashboard-app.js', 'theme.js', 'landing.js']
+  const markup = ['app.html', 'dashboard-app.js', 'theme.js']
     .map(f => readFileSync(join(web, f), 'utf8'))
     .join('\n');
   const styled = new Set([...css.matchAll(/\.([a-z][\w-]*)/g)].map(m => m[1]));

@@ -35,7 +35,7 @@ export function scriptsFor(page) {
   return [...seen];
 }
 
-export const pages = ['index.html', 'app.html'];
+export const pages = ['app.html'];
 
 /** Every page plus every script it pulls in, deduplicated. */
 export function allSources() {
