@@ -39,7 +39,7 @@ node --check web/theme.js && node --check web/landing.js && node --check web/das
 
 - **Compiles.** Whole workspace plus `commercial/control-plane`.
 - `clippy -- -D warnings` **clean**; `cargo fmt` clean.
-- **74 Rust tests, 55 web tests and 11 Python tests, all passing.** Nine speak real
+- **95 Rust tests, 55 web tests and 11 Python tests, all passing.** Nine speak real
   RTSP, three negotiate a real peer connection, thirteen drive the HTTP surface and
   fourteen cover the plugin runtime.
   `src/fake_camera.rs` is a test-only RTSP server that serves
