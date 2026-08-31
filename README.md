@@ -1,40 +1,35 @@
-# White-label CCTV VMS — Community + Commercial prototype
+# RelaySight
 
-`RelaySight` is only the default demo brand. Name, logo, palette, locale set and hosted free-tier size are runtime configuration.
+Self-hosted video management system for camera fleets you
+maintain for someone else.
 
-The project now uses an **open-core split**:
+White-label. `RelaySight` is only the default brand. Name,
+logo, palette and locales are runtime configuration, not a
+build.
 
-- **Community Self-Hosted** — open-source core, self-operated, no camera-count cap.
-- **Commercial Cloud / Enterprise** — the same core plus a private entitlement/control-plane service for managed hosting, paid plans and enterprise features.
-- **Plugins are common to both** — custom AI and storage are never commercial-only extension points.
+## What it does
 
-## Repository layout
+Keeps the cameras already installed. Runs a small gateway
+inside the customer network, outbound only, so no inbound
+ports and no VPN.
 
-```text
-crates/domain/             shared VMS wire/domain types
-crates/plugin-sdk/         versioned plugin protocol (open source)
-crates/plugin-runtime/     plugin registry + HTTP dispatcher (open source)
-services/api/              open-source control API
-edge/gateway/              open-source Rust camera gateway
-plugins.d/                 plugin registrations
-web/                       language-agnostic white-label landing/dashboard
-```
+One dashboard shows which cameras are offline and which
+streams are unstable. Live view and archive playback are
+there too. AI analysis runs through a plugin you supply.
 
-See `docs/EDITIONS.md`, `docs/PLUGIN-SDK.md` and `docs/ARCHIVE.md`.
-
-## Community Self-Hosted
-
-Run without the commercial overlay:
+## Run it
 
 ```bash
 make community
 ```
 
-Open `http://localhost:8081/`.
+Then open `http://localhost:8081/`.
 
-With no `ENTITLEMENTS_URL`, the API reports `community-self-hosted` and `camera_limit: null`. Gateway enrollment therefore becomes unlimited by camera count.
+No entitlement service configured means Community. The API
+reports `camera_limit: null`, and enrollment is unlimited by
+camera count.
 
-To run a real edge gateway on the camera LAN:
+A real gateway on the camera LAN:
 
 ```bash
 export CAMERA_USERNAME=admin
@@ -43,43 +38,42 @@ export ENROLLMENT_TOKEN='TOKEN_FROM_DASHBOARD'
 make edge
 ```
 
-## Commercial prototype
-
-Run core plus the proprietary entitlement service:
-
-```bash
-make commercial
-```
-
-Unknown/new customer IDs receive the hosted free entitlement (3 cameras by default). To mark a demo customer as paid:
-
-```bash
-PAID_CUSTOMERS=my-customer-id make commercial
-```
-
-Production billing/licensing is intentionally outside core. The current commercial service is only the architectural boundary and entitlement prototype.
-
-## Plugin system
-
-Start the included example AI and storage plugins plus MinIO:
-
-```bash
-make plugins
-```
-
-For the complete local media demo (API + web + plugins + MinIO + edge gateway):
+Full local demo, API and web and plugins and MinIO and
+gateway:
 
 ```bash
 CAMERA_USERNAME=admin CAMERA_PASSWORD=secret make demo
 ```
 
-The edge profile uses host networking so ONVIF multicast discovery can see cameras on the LAN.
+The edge profile uses host networking, so ONVIF multicast
+discovery can see the LAN.
 
-The dashboard **Plugins** section reads `GET /api/v1/plugins`, displays capabilities and can call each plugin health endpoint.
+## Layout
 
-### Connect your AI
+```text
+crates/domain/          shared wire and domain types
+crates/plugin-sdk/      versioned plugin protocol
+crates/plugin-runtime/  plugin registry and HTTP dispatch
+services/api/           control API
+edge/gateway/           Rust camera gateway
+plugins.d/              plugin registrations
+web/                    landing and dashboard
+```
 
-The included `ai-http-adapter` lets your model live anywhere:
+## Plugins
+
+Custom AI and custom storage are never paid-only. A
+deployment that cannot bring its own model or its own bucket
+is not self-hosted.
+
+Reference implementations live in
+[relaysight-plugins](https://github.com/mnaza/relaysight-plugins).
+
+```bash
+make plugins
+```
+
+Your model anywhere:
 
 ```bash
 UPSTREAM_AI_URL=https://ai.example.com/analyze \
@@ -87,64 +81,63 @@ UPSTREAM_AI_TOKEN=secret \
 make plugins
 ```
 
-Or implement Plugin Protocol v1 directly. AI plugins can be Python/CUDA, Rust, Go, Node, etc.
+Or implement Plugin Protocol v1 directly. The core talks
+HTTP and knows nothing else, so a plugin can be Python,
+Rust, Go, whatever holds a socket.
 
-### Connect storage
+Storage signs presigned PUT and GET. Video bytes never route
+through the API.
 
-`storage-s3` works with S3-compatible systems and returns presigned PUT/GET URLs. Configure AWS S3, MinIO, Backblaze B2 S3 or another compatible target without modifying core.
-
-This design avoids routing continuous video bytes through the VMS API.
-
-## What is real now
+## What works
 
 - Rust Axum core API
-- one-time gateway enrollment + per-gateway auth
-- Community vs Commercial entitlement boundary
-- Community unlimited camera entitlement
-- Commercial hosted-free / paid entitlement prototype
-- ONVIF WS-Discovery and media profile/URI resolution
+- one-time gateway enrollment, per-gateway auth
+- ONVIF WS-Discovery, media profile and URI resolution
 - WS-Security PasswordDigest
 - RTSP health sampling with Retina
-- FPS / bitrate / packet-loss / reconnect telemetry
-- stale/offline detection
-- plugin SDK/runtime shared by both editions
-- AI HTTP adapter example
-- S3-compatible storage plugin example
-- plugin UI with health test
-- runtime white-label landing/dashboard
-- EN / ES / RU dictionaries
-- outbound gateway media-command queue
-- zero-transcode H.264 fMP4/CMAF-style recording via Retina + `shiguredo_mp4`
-- direct signed upload of `init.mp4` / `.m4s` through the storage plugin
-- recording index, timeline, signed playback manifest and browser MediaSource playback
-- configurable automatic archive retention/deletion
+- FPS, bitrate, packet loss, reconnect telemetry
+- stale and offline detection
+- plugin SDK and runtime
+- WebRTC live view, with ICE path reporting
+- zero-transcode H.264 fMP4 recording
+- signed upload of `init.mp4` and `.m4s` via the plugin
+- recording index, timeline, MediaSource playback
+- automatic archive retention
+- EN, ES, RU dictionaries
+- 95 Rust tests, 55 web tests
 
-## Still not implemented
+## What does not
 
-- WebRTC live viewing
-- continuous recording policies (current archive is on-demand)
+- continuous recording policies; archive is on-demand
 - archive audio muxing
-- Postgres persistence for commands/recording manifests
-- production user auth/RBAC
-- billing provider integration
-- production commercial license validation
-- SSO/HA/reseller hierarchy
-- real AI frame scheduling/snapshot pipeline
+- Postgres for commands and manifests
+- production auth and RBAC
+- SSO, HA, reseller hierarchy
+- AI frame scheduling beyond snapshot-on-demand
 
-## Rebrand without rebuilding
+Prototype. It runs, it is tested, it has not been through a
+season in production.
 
-Edit `web/brand.json`. UI copy remains in `web/locales/*.json`; brand name, logo, colors, locales, gateway image/API URL and hosted free-tier count are runtime settings.
+## Rebrand
 
-## Licensing
+Edit `web/brand.json`. Copy stays in `web/locales/*.json`.
+Brand name, logo, colors, locales, gateway image and API URL
+are runtime settings.
 
-This repository is Community Core and carries GPL-3.0 as the working open-source license (`LICENSE`). The commercial control plane and the reference plugins live in separate repositories. Review the final licensing model before accepting external contributions or public launch.
+## Docs
 
-## v6 media/action checkpoint
+`docs/ARCHITECTURE.md`, `docs/PLUGIN-SDK.md`,
+`docs/EDITIONS.md`, `docs/ARCHIVE.md`, `docs/LIVE.md`,
+`docs/AI.md`.
 
-The v6 prototype adds the two remaining interactive pilot paths on top of the v5 archive layer:
+`docs/TURN-COSTS.md` is the one to read if you are pricing
+relay bandwidth. The finding is that a flat-rate box makes
+it free and a per-GB cloud makes it ruinous.
 
-- **Live:** browser SDP -> Core API -> outbound edge command -> RTSP H.264 -> WebRTC -> browser.
-- **AI:** ONVIF snapshot -> edge -> storage plugin + custom AI plugin -> normalized detections -> bbox overlay.
-- **Storage audience:** signed transfers distinguish browser/edge/service endpoints, so MinIO/S3/B2 can be reachable correctly from each network context.
+## License
 
-See `docs/LIVE.md`, `docs/AI.md`, and `docs/RELEASE-v6.md`.
+GPL-3.0. See `LICENSE` and `NOTICE.md`.
+
+The commercial control plane is a separate private
+repository. The boundary is a service boundary, so there is
+no directory here you are asked to ignore.
