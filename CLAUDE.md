@@ -84,11 +84,15 @@ because the same mistake will recur:
    the bandwidth the architecture exists to avoid, so see `docs/TURN-COSTS.md` — and
    relay share is now measured rather than guessed: every session resolves its own ICE
    candidate pair and logs `path=` and `relayed=` (`edge/gateway/src/icepath.rs`).
-2. **Camera interoperability is untested.** The passthrough path depends on H.264
-   parameter sets (SPS/PPS) arriving on keyframes. Vendors that send them once at session
-   start, or out of band, will break it. Hikvision and Dahua at minimum need real
-   hardware testing. This tail is the actual moat in this market and it is ground out one
-   vendor at a time.
+2. **Camera interoperability is tested against the dialects we know about, not against
+   real hardware.** `FakeCamera::start_with` takes a `ParameterSets` mode — `Both`,
+   `SdpOnly` (advertised in the SDP, never repeated in the stream) or `InBandOnly` (no
+   `sprop-parameter-sets` at all). Probe, recording and live are covered against each,
+   because a decoder that quietly depends on one source works against half the cameras in
+   the field and fails against the rest. **Real hardware is still required**: Hikvision
+   and Dahua at minimum, and the quirks nobody has written down. Add a mode here whenever
+   a real camera teaches you a new one — this tail is the actual moat in this market and
+   it is ground out one vendor at a time.
 3. **Nothing renders the UI, and no plugin is run for real.** The Python example
    plugins are tested only where they are pure; their HTTP handlers, and the boto3 and
    upstream calls behind them, are not exercised.

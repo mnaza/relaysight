@@ -26,6 +26,23 @@ const PAYLOAD_TYPE: u8 = 96;
 /// Below the usual 1500-byte MTU with room for RTP and interleave headers.
 const MAX_PAYLOAD: usize = 1400;
 
+/// Where a camera puts its H.264 parameter sets.
+///
+/// Vendors differ and both of these are common in the field. A decoder that quietly
+/// depends on one of them works against half the cameras and fails against the rest,
+/// which is the compatibility tail this project has to grind through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParameterSets {
+    /// SDP `sprop-parameter-sets` and repeated in-band before each IDR.
+    Both,
+    /// SDP only. Nothing in the stream, so a decoder that ignores the SDP never
+    /// learns the dimensions and cannot start.
+    SdpOnly,
+    /// In-band only, no `sprop-parameter-sets` in the SDP. A decoder that reads only
+    /// the SDP waits forever.
+    InBandOnly,
+}
+
 /// One access unit: the VCL NAL plus any parameter sets that preceded it.
 struct AccessUnit {
     nals: Vec<Vec<u8>>,
@@ -70,7 +87,7 @@ fn parse_annex_b(data: &[u8]) -> Vec<AccessUnit> {
     units
 }
 
-fn parameter_sets(units: &[AccessUnit]) -> (Vec<u8>, Vec<u8>) {
+fn extract_parameter_sets(units: &[AccessUnit]) -> (Vec<u8>, Vec<u8>) {
     let find = |kind: u8| {
         units
             .iter()
@@ -154,6 +171,14 @@ impl FakeCamera {
     /// Authorization header is present, which is how the credential plumbing gets
     /// exercised end to end rather than only in unit tests.
     pub async fn start(require_credentials: bool) -> anyhow::Result<Self> {
+        Self::start_with(require_credentials, ParameterSets::Both).await
+    }
+
+    /// As `start`, but choosing where the parameter sets come from.
+    pub async fn start_with(
+        require_credentials: bool,
+        parameter_sets: ParameterSets,
+    ) -> anyhow::Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .context("bind fake camera")?;
@@ -161,7 +186,7 @@ impl FakeCamera {
         let url = format!("rtsp://{addr}/stream");
         let task = tokio::spawn(async move {
             if let Ok((socket, _)) = listener.accept().await
-                && let Err(error) = serve(socket, require_credentials).await
+                && let Err(error) = serve(socket, require_credentials, parameter_sets).await
             {
                 eprintln!("fake camera session ended: {error:#}");
             }
@@ -170,10 +195,14 @@ impl FakeCamera {
     }
 }
 
-async fn serve(mut socket: TcpStream, require_credentials: bool) -> anyhow::Result<()> {
+async fn serve(
+    mut socket: TcpStream,
+    require_credentials: bool,
+    parameter_sets: ParameterSets,
+) -> anyhow::Result<()> {
     let raw = include_bytes!("../fixtures/camera.h264");
     let units = parse_annex_b(raw);
-    let (sps, pps) = parameter_sets(&units);
+    let (sps, pps) = extract_parameter_sets(&units);
 
     let mut buffer = Vec::new();
     let mut scratch = [0u8; 4096];
@@ -212,10 +241,16 @@ async fn serve(mut socket: TcpStream, require_credentials: bool) -> anyhow::Resu
                         "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=fake\r\nt=0 0\r\n\
                          m=video 0 RTP/AVP {PAYLOAD_TYPE}\r\nc=IN IP4 0.0.0.0\r\n\
                          a=rtpmap:{PAYLOAD_TYPE} H264/{CLOCK_RATE}\r\n\
-                         a=fmtp:{PAYLOAD_TYPE} packetization-mode=1;sprop-parameter-sets={},{}\r\n\
+                         a=fmtp:{PAYLOAD_TYPE} packetization-mode=1{}\r\n\
                          a=control:streamid=0\r\n",
-                        BASE64.encode(&sps),
-                        BASE64.encode(&pps),
+                        match parameter_sets {
+                            ParameterSets::InBandOnly => String::new(),
+                            _ => format!(
+                                ";sprop-parameter-sets={},{}",
+                                BASE64.encode(&sps),
+                                BASE64.encode(&pps)
+                            ),
+                        },
                     );
                     let body = format!(
                         "RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\nContent-Type: application/sdp\r\nContent-Length: {}\r\n\r\n{sdp}",
@@ -233,7 +268,7 @@ async fn serve(mut socket: TcpStream, require_credentials: bool) -> anyhow::Resu
                     let body =
                         format!("RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\nSession: 12345678\r\n\r\n");
                     socket.write_all(body.as_bytes()).await?;
-                    stream_units(&mut socket, &units).await?;
+                    stream_units(&mut socket, &units, parameter_sets).await?;
                     return Ok(());
                 }
                 "TEARDOWN" => {
@@ -247,13 +282,24 @@ async fn serve(mut socket: TcpStream, require_credentials: bool) -> anyhow::Resu
     }
 }
 
-async fn stream_units(socket: &mut TcpStream, units: &[AccessUnit]) -> anyhow::Result<()> {
+async fn stream_units(
+    socket: &mut TcpStream,
+    units: &[AccessUnit],
+    parameter_sets: ParameterSets,
+) -> anyhow::Result<()> {
     let ssrc = 0x1234_5678;
     let mut sequence: u16 = 0;
     let mut timestamp: u32 = 0;
     for unit in units {
-        let count = unit.nals.len();
-        for (idx, nal) in unit.nals.iter().enumerate() {
+        // A camera that advertises its parameter sets in the SDP often does not
+        // repeat them in the stream. Drop them here to reproduce that.
+        let nals: Vec<&Vec<u8>> = unit
+            .nals
+            .iter()
+            .filter(|n| parameter_sets != ParameterSets::SdpOnly || !matches!(n[0] & 0x1f, 7 | 8))
+            .collect();
+        let count = nals.len();
+        for (idx, nal) in nals.iter().enumerate() {
             let last = idx + 1 == count;
             for packet in packetise(nal, last, &mut sequence, timestamp, ssrc) {
                 socket.write_all(&interleave(0, &packet)).await?;
@@ -285,7 +331,7 @@ fn header_value(request: &str, name: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AccessUnit, packetise, parameter_sets, parse_annex_b};
+    use super::{AccessUnit, extract_parameter_sets, packetise, parse_annex_b};
 
     fn fixture() -> Vec<AccessUnit> {
         parse_annex_b(include_bytes!("../fixtures/camera.h264"))
@@ -310,7 +356,7 @@ mod tests {
     #[test]
     fn parameter_sets_are_present_and_well_formed() {
         let units = fixture();
-        let (sps, pps) = parameter_sets(&units);
+        let (sps, pps) = extract_parameter_sets(&units);
         assert_eq!(sps[0] & 0x1f, 7);
         assert_eq!(pps[0] & 0x1f, 8);
     }

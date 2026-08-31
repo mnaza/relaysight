@@ -389,6 +389,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_works_whichever_way_the_camera_supplies_parameter_sets() {
+        // Passthrough sends the camera's H.264 to the browser untouched, so if the
+        // parameter sets never reach the wire the browser has a stream it cannot
+        // decode. Both vendor dialects have to end in media arriving.
+        for mode in [
+            crate::fake_camera::ParameterSets::SdpOnly,
+            crate::fake_camera::ParameterSets::InBandOnly,
+        ] {
+            let camera = FakeCamera::start_with(false, mode).await.unwrap();
+            let browser = FakeBrowser::offer().await.unwrap();
+            let answer = super::start_h264(
+                camera.url.clone(),
+                None,
+                None,
+                browser.offer_sdp().to_owned(),
+                "offer".into(),
+                Vec::new(),
+                10,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{mode:?}: gateway did not answer: {e:#}"));
+
+            browser.accept_answer(&answer.sdp).await.unwrap();
+            let received = browser
+                .wait_for_media(Duration::from_secs(15))
+                .await
+                .unwrap_or_else(|e| panic!("{mode:?}: no media reached the browser: {e:#}"));
+            assert!(
+                received.payload_bytes > 1000,
+                "{mode:?}: only {} payload bytes, which is padding rather than video",
+                received.payload_bytes
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn an_answer_is_refused_as_an_offer() {
         // The command carries the SDP type from the browser. Treating an answer
         // as an offer would produce an unusable session rather than an error.

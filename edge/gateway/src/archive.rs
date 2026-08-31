@@ -515,4 +515,40 @@ mod tests {
             .is_err()
         );
     }
+
+    #[tokio::test]
+    async fn recording_works_whichever_way_the_camera_supplies_parameter_sets() {
+        // The archive writer builds an avcC box from SPS and PPS. Where those come
+        // from differs by vendor, and a writer that silently depends on one source
+        // records nothing playable against half the cameras in the field.
+        for mode in [
+            crate::fake_camera::ParameterSets::Both,
+            crate::fake_camera::ParameterSets::SdpOnly,
+            crate::fake_camera::ParameterSets::InBandOnly,
+        ] {
+            let camera = crate::fake_camera::FakeCamera::start_with(false, mode)
+                .await
+                .unwrap();
+            let recording = super::record_h264_cmaf(
+                &camera.url,
+                None,
+                None,
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(1),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{mode:?} camera failed to record: {e:#}"));
+
+            assert_eq!(
+                recording.width, 320,
+                "{mode:?}: dimensions come from the SPS"
+            );
+            assert_eq!(recording.height, 240, "{mode:?}");
+            assert!(
+                !recording.init.is_empty(),
+                "{mode:?}: no init segment, so no avcC"
+            );
+            assert!(!recording.segments.is_empty(), "{mode:?}: recorded nothing");
+        }
+    }
 }

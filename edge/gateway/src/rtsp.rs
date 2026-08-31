@@ -372,4 +372,45 @@ mod tests {
                 .is_err()
         );
     }
+
+    // ---- vendor dialects: where the H.264 parameter sets come from ----
+
+    #[tokio::test]
+    async fn a_camera_that_only_advertises_parameter_sets_in_the_sdp_still_works() {
+        // Common in the field. Nothing in the stream, so a decoder that ignores the
+        // SDP never learns the dimensions and produces nothing. Until now every test
+        // ran against a camera that sent both, which hides the dependency entirely.
+        let camera = crate::fake_camera::FakeCamera::start_with(
+            false,
+            crate::fake_camera::ParameterSets::SdpOnly,
+        )
+        .await
+        .unwrap();
+        let metrics = super::probe(&camera.url, None, None, Duration::from_millis(600))
+            .await
+            .expect("SDP-only parameter sets must be enough");
+        assert!(
+            metrics.frames > 0,
+            "no frames decoded from an SDP-only camera"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_camera_that_only_repeats_parameter_sets_in_band_still_works() {
+        // The other half of the field. No sprop-parameter-sets in the SDP at all, so
+        // a decoder that reads only the SDP waits forever.
+        let camera = crate::fake_camera::FakeCamera::start_with(
+            false,
+            crate::fake_camera::ParameterSets::InBandOnly,
+        )
+        .await
+        .unwrap();
+        let metrics = super::probe(&camera.url, None, None, Duration::from_millis(600))
+            .await
+            .expect("in-band parameter sets must be enough");
+        assert!(
+            metrics.frames > 0,
+            "no frames decoded from an in-band-only camera"
+        );
+    }
 }
