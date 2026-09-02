@@ -413,4 +413,57 @@ mod tests {
             "no frames decoded from an in-band-only camera"
         );
     }
+
+    /// Run the real probe against a real camera.
+    ///
+    /// Everything above this point runs against `FakeCamera`, which answers the
+    /// five methods this gateway sends and nothing else. That is enough to test
+    /// our logic and it cannot tell us what a real encoder does, which is the
+    /// half that goes wrong.
+    ///
+    /// Ignored by default because it needs hardware. Point it at yours:
+    ///
+    /// ```text
+    /// RELAYSIGHT_TEST_RTSP_URL='rtsp://user:pass@host:554/path' \
+    ///   cargo test -p vms-gateway -- --ignored --nocapture real_camera
+    /// ```
+    ///
+    /// The URL carries a password, so it is read from the environment and never
+    /// printed. Only the redacted endpoint appears in the output.
+    #[tokio::test]
+    #[ignore = "needs a real camera; set RELAYSIGHT_TEST_RTSP_URL"]
+    async fn a_real_camera_produces_frames() {
+        let url = match std::env::var("RELAYSIGHT_TEST_RTSP_URL") {
+            Ok(u) if !u.is_empty() => u,
+            _ => panic!("set RELAYSIGHT_TEST_RTSP_URL to run this"),
+        };
+
+        let metrics = super::probe(&url, None, None, Duration::from_secs(5))
+            .await
+            .expect("probe a real camera");
+
+        println!(
+            "endpoint     {}",
+            super::redacted_endpoint(&url).unwrap_or_else(|| "<unprintable>".into())
+        );
+        println!("codec        {:?}", metrics.codec);
+        println!("frames       {}", metrics.frames);
+        println!("fps          {:?}", metrics.fps);
+        println!("bitrate      {:?} kbps", metrics.bitrate_kbps);
+        println!("packet loss  {}", metrics.packet_loss);
+        println!("bytes        {}", metrics.bytes);
+
+        assert!(metrics.frames > 0, "no frames from the camera");
+        // retina reports the SDP encoding name as the camera wrote it, and case
+        // is not fixed: this Dahua says "h264". Compare case-insensitively or the
+        // test fails on the letters rather than on the stream.
+        assert!(
+            metrics
+                .codec
+                .as_deref()
+                .is_some_and(|c| c.eq_ignore_ascii_case("h264")),
+            "the passthrough path carries H.264 only, got {:?}",
+            metrics.codec
+        );
+    }
 }
