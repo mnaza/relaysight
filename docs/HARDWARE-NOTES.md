@@ -67,14 +67,33 @@ ONVIF. Only the RTSP port is forwarded, so `GetProfiles`, `GetStreamUri` and
 device information were unreachable, and WS-Discovery is multicast and does not
 cross a routed boundary anyway.
 
-That leaves a real gap in the gateway, which this device made obvious. There are
+That left a real gap in the gateway, which this device made obvious. There were
 two ways in and nothing between them: multicast discovery, which needs the
 camera on the same segment, or `CAMERA_RTSP_URL`, which skips ONVIF entirely and
-gives up profile selection, the substream and snapshots. **A camera reachable by
-address but not by multicast — a separate VLAN, a VPN, a port forward — has no
-good path.** An `ONVIF_HOSTS` list that skips discovery and calls
-`resolve_camera` directly would close it; the code underneath already takes an
-address.
+gives up profile selection, the substream and snapshots. A camera reachable by
+address but not by multicast — a separate VLAN, a VPN, a port forward — had no
+good path.
+
+**Closed by `ONVIF_HOSTS`.** A comma-separated list of addresses the gateway
+talks ONVIF to directly. Bare host, `host:port`, or a full URL when the vendor's
+path is not the usual one:
+
+```text
+ONVIF_HOSTS=192.168.1.50,10.0.0.4:8899,http://10.0.0.9/onvif/device
+ONVIF_DISCOVERY_SECONDS=0
+```
+
+Setting the wait to zero skips discovery, which on a routed network is three
+seconds a cycle spent on a probe that cannot succeed.
+
+A camera found both ways is resolved once. Discovery wins, because its endpoint
+reference is a stable identity while an address is only a place — and resolving
+the same camera twice would give it two ids and list it twice.
+
+⚠️ **This is still untested against ONVIF hardware.** The device above exposes
+only RTSP, so the code path has unit tests and no camera behind it. The first
+person to point it at a real camera on a routed network should expect to find
+something.
 
 ## Running the real-camera test
 

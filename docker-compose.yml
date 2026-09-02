@@ -49,7 +49,13 @@ services:
       SITE_NAME: Madrid demo
       SITE_CITY: Madrid
       HEARTBEAT_INTERVAL_SECONDS: 10
-      ONVIF_DISCOVERY_SECONDS: 3
+      # Multicast, so it only reaches cameras on the same segment. Set 0 to skip
+      # it entirely on a routed network and name the cameras in ONVIF_HOSTS.
+      ONVIF_DISCOVERY_SECONDS: ${ONVIF_DISCOVERY_SECONDS:-3}
+      # Comma-separated addresses to talk ONVIF to directly, for cameras that
+      # discovery cannot reach: another VLAN, a VPN, a port forward. Bare host,
+      # host:port, or a full URL when the vendor's path is not the usual one.
+      ONVIF_HOSTS: ${ONVIF_HOSTS:-}
       CAMERA_PROBE_INTERVAL_SECONDS: 30
       RTSP_PROBE_SECONDS: 5
       COMMAND_POLL_INTERVAL_SECONDS: ${COMMAND_POLL_INTERVAL_SECONDS:-1}

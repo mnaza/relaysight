@@ -12,7 +12,7 @@ mod rtsp;
 mod snapshot;
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     env,
     sync::Arc,
     time::{Duration, Instant},
@@ -21,7 +21,7 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::Utc;
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use vms_domain::{
     AiAnalysisResult, AiBoundingBox, AiDetectionResult, CameraTelemetry, CameraTelemetryBatch,
     GatewayCommand, GatewayCommandKind, GatewayCommandResult, GatewayCommandStatus,
@@ -54,6 +54,8 @@ struct Config {
     camera_password: Option<String>,
     explicit_rtsp_url: Option<String>,
     explicit_camera_name: String,
+    /// Addresses to talk ONVIF to directly, skipping multicast discovery.
+    onvif_hosts: Vec<String>,
 }
 
 impl Config {
@@ -82,6 +84,13 @@ impl Config {
             explicit_rtsp_url: env::var("CAMERA_RTSP_URL").ok().filter(|s| !s.is_empty()),
             explicit_camera_name: env::var("CAMERA_NAME")
                 .unwrap_or_else(|_| "Manual RTSP camera".into()),
+            onvif_hosts: env::var("ONVIF_HOSTS")
+                .unwrap_or_default()
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect(),
         }
     }
 }
@@ -205,9 +214,54 @@ async fn probe_loop(
             _ => None,
         };
 
-        match onvif::discover(config.discovery_wait).await {
-            Ok(devices) => {
-                info!(count = devices.len(), "ONVIF discovery completed");
+        // Discovery is multicast, so it only reaches the local segment. Set
+        // ONVIF_DISCOVERY_SECONDS=0 on a routed network to stop paying for a
+        // probe that cannot succeed, and name the cameras in ONVIF_HOSTS instead.
+        let mut devices = if config.discovery_wait.is_zero() {
+            debug!("ONVIF discovery disabled");
+            Vec::new()
+        } else {
+            match onvif::discover(config.discovery_wait).await {
+                Ok(found) => {
+                    info!(count = found.len(), "ONVIF discovery completed");
+                    found
+                }
+                Err(error) => {
+                    warn!(%error, "ONVIF discovery failed");
+                    Vec::new()
+                }
+            }
+        };
+
+        // A camera can be both discovered and configured. Discovery wins, because
+        // its endpoint reference is a stable identity while an address is only a
+        // place — and resolving the same camera twice would give it two ids and
+        // list it twice.
+        let discovered: HashSet<String> = devices
+            .iter()
+            .flat_map(|d| d.xaddrs.iter())
+            .filter_map(|x| onvif::xaddr_authority(x))
+            .collect();
+
+        for address in &config.onvif_hosts {
+            match onvif::device_from_address(address) {
+                Ok(device) => {
+                    let authority = device
+                        .xaddrs
+                        .first()
+                        .and_then(|x| onvif::xaddr_authority(x));
+                    if authority.is_some_and(|a| discovered.contains(&a)) {
+                        debug!(%address, "already found by discovery");
+                        continue;
+                    }
+                    devices.push(device);
+                }
+                Err(error) => warn!(%address, %error, "bad ONVIF_HOSTS entry"),
+            }
+        }
+
+        {
+            {
                 for device in devices {
                     match onvif::resolve_camera(&client, &device, credentials.as_ref()).await {
                         Ok(candidate) => {
@@ -259,7 +313,6 @@ async fn probe_loop(
                     }
                 }
             }
-            Err(error) => warn!(%error, "ONVIF discovery failed"),
         }
 
         if let Some(url) = &config.explicit_rtsp_url {
@@ -916,6 +969,7 @@ mod tests {
             camera_password: None,
             explicit_rtsp_url: None,
             explicit_camera_name: "Camera".into(),
+            onvif_hosts: Vec::new(),
         }
     }
 

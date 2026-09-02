@@ -12,6 +12,7 @@ use tokio::{
     time::{Instant, timeout},
 };
 use tracing::{debug, info, warn};
+use url::Url;
 use uuid::Uuid;
 
 const WS_DISCOVERY_ADDR: &str = "239.255.255.250:3702";
@@ -150,6 +151,61 @@ fn select_profiles(mut profiles: Vec<OnvifProfile>) -> (OnvifProfile, OnvifProfi
         .unwrap_or_else(|| main.clone());
 
     (main, live)
+}
+
+/// Build a device from an address the operator configured, skipping discovery.
+///
+/// WS-Discovery is multicast, so it only ever finds cameras on the same segment.
+/// A camera behind a router, a VPN or a port forward is reachable and invisible,
+/// and until this existed the only way to use one was `CAMERA_RTSP_URL`, which
+/// skips ONVIF entirely and gives up profile selection, the substream and
+/// snapshots. This is the middle that was missing.
+///
+/// Accepts a bare host, a host with a port, or a full URL. A URL that already
+/// names a path is taken as given, because vendors do not agree on it.
+pub fn device_from_address(address: &str) -> anyhow::Result<DiscoveredDevice> {
+    let address = address.trim();
+    if address.is_empty() {
+        return Err(anyhow!("empty ONVIF address"));
+    }
+
+    let xaddr = if address.starts_with("http://") || address.starts_with("https://") {
+        let parsed = Url::parse(address).context("parse ONVIF address")?;
+        if parsed.path() == "/" || parsed.path().is_empty() {
+            format!("{}/onvif/device_service", address.trim_end_matches('/'))
+        } else {
+            address.to_string()
+        }
+    } else {
+        format!("http://{address}/onvif/device_service")
+    };
+
+    // Reject here rather than at the first SOAP call, so a typo in configuration
+    // is a startup complaint instead of a camera that silently never appears.
+    let parsed = Url::parse(&xaddr).context("parse ONVIF address")?;
+    if parsed.host_str().is_none() {
+        return Err(anyhow!("ONVIF address has no host: {address}"));
+    }
+
+    Ok(DiscoveredDevice {
+        // No endpoint reference: the camera was not asked to identify itself.
+        // `resolve_camera` falls back to the service URL for the camera id, which
+        // is stable as long as the address is.
+        endpoint_reference: None,
+        xaddrs: vec![xaddr],
+    })
+}
+
+/// `host:port` of an XAddr, for matching a configured address against a
+/// discovered one. Discovery wins when both find the same camera, because its
+/// endpoint reference is a stable identity and an address is not.
+pub fn xaddr_authority(xaddr: &str) -> Option<String> {
+    let url = Url::parse(xaddr).ok()?;
+    let host = url.host_str()?.to_ascii_lowercase();
+    Some(match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host,
+    })
 }
 
 pub async fn discover(wait: Duration) -> anyhow::Result<Vec<DiscoveredDevice>> {
@@ -661,6 +717,62 @@ mod tests {
             profile("big", 2560, 1440, Some("H264")),
         ]);
         assert_eq!(live.token, "big", "still better than relaying 4K");
+    }
+
+    #[test]
+    fn a_bare_host_becomes_a_device_service_url() {
+        let d = super::device_from_address("192.168.1.50").unwrap();
+        assert_eq!(d.xaddrs, vec!["http://192.168.1.50/onvif/device_service"]);
+        assert!(d.endpoint_reference.is_none());
+    }
+
+    #[test]
+    fn a_host_with_a_port_keeps_the_port() {
+        let d = super::device_from_address("192.168.1.50:8000").unwrap();
+        assert_eq!(
+            d.xaddrs,
+            vec!["http://192.168.1.50:8000/onvif/device_service"]
+        );
+    }
+
+    #[test]
+    fn a_url_with_a_path_is_taken_as_given() {
+        // Vendors do not agree on the path, so an operator who knows theirs must
+        // be able to say it.
+        let d = super::device_from_address("http://10.0.0.4:8899/onvif/device").unwrap();
+        assert_eq!(d.xaddrs, vec!["http://10.0.0.4:8899/onvif/device"]);
+    }
+
+    #[test]
+    fn a_url_without_a_path_gets_the_default_one() {
+        let d = super::device_from_address("http://10.0.0.4:8899").unwrap();
+        assert_eq!(d.xaddrs, vec!["http://10.0.0.4:8899/onvif/device_service"]);
+    }
+
+    #[test]
+    fn surrounding_whitespace_is_ignored() {
+        // These arrive from a comma-separated environment variable.
+        let d = super::device_from_address("  192.168.1.50  ").unwrap();
+        assert_eq!(d.xaddrs, vec!["http://192.168.1.50/onvif/device_service"]);
+    }
+
+    #[test]
+    fn an_address_with_no_host_is_rejected_at_configuration_time() {
+        assert!(super::device_from_address("").is_err());
+        assert!(super::device_from_address("http://").is_err());
+    }
+
+    #[test]
+    fn authority_matches_a_configured_address_against_a_discovered_one() {
+        assert_eq!(
+            super::xaddr_authority("http://192.168.1.50:8000/onvif/device_service"),
+            Some("192.168.1.50:8000".into())
+        );
+        // A default port is absent from both forms, so they still compare equal.
+        assert_eq!(
+            super::xaddr_authority("http://192.168.1.50/onvif/device_service"),
+            super::xaddr_authority("http://192.168.1.50/onvif/device")
+        );
     }
 
     #[test]
