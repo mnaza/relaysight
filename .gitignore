@@ -3,3 +3,4 @@ target/
 .DS_Store
 *.log
 node_modules/
+docker-compose.override.yml
