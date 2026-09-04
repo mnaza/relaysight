@@ -1,0 +1,34 @@
+# The relay, on its own.
+#
+# TURN is separate from the rest on purpose. It wants bandwidth and nothing
+# else, so it belongs on a cheap flat-rate box rather than beside the API — and
+# on a hyperscaler the same traffic costs about a hundred times more. That is
+# the finding in docs/TURN-COSTS.md, and it is the reason this file exists
+# apart from the main one.
+#
+#   RTC_TURN_PUBLIC_IP=203.0.113.10 \
+#   RTC_TURN_REALM=relay.example.com \
+#   RTC_TURN_SECRET=... \
+#     docker compose -f deploy/coturn/docker-compose.yml up -d
+#
+# The same secret goes to the API as RTC_TURN_SECRET. Nothing else is shared.
+
+services:
+  coturn:
+    image: coturn/coturn:4.6
+    # Host networking on purpose. A relay needs a wide UDP port range, and
+    # publishing forty ports through the docker proxy is slow to start and a
+    # needless hop on every packet. It also lets coturn see real client
+    # addresses instead of the bridge's.
+    network_mode: host
+    volumes:
+      - ./turnserver.conf:/etc/coturn/turnserver.conf:ro
+    # coturn does not read these from the environment, so they arrive as flags.
+    # They are visible in `ps` on the host: acceptable when the host is yours,
+    # and worth knowing when it is not.
+    command: >
+      -c /etc/coturn/turnserver.conf
+      --realm=${RTC_TURN_REALM:?set the realm, e.g. relay.example.com}
+      --external-ip=${RTC_TURN_PUBLIC_IP:?set the public address of this box}
+      --static-auth-secret=${RTC_TURN_SECRET:?set the same secret the api uses}
+    restart: unless-stopped

@@ -11,7 +11,14 @@ services:
       DEFAULT_STORAGE_PLUGIN: ${DEFAULT_STORAGE_PLUGIN:-storage-s3}
       DEFAULT_AI_PLUGIN: ${DEFAULT_AI_PLUGIN:-ai-http-adapter}
       DEFAULT_RETENTION_DAYS: ${DEFAULT_RETENTION_DAYS:-30}
-      RTC_ICE_SERVERS_JSON: ${RTC_ICE_SERVERS_JSON:-}
+      # ICE configuration handed to browsers and gateways. STUN alone gets most
+      # networks a direct path; TURN is for the ones where it cannot be
+      # negotiated at all. Leave the TURN values empty and those sites do not
+      # degrade, they never connect. See docs/TURN-DEPLOY.md.
+      RTC_STUN_URLS: ${RTC_STUN_URLS:-stun:stun.l.google.com:19302}
+      RTC_TURN_URLS: ${RTC_TURN_URLS:-}
+      RTC_TURN_SECRET: ${RTC_TURN_SECRET:-}
+      RTC_TURN_TTL_SECS: ${RTC_TURN_TTL_SECS:-600}
       AI_PLUGIN_TOKEN: ${AI_PLUGIN_TOKEN:-demo-ai-plugin-token}
       STORAGE_PLUGIN_TOKEN: ${STORAGE_PLUGIN_TOKEN:-demo-storage-plugin-token}
       RUST_LOG: info
