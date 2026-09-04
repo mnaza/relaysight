@@ -65,7 +65,7 @@ before anything leaves the gateway.
 ```json
 {"name": "Dahua channel 1", "status": "warning", "codec": "h264",
  "fps": 4.39, "bitrate_kbps": 1899, "packet_loss": 573,
- "rtsp_endpoint": "rtsp://212.87.169.76:55544/cam/realmonitor?channel=1&subtype=0"}
+ "rtsp_endpoint": "rtsp://198.51.100.20:55544/cam/realmonitor?channel=1&subtype=0"}
 ```
 
 `status: warning` there is honest. That camera was reached across the public
