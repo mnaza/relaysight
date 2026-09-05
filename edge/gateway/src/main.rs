@@ -1,4 +1,5 @@
 mod archive;
+mod backoff;
 #[cfg(test)]
 mod fake_browser;
 #[cfg(test)]
@@ -18,10 +19,13 @@ use std::{
     time::{Duration, Instant},
 };
 
+use anyhow::anyhow;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::Utc;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
+
+use crate::backoff::{Backoff, DEFAULT_CAP};
 use vms_domain::{
     AiAnalysisResult, AiBoundingBox, AiDetectionResult, CameraTelemetry, CameraTelemetryBatch,
     GatewayCommand, GatewayCommandKind, GatewayCommandResult, GatewayCommandStatus,
@@ -129,6 +133,10 @@ async fn main() -> anyhow::Result<()> {
     let cameras = Arc::new(RwLock::new(Vec::<CameraTelemetry>::new()));
     let sources = Arc::new(RwLock::new(HashMap::<String, CameraSource>::new()));
     let reconnects = Arc::new(RwLock::new(HashMap::<String, u32>::new()));
+    // Doubling from the probe interval. A camera that stops answering is dialled
+    // less and less often instead of once every interval forever; see backoff.rs
+    // for what that trades away.
+    let backoff = Arc::new(RwLock::new(Backoff::new(config.probe_interval, DEFAULT_CAP)));
     let started = Instant::now();
     let hostname = env::var("HOSTNAME").unwrap_or_else(|_| "edge-node".into());
 
@@ -140,6 +148,7 @@ async fn main() -> anyhow::Result<()> {
         client.clone(),
         cameras.clone(),
         reconnects,
+        backoff,
         sources.clone(),
     ));
     let command_task = tokio::spawn(command_loop(config.clone(), client.clone(), sources));
@@ -201,6 +210,7 @@ async fn probe_loop(
     client: reqwest::Client,
     shared: Arc<RwLock<Vec<CameraTelemetry>>>,
     reconnects: Arc<RwLock<HashMap<String, u32>>>,
+    backoff: Arc<RwLock<Backoff>>,
     sources: Arc<RwLock<HashMap<String, CameraSource>>>,
 ) -> anyhow::Result<()> {
     loop {
@@ -275,7 +285,7 @@ async fn probe_loop(
                                     password: config.camera_password.clone(),
                                 },
                             );
-                            telemetry.push(probe_candidate(&config, &candidate, &reconnects).await);
+                            telemetry.push(probe_candidate(&config, &candidate, &reconnects, &backoff).await);
                         }
                         Err(error) => {
                             let identity = device
@@ -330,7 +340,7 @@ async fn probe_loop(
                         password: config.camera_password.clone(),
                     },
                 );
-                telemetry.push(probe_explicit(&config, id, url, &reconnects).await);
+                telemetry.push(probe_explicit(&config, id, url, &reconnects, &backoff).await);
             }
         }
 
@@ -369,6 +379,7 @@ async fn probe_candidate(
     config: &Config,
     candidate: &onvif::CameraCandidate,
     reconnects: &Arc<RwLock<HashMap<String, u32>>>,
+    backoff: &Arc<RwLock<Backoff>>,
 ) -> CameraTelemetry {
     let camera_name = candidate
         .profile
@@ -376,11 +387,11 @@ async fn probe_candidate(
         .clone()
         .or_else(|| candidate.model.clone())
         .unwrap_or_else(|| format!("Camera {}", &candidate.camera_id[..8]));
-    let result = rtsp::probe(
+    let result = probe_with_backoff(
+        config,
+        &candidate.camera_id,
         &candidate.rtsp_uri,
-        config.camera_username.as_deref(),
-        config.camera_password.as_deref(),
-        config.rtsp_probe_window,
+        backoff,
     )
     .await;
     telemetry_from_probe(
@@ -406,14 +417,9 @@ async fn probe_explicit(
     camera_id: String,
     url: &str,
     reconnects: &Arc<RwLock<HashMap<String, u32>>>,
+    backoff: &Arc<RwLock<Backoff>>,
 ) -> CameraTelemetry {
-    let result = rtsp::probe(
-        url,
-        config.camera_username.as_deref(),
-        config.camera_password.as_deref(),
-        config.rtsp_probe_window,
-    )
-    .await;
+    let result = probe_with_backoff(config, &camera_id, url, backoff).await;
     telemetry_from_probe(
         config,
         camera_id,
@@ -430,6 +436,55 @@ async fn probe_explicit(
         reconnects,
     )
     .await
+}
+
+/// Probe, unless this camera failed recently enough that it is still waiting.
+///
+/// A camera held off still produces telemetry — the error that put it there,
+/// repeated — because dropping it from the fleet while it is broken hides
+/// exactly the thing an operator is looking for. What is skipped is the dialling
+/// and its eight-second timeout, not the reporting.
+async fn probe_with_backoff(
+    config: &Config,
+    camera_id: &str,
+    url: &str,
+    backoff: &Arc<RwLock<Backoff>>,
+) -> anyhow::Result<rtsp::RtspMetrics> {
+    let now = Instant::now();
+    if let Some(reason) = backoff.read().await.skip_reason(camera_id, now) {
+        return Err(anyhow!(reason));
+    }
+
+    let result = rtsp::probe(
+        url,
+        config.camera_username.as_deref(),
+        config.camera_password.as_deref(),
+        config.rtsp_probe_window,
+    )
+    .await;
+
+    let mut guard = backoff.write().await;
+    match &result {
+        Ok(_) => {
+            if guard.failures(camera_id) > 0 {
+                info!(camera_id, "camera answered again");
+            }
+            guard.record_success(camera_id);
+        }
+        Err(error) => {
+            guard.record_failure(camera_id, &error.to_string(), now);
+            // The count is the useful part. Twenty-five identical warnings say
+            // nothing the first one did not; a rising count and a rising wait
+            // say the loop knows the camera is gone and has stopped pretending
+            // otherwise.
+            debug!(
+                camera_id,
+                consecutive_failures = guard.failures(camera_id),
+                "backing off"
+            );
+        }
+    }
+    result
 }
 
 #[allow(clippy::too_many_arguments)]

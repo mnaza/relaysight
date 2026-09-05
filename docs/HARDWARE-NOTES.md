@@ -95,6 +95,35 @@ only RTSP, so the code path has unit tests and no camera behind it. The first
 person to point it at a real camera on a routed network should expect to find
 something.
 
+## What twenty hours against that camera looked like
+
+The gateway was left pointed at it overnight. 186 failed probes out of roughly
+1900, in **32 separate windows**:
+
+```text
+09-04 11:38 -> 17:46   single failures, an hour or two apart
+09-04 19:57 -> 23:48   windows of 1-6 minutes, more often
+09-05 01:12 -> 06:17   worse: 8, 10, 10, 15 minutes
+09-05 07:02 -> 07:26   two windows of 5 minutes, then clear
+```
+
+**None of it was the camera and none of it was the gateway.** During an outage a
+raw `OPTIONS` to the device answered in 0.08s and an authenticated `DESCRIBE` in
+1.12s, so the RTSP server was healthy throughout. The log carries three
+`No route to host (os error 113)`, which is a routing failure and not something
+an application invents. It was the link, degrading overnight and clearing by
+morning.
+
+The gateway recovered from all 32 without intervention and without leaking
+anything, which is a soak test nobody planned to run.
+
+**What it did do badly was retry.** A fifteen-minute outage cost twenty-five
+probes, each waiting out an eight-second timeout and writing an identical
+warning. That is what `backoff.rs` is for now: the wait doubles from the probe
+interval up to a five-minute ceiling and resets the moment the camera answers.
+The ceiling is deliberately low — a longer one would quieten the log by leaving
+the dashboard wrong for most of a recovery.
+
 ## Running the real-camera test
 
 ```text
