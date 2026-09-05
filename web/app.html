@@ -11,12 +11,14 @@
     <aside class="sidebar">
       <div id="app-brand"></div>
       <nav class="sidebar-nav">
-        <a class="sidebar-link active" href="#"><span class="nav-icon">⌂</span><span data-i18n="app.overview"></span></a>
-        <a class="sidebar-link" href="#"><span class="nav-icon">◎</span><span data-i18n="app.customers"></span></a>
-        <a class="sidebar-link" href="#"><span class="nav-icon">◇</span><span data-i18n="app.sites"></span></a>
-        <a class="sidebar-link" href="#"><span class="nav-icon">◉</span><span data-i18n="app.cameras"></span></a>
-        <a class="sidebar-link" href="#"><span class="nav-icon">△</span><span data-i18n="app.events"></span></a>
-        <a class="sidebar-link" href="#"><span class="nav-icon">⇄</span><span data-i18n="app.gateways"></span></a>
+        <a class="sidebar-link active" href="#overview"><span class="nav-icon">⌂</span><span data-i18n="app.overview"></span></a>
+        <a class="sidebar-link" href="#fleet"><span class="nav-icon">◎</span><span data-i18n="app.customers"></span></a>
+        <a class="sidebar-link" href="#fleet"><span class="nav-icon">◇</span><span data-i18n="app.sites"></span></a>
+        <a class="sidebar-link" href="#fleet"><span class="nav-icon">◉</span><span data-i18n="app.cameras"></span></a>
+        <!-- No events view exists yet. A link that goes nowhere is worse than a
+             link that says so, so this one is disabled rather than dead. -->
+        <a class="sidebar-link disabled" aria-disabled="true"><span class="nav-icon">△</span><span data-i18n="app.events"></span></a>
+        <a class="sidebar-link" href="#gateways"><span class="nav-icon">⇄</span><span data-i18n="app.gateways"></span></a>
         <a id="plugins-link" class="sidebar-link" href="#plugins"><span class="nav-icon">✦</span><span data-i18n="app.plugins"></span></a>
         <a id="brand-settings-link" class="sidebar-link" href="#branding"><span class="nav-icon">⚙</span><span data-i18n="app.settings"></span></a>
       </nav>
@@ -43,14 +45,14 @@
           <span id="fleet-source" class="demo-tag" data-i18n="app.demo"></span>
         </div>
 
-        <section class="stats">
-          <div class="stat-card"><div class="stat-label" data-i18n="app.stat.online"></div><div id="stat-online" class="stat-value">—</div><div class="stat-delta" data-i18n="app.delta.online"></div></div>
-          <div class="stat-card"><div class="stat-label" data-i18n="app.stat.alerts"></div><div id="stat-alerts" class="stat-value">—</div><div class="stat-delta" style="color:var(--warning)" data-i18n="app.delta.alerts"></div></div>
-          <div class="stat-card"><div class="stat-label" data-i18n="app.stat.sites"></div><div id="stat-sites" class="stat-value">—</div><div class="stat-delta" data-i18n="app.delta.sites"></div></div>
-          <div class="stat-card"><div class="stat-label" data-i18n="app.stat.uptime"></div><div class="stat-value">99.72%</div><div class="stat-delta" data-i18n="app.delta.uptime"></div></div>
+        <section id="overview" class="stats">
+          <div class="stat-card"><div class="stat-label" data-i18n="app.stat.online"></div><div id="stat-online" class="stat-value">—</div><div id="sub-online" class="stat-delta"></div></div>
+          <div class="stat-card"><div class="stat-label" data-i18n="app.stat.alerts"></div><div id="stat-alerts" class="stat-value">—</div><div id="sub-alerts" class="stat-delta" style="color:var(--warning)"></div></div>
+          <div class="stat-card"><div class="stat-label" data-i18n="app.stat.sites"></div><div id="stat-sites" class="stat-value">—</div><div id="sub-sites" class="stat-delta"></div></div>
+          <div class="stat-card"><div class="stat-label" data-i18n="app.stat.throughput"></div><div id="stat-throughput" class="stat-value">—</div><div id="sub-throughput" class="stat-delta"></div></div>
         </section>
 
-        <section class="panel">
+        <section id="fleet" class="panel">
           <div class="panel-head"><strong data-i18n="app.title"></strong><span class="demo-tag" data-i18n="app.demoNote"></span></div>
           <div style="overflow-x:auto">
             <table class="fleet-table">
@@ -58,6 +60,13 @@
               <tbody id="fleet-body"></tbody>
             </table>
           </div>
+        </section>
+
+        <section id="gateways" class="panel">
+          <div class="panel-head">
+            <div><strong data-i18n="app.gateways.title"></strong><div class="metric-sub" data-i18n="app.gateways.subtitle"></div></div>
+          </div>
+          <div id="gateways-grid" class="plugins-grid"></div>
         </section>
 
         <section id="plugins" class="panel">

@@ -51,7 +51,12 @@ export async function startDashboard({ brand, locale, dict }) {
     catch { return await fetch('demo-plugins.json').then(r => r.json()).catch(() => []); }
   }
 
-  let [fleet, telemetry, edition, plugins] = await Promise.all([loadFleet(), loadTelemetry(), loadEdition(), loadPlugins()]);
+  async function loadGateways() {
+    try { return await tryJson('api/v1/gateways'); }
+    catch { return []; }
+  }
+
+  let [fleet, telemetry, edition, plugins, gateways] = await Promise.all([loadFleet(), loadTelemetry(), loadEdition(), loadPlugins(), loadGateways()]);
   const telemetryById = new Map(telemetry.map(camera => [camera.camera_id, camera]));
   const isLive = fleet.source === 'live';
   const sourceTag = document.querySelector('#fleet-source');
@@ -60,11 +65,28 @@ export async function startDashboard({ brand, locale, dict }) {
 
   const rows = fleet.customers.flatMap(customer => customer.sites.map(site => ({ customer, site })));
   const allCameras = rows.flatMap(row => row.site.cameras);
+  // Every number on this screen is computed from what the fleet actually
+  // reported. There were five hardcoded ones here -- a 99.72% uptime and four
+  // invented trends like "+1 this month" -- sitting beside three real ones,
+  // with nothing to tell a reader which was which. A dashboard that mixes
+  // measurements with decoration cannot be used to decide anything.
   const online = allCameras.filter(camera => camera.status !== 'offline').length;
-  const alerts = allCameras.filter(camera => camera.status !== 'healthy').length;
+  const offline = allCameras.filter(camera => camera.status === 'offline').length;
+  const warning = allCameras.filter(camera => camera.status === 'warning').length;
+  const alerts = warning + offline;
+  const throughput = allCameras.reduce((n, camera) => n + (camera.bitrate_kbps || 0), 0);
+  const fill = (id, key, vars) => { document.querySelector(id).textContent = t(dict, key, key, vars); };
+
   document.querySelector('#stat-online').textContent = `${online} / ${allCameras.length}`;
   document.querySelector('#stat-alerts').textContent = String(alerts);
   document.querySelector('#stat-sites').textContent = String(rows.length);
+  document.querySelector('#stat-throughput').textContent = throughput >= 1000
+    ? `${(throughput / 1000).toFixed(1)} Mbps`
+    : `${throughput} kbps`;
+  fill('#sub-online', 'app.stat.sub.online', { offline });
+  fill('#sub-alerts', 'app.stat.sub.alerts', { warning, offline });
+  fill('#sub-sites', 'app.stat.sub.sites', { customers: fleet.customers.length });
+  fill('#sub-throughput', 'app.stat.sub.throughput', { cameras: allCameras.length });
   const planTitle = document.querySelector('#plan-title');
   const planUsage = document.querySelector('#free-usage');
   const usageWrap = document.querySelector('#usage-wrap');
@@ -445,6 +467,68 @@ export async function startDashboard({ brand, locale, dict }) {
     }[capability];
     return key ? t(dict, key) : capability;
   }
+  // The gateway is the thing that can take a whole site down, and until now it
+  // was the one part of the fleet with no view. /api/v1/gateways has been
+  // reporting uptime, version and per-status camera counts the whole time.
+  function renderGateways() {
+    const grid = document.querySelector('#gateways-grid');
+    grid.replaceChildren();
+    if (!Array.isArray(gateways) || gateways.length === 0) {
+      const empty = document.createElement('p');
+      empty.className = 'metric-sub';
+      empty.textContent = t(dict, 'app.gateways.none');
+      grid.appendChild(empty);
+      return;
+    }
+    for (const gateway of gateways) {
+      const healthy = Number(gateway.healthy_cameras || 0);
+      const warn = Number(gateway.warning_cameras || 0);
+      const off = Number(gateway.offline_cameras || 0);
+      // A gateway is only as healthy as what it reports about. Offline cameras
+      // are the loud case; warnings are the one that gets ignored.
+      const status = off > 0 ? 'offline' : warn > 0 ? 'warning' : 'healthy';
+      const card = document.createElement('article');
+      card.className = 'plugin-card';
+      card.innerHTML = `
+        <div class="panel-head">
+          <div><strong class="gw-name"></strong><div class="metric-sub gw-site"></div></div>
+          <span class="health-pill ${status}"></span>
+        </div>
+        <div class="telemetry-grid">
+          <div class="telemetry-metric"><span class="gw-l-uptime"></span><strong class="gw-uptime"></strong></div>
+          <div class="telemetry-metric"><span class="gw-l-cameras"></span><strong class="gw-cameras"></strong></div>
+          <div class="telemetry-metric"><span class="gw-l-version"></span><strong class="gw-version"></strong></div>
+          <div class="telemetry-metric"><span class="gw-l-seen"></span><strong class="gw-seen"></strong></div>
+        </div>`;
+      const set = (sel, value) => { card.querySelector(sel).textContent = value; };
+      set('.gw-name', gateway.hostname || gateway.gateway_id);
+      set('.gw-site', gateway.site_id || '');
+      set('.health-pill', t(dict, `app.${status}`));
+      set('.gw-l-uptime', t(dict, 'app.gateways.uptime'));
+      set('.gw-l-cameras', t(dict, 'app.gateways.cameras'));
+      set('.gw-l-version', t(dict, 'app.gateways.version'));
+      set('.gw-l-seen', t(dict, 'app.gateways.lastSeen'));
+      set('.gw-uptime', formatUptime(gateway.uptime_seconds));
+      set('.gw-cameras', `${healthy} / ${healthy + warn + off}`);
+      set('.gw-version', gateway.version || '—');
+      set('.gw-seen', gateway.sent_at ? new Date(gateway.sent_at).toLocaleTimeString(locale, { hour: '2-digit', minute: '2-digit' }) : '—');
+      grid.appendChild(card);
+    }
+  }
+
+  function formatUptime(seconds) {
+    const total = Number(seconds);
+    if (!Number.isFinite(total) || total < 0) return '—';
+    const d = Math.floor(total / 86400);
+    const h = Math.floor((total % 86400) / 3600);
+    const m = Math.floor((total % 3600) / 60);
+    if (d > 0) return `${d}d ${h}h`;
+    if (h > 0) return `${h}h ${m}m`;
+    return `${m}m`;
+  }
+
+  renderGateways();
+
   function renderPlugins() {
     const grid = document.querySelector('#plugins-grid');
     grid.replaceChildren();
