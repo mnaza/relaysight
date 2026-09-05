@@ -57,36 +57,39 @@ export async function startDashboard({ brand, locale, dict }) {
   }
 
   let [fleet, telemetry, edition, plugins, gateways] = await Promise.all([loadFleet(), loadTelemetry(), loadEdition(), loadPlugins(), loadGateways()]);
-  const telemetryById = new Map(telemetry.map(camera => [camera.camera_id, camera]));
+  let telemetryById = new Map(telemetry.map(camera => [camera.camera_id, camera]));
   const isLive = fleet.source === 'live';
   const sourceTag = document.querySelector('#fleet-source');
   sourceTag.textContent = t(dict, isLive ? 'app.liveData' : 'app.demo');
   sourceTag.classList.toggle('status', isLive);
 
-  const rows = fleet.customers.flatMap(customer => customer.sites.map(site => ({ customer, site })));
-  const allCameras = rows.flatMap(row => row.site.cameras);
+  let rows = fleet.customers.flatMap(customer => customer.sites.map(site => ({ customer, site })));
+  let allCameras = rows.flatMap(row => row.site.cameras);
   // Every number on this screen is computed from what the fleet actually
   // reported. There were five hardcoded ones here -- a 99.72% uptime and four
   // invented trends like "+1 this month" -- sitting beside three real ones,
   // with nothing to tell a reader which was which. A dashboard that mixes
   // measurements with decoration cannot be used to decide anything.
-  const online = allCameras.filter(camera => camera.status !== 'offline').length;
-  const offline = allCameras.filter(camera => camera.status === 'offline').length;
-  const warning = allCameras.filter(camera => camera.status === 'warning').length;
-  const alerts = warning + offline;
-  const throughput = allCameras.reduce((n, camera) => n + (camera.bitrate_kbps || 0), 0);
   const fill = (id, key, vars) => { document.querySelector(id).textContent = t(dict, key, key, vars); };
 
-  document.querySelector('#stat-online').textContent = `${online} / ${allCameras.length}`;
-  document.querySelector('#stat-alerts').textContent = String(alerts);
-  document.querySelector('#stat-sites').textContent = String(rows.length);
-  document.querySelector('#stat-throughput').textContent = throughput >= 1000
-    ? `${(throughput / 1000).toFixed(1)} Mbps`
-    : `${throughput} kbps`;
-  fill('#sub-online', 'app.stat.sub.online', { offline });
-  fill('#sub-alerts', 'app.stat.sub.alerts', { warning, offline });
-  fill('#sub-sites', 'app.stat.sub.sites', { customers: fleet.customers.length });
-  fill('#sub-throughput', 'app.stat.sub.throughput', { cameras: allCameras.length });
+  function paintStats() {
+    const online = allCameras.filter(camera => camera.status !== 'offline').length;
+    const offline = allCameras.filter(camera => camera.status === 'offline').length;
+    const warning = allCameras.filter(camera => camera.status === 'warning').length;
+    const throughput = allCameras.reduce((n, camera) => n + (camera.bitrate_kbps || 0), 0);
+
+    document.querySelector('#stat-online').textContent = `${online} / ${allCameras.length}`;
+    document.querySelector('#stat-alerts').textContent = String(warning + offline);
+    document.querySelector('#stat-sites').textContent = String(rows.length);
+    document.querySelector('#stat-throughput').textContent = throughput >= 1000
+      ? `${(throughput / 1000).toFixed(1)} Mbps`
+      : `${throughput} kbps`;
+    fill('#sub-online', 'app.stat.sub.online', { offline });
+    fill('#sub-alerts', 'app.stat.sub.alerts', { warning, offline });
+    fill('#sub-sites', 'app.stat.sub.sites', { customers: fleet.customers.length });
+    fill('#sub-throughput', 'app.stat.sub.throughput', { cameras: allCameras.length });
+  }
+  paintStats();
   const planTitle = document.querySelector('#plan-title');
   const planUsage = document.querySelector('#free-usage');
   const usageWrap = document.querySelector('#usage-wrap');
@@ -458,8 +461,65 @@ export async function startDashboard({ brand, locale, dict }) {
         body.appendChild(row);
       });
   }
+  // The search box is the one piece of state a refresh must not stamp on, so
+  // the current filter is kept rather than read back out of the input.
+  let currentFilter = '';
   render();
-  document.querySelector('#fleet-search').addEventListener('input', event => render(event.target.value));
+  document.querySelector('#fleet-search').addEventListener('input', event => {
+    currentFilter = event.target.value;
+    render(currentFilter);
+  });
+
+  // Poll, because a dashboard that only tells the truth at page load is a
+  // screenshot. Three rules, each for a reason that showed up in use:
+  //
+  //   - Skip while a modal is open. Repainting the fleet under someone who is
+  //     reading a camera's telemetry or filling in the enrollment form is worse
+  //     than showing them a number a few seconds old.
+  //   - Skip ticks while the tab is hidden. Nobody is reading it, and a wall
+  //     display left open for a week should not spend a week polling in the
+  //     background. That test is on the tick rather than inside refresh().
+  //   - A failed poll changes nothing. The old data stays on screen and the next
+  //     tick tries again; blanking the fleet because one request timed out would
+  //     turn a blip into an apparent outage.
+  const REFRESH_MS = 5000;
+
+  async function refresh() {
+    // The modal guard lives here because it protects whoever is reading the
+    // page, whatever caused the refresh. Whether the tab is worth polling at
+    // all is a question about the tick, not about this function, so it is
+    // asked below — an explicit refresh() should refresh.
+    if (document.querySelector('.modal-backdrop.open')) return;
+    let next;
+    try {
+      next = await Promise.all([loadFleet(), loadTelemetry(), loadGateways()]);
+    } catch {
+      return;
+    }
+    [fleet, telemetry, gateways] = next;
+    telemetryById = new Map(telemetry.map(camera => [camera.camera_id, camera]));
+    rows = fleet.customers.flatMap(customer => customer.sites.map(site => ({ customer, site })));
+    allCameras = rows.flatMap(row => row.site.cameras);
+    paintStats();
+    render(currentFilter);
+    renderGateways();
+    markUpdated();
+  }
+
+  function markUpdated() {
+    const stamp = new Date().toLocaleTimeString(locale, { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    sourceTag.textContent = `${t(dict, isLive ? 'app.liveData' : 'app.demo')} · ${stamp}`;
+  }
+  markUpdated();
+
+  const timer = setInterval(() => { if (!document.hidden) refresh(); }, REFRESH_MS);
+  // Node keeps a process alive for as long as an interval is pending, so a test
+  // that starts the dashboard would hang on exit. `unref` releases that hold
+  // without changing when the timer fires. Browsers return a plain number from
+  // setInterval and have no unref, hence the optional calls.
+  timer?.unref?.();
+  // A tab coming back to the front should not wait out the rest of the interval.
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
 
   function capabilityLabel(capability) {
     const key = {
@@ -742,6 +802,8 @@ export async function startDashboard({ brand, locale, dict }) {
   if (location.hash === '#branding') brandModal.classList.add('open');
 
   // Handles worth reaching from a test. The rest close over local state that
-  // only means anything mid-render.
-  return { siteStatus, fmt, escapeHtml, storagePluginId, aiPluginId, render };
+  // only means anything mid-render. `stop` is here because anything that starts
+  // this dashboard should be able to end it — a timer with no off switch is a
+  // leak waiting for whoever embeds this next.
+  return { siteStatus, fmt, escapeHtml, storagePluginId, aiPluginId, render, refresh, stop: () => clearInterval(timer) };
 }

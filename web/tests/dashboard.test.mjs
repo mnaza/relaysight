@@ -148,3 +148,62 @@ test('fmt shows a dash for absent values rather than null', async () => {
   assert.equal(fmt(0), '0', 'zero is a value, not an absence');
   assert.match(fmt(12, ' kbps'), /12 kbps/);
 });
+
+// A poll loop that never runs, or runs when it should not, fails silently. The
+// page looks fine and the numbers are simply from earlier.
+
+/** A one-camera fleet, so a test can change a status and watch the stats move. */
+function fleetWith(status, bitrate) {
+  return {
+    generated_at: new Date().toISOString(),
+    source: 'live',
+    customers: [{
+      id: 'c1', name: 'Customer', sites: [{
+        id: 's1', customer_id: 'c1', name: 'Site', city: 'Barcelona',
+        cameras: [{ id: 'cam1', name: 'Cam', site_id: 's1', status, bitrate_kbps: bitrate, last_seen: new Date().toISOString() }],
+      }],
+    }],
+  };
+}
+
+test('a refresh repaints the stats from the new fleet', async () => {
+  stubFetch({ 'api/v1/fleet': fleetWith('healthy', 2000) });
+  const app = await startDashboard({ brand, locale: 'en', dict });
+  assert.equal(document.querySelector('#stat-online').textContent, '1 / 1');
+  assert.equal(document.querySelector('#stat-throughput').textContent, '2.0 Mbps');
+
+  stubFetch({ 'api/v1/fleet': fleetWith('offline', 0) });
+  await app.refresh();
+
+  assert.equal(document.querySelector('#stat-online').textContent, '0 / 1');
+  assert.equal(document.querySelector('#stat-alerts').textContent, '1');
+  assert.equal(document.querySelector('#stat-throughput').textContent, '0 kbps');
+  app.stop();
+});
+
+test('a refresh does not repaint under an open modal', async () => {
+  // Repainting the fleet while someone reads a camera's telemetry, or fills in
+  // the enrollment form, is worse than a number a few seconds old.
+  stubFetch({ 'api/v1/fleet': fleetWith('healthy', 2000) });
+  const app = await startDashboard({ brand, locale: 'en', dict });
+  document.querySelector('.modal-backdrop').classList.add('open');
+
+  stubFetch({ 'api/v1/fleet': fleetWith('offline', 0) });
+  await app.refresh();
+
+  assert.equal(document.querySelector('#stat-online').textContent, '1 / 1', 'repainted under a modal');
+  app.stop();
+});
+
+test('a failed poll leaves the last good numbers alone', async () => {
+  // One timed-out request should not look like an outage.
+  stubFetch({ 'api/v1/fleet': fleetWith('healthy', 2000) });
+  const app = await startDashboard({ brand, locale: 'en', dict });
+
+  globalThis.fetch = async () => { throw new Error('network'); };
+  await app.refresh();
+
+  assert.equal(document.querySelector('#stat-online').textContent, '1 / 1');
+  assert.equal(document.querySelector('#stat-throughput').textContent, '2.0 Mbps');
+  app.stop();
+});
