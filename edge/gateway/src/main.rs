@@ -387,7 +387,7 @@ async fn probe_candidate(
         .clone()
         .or_else(|| candidate.model.clone())
         .unwrap_or_else(|| format!("Camera {}", &candidate.camera_id[..8]));
-    let result = probe_with_backoff(
+    let (result, held_off) = probe_with_backoff(
         config,
         &candidate.camera_id,
         &candidate.rtsp_uri,
@@ -407,6 +407,7 @@ async fn probe_candidate(
         candidate.profile.height,
         &candidate.rtsp_uri,
         result,
+        held_off,
         reconnects,
     )
     .await
@@ -419,7 +420,7 @@ async fn probe_explicit(
     reconnects: &Arc<RwLock<HashMap<String, u32>>>,
     backoff: &Arc<RwLock<Backoff>>,
 ) -> CameraTelemetry {
-    let result = probe_with_backoff(config, &camera_id, url, backoff).await;
+    let (result, held_off) = probe_with_backoff(config, &camera_id, url, backoff).await;
     telemetry_from_probe(
         config,
         camera_id,
@@ -433,6 +434,7 @@ async fn probe_explicit(
         None,
         url,
         result,
+        held_off,
         reconnects,
     )
     .await
@@ -449,10 +451,13 @@ async fn probe_with_backoff(
     camera_id: &str,
     url: &str,
     backoff: &Arc<RwLock<Backoff>>,
-) -> anyhow::Result<rtsp::RtspMetrics> {
+) -> (anyhow::Result<rtsp::RtspMetrics>, bool) {
     let now = Instant::now();
     if let Some(reason) = backoff.read().await.skip_reason(camera_id, now) {
-        return Err(anyhow!(reason));
+        // Held off, not failed. The caller has to be able to tell: a skipped
+        // dial is not a reconnect and does not deserve its own warning, and
+        // conflating them was the first version of this.
+        return (Err(anyhow!(reason)), true);
     }
 
     let result = rtsp::probe(
@@ -484,7 +489,7 @@ async fn probe_with_backoff(
             );
         }
     }
-    result
+    (result, false)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -501,6 +506,8 @@ async fn telemetry_from_probe(
     height: Option<u32>,
     rtsp_uri: &str,
     result: anyhow::Result<rtsp::RtspMetrics>,
+    // True when no dial happened because the camera is still in backoff.
+    held_off: bool,
     reconnects: &Arc<RwLock<HashMap<String, u32>>>,
 ) -> CameraTelemetry {
     match result {
@@ -533,13 +540,21 @@ async fn telemetry_from_probe(
             }
         }
         Err(error) => {
-            let count = {
+            // A camera held off did not fail here — it failed earlier and is
+            // waiting. Counting that as a reconnect inflates the number an
+            // operator uses to judge a flaky link, and warning about it again
+            // every interval is the noise backoff exists to remove.
+            let count = if held_off {
+                *reconnects.read().await.get(&camera_id).unwrap_or(&0)
+            } else {
                 let mut map = reconnects.write().await;
                 let count = map.entry(camera_id.clone()).or_default();
                 *count += 1;
                 *count
             };
-            warn!(camera_id = %camera_id, %error, "RTSP probe failed");
+            if !held_off {
+                warn!(camera_id = %camera_id, %error, "RTSP probe failed");
+            }
             CameraTelemetry {
                 camera_id,
                 gateway_id: config.gateway_id.clone(),
@@ -1002,6 +1017,46 @@ mod tests {
     use crate::{fake_camera::FakeCamera, fake_control_plane::FakeControlPlane};
 
     const TOKEN: &str = "gateway-token";
+
+    /// A camera held off by backoff is not reconnecting, and the number an
+    /// operator uses to judge a flaky link must not count the waiting.
+    ///
+    /// The first version of backoff got this wrong. It returned the held-off
+    /// case as an ordinary Err, which walked straight into the failure branch,
+    /// incremented the counter and logged a warning every interval — so the
+    /// change meant to quieten the log left it exactly as loud and started
+    /// inventing reconnects on top. Unit tests on the Backoff type could not
+    /// see it; only running the thing did.
+    #[tokio::test]
+    async fn a_held_off_probe_is_not_counted_as_a_reconnect() {
+        let cfg = config("http://127.0.0.1:9");
+        let reconnects = Arc::new(RwLock::new(HashMap::<String, u32>::new()));
+
+        let real_failure = telemetry_from_probe(
+            &cfg, "cam".into(), "Cam".into(), None, None, None, None, None, None, None,
+            "rtsp://example.test/s", Err(anyhow!("RTSP DESCRIBE timeout")), false, &reconnects,
+        )
+        .await;
+        assert_eq!(real_failure.reconnects, 1);
+
+        for _ in 0..5 {
+            let waiting = telemetry_from_probe(
+                &cfg, "cam".into(), "Cam".into(), None, None, None, None, None, None, None,
+                "rtsp://example.test/s", Err(anyhow!("RTSP DESCRIBE timeout")), true, &reconnects,
+            )
+            .await;
+            assert_eq!(
+                waiting.reconnects, 1,
+                "waiting for the next attempt counted as reconnecting"
+            );
+            assert_eq!(waiting.status, HealthStatus::Offline);
+            assert_eq!(
+                waiting.last_error.as_deref(),
+                Some("RTSP DESCRIBE timeout"),
+                "a camera in backoff has to keep saying why it is offline"
+            );
+        }
+    }
 
     fn config(api_url: &str) -> Config {
         Config {
