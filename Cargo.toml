@@ -25,7 +25,3 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uuid = { version = "1", features = ["serde", "v4", "v5"] }
 
-# Local only, not committed: retina rejects the decimal SSRC this Dahua sends
-# in RTP-Info. See docs/HARDWARE-NOTES.md and scottlamb/retina#137.
-[patch.crates-io]
-retina = { path = "../retina-fork" }
