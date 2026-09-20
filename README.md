@@ -48,6 +48,21 @@ CAMERA_USERNAME=admin CAMERA_PASSWORD=secret make demo
 The edge profile uses host networking, so ONVIF multicast
 discovery can see the LAN.
 
+Both editions side by side, free and paid:
+
+```bash
+make demo-community             # Community Self-Hosted
+make demo-commercial            # Hosted Free, three cameras
+make demo-commercial PLAN=pro   # Commercial Pro, unlimited
+make demo-fleet                 # five cameras into whichever is up
+make check-editions             # prove the three differ, headless
+```
+
+The paid side runs against a stand-in entitlement service
+in `deploy/demo-entitlements/`, because the real control
+plane is not in this repository. `docs/DEMO.md` says what
+each one shows, and what the camera cap really does.
+
 ## Layout
 
 ```text
@@ -132,8 +147,8 @@ It is not needed to run this. Nothing here links to it unless
 ## Docs
 
 `docs/ARCHITECTURE.md`, `docs/PLUGIN-SDK.md`,
-`docs/EDITIONS.md`, `docs/ARCHIVE.md`, `docs/LIVE.md`,
-`docs/AI.md`.
+`docs/EDITIONS.md`, `docs/DEMO.md`, `docs/ARCHIVE.md`,
+`docs/LIVE.md`, `docs/AI.md`.
 
 `docs/TURN-COSTS.md` is the one to read if you are pricing
 relay bandwidth. The finding is that a flat-rate box makes

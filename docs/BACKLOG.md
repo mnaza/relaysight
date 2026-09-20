@@ -63,14 +63,20 @@
 ## Next — make the demo sellable on real sites
 
 - [ ] On-demand RTSP → WebRTC live session
-- [ ] Camera disconnect/recovery incident timeline
-- [ ] Persistent Postgres model for organizations, sites, gateways and cameras
-- [ ] Production auth for installer dashboard
-- [ ] Encrypted persistent gateway token / identity
+- [x] Camera disconnect/recovery incident timeline
+- [x] Persistent model for organizations, sites, gateways and cameras — done as SQLite behind a `Store` trait (spec: `docs/superpowers/specs/2026-09-06-persistent-fleet-store-design.md`); Postgres becomes a second `Store` implementation when hosted scale calls for it
+- [x] Production auth for installer dashboard
+- [x] Encrypted persistent gateway token / identity
 - [ ] Per-camera credential store encrypted at rest on edge
 - [ ] Hikvision/Dahua compatibility fixtures and device test matrix
 - [ ] Gateway installer package / update channel (systemd + Docker)
-- [ ] Gateway revocation and audit log
+- [x] Gateway revocation and audit log
+- [ ] Camera decommission flow — retire a revoked gateway's cameras from the roster
+- [x] Both editions demonstrable on one machine — `make demo-community`, `make demo-commercial [PLAN=pro]`, `make check-editions`, against a stand-in entitlement service in `deploy/demo-entitlements/` (`docs/DEMO.md`)
+- [x] Relay serves TURN over TLS on 443 (`make check-relay`)
+- [x] Gateway relays over TURN TCP/TLS — through a local bridge in the gateway (`make check-gateway-relay` covers TLS; plain TCP has only met a test server); remove it once webrtc-rs supports `turns:` (webrtc-rs#848)
+- [ ] Relay healthcheck notices an expired or wrong-name certificate, not only a missing TLS listener
+- [ ] install-cert.sh notices a relay whose TLS listener never came up and says to restart it instead of reporting a reload
 
 ## Plugin productionization
 

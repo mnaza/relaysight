@@ -84,6 +84,10 @@ button { cursor: pointer; }
 .metric-sub { color: var(--muted); font-size: 11px; margin-top: 3px; }
 .modal-backdrop { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.62); z-index: 40; padding: 24px; align-items: center; justify-content: center; backdrop-filter: blur(7px); }
 .modal-backdrop.open { display: flex; }
+/* The login gate sits above everything and is opaque: an unauthenticated
+   viewer must not see the fleet behind a translucent scrim. */
+.login-backdrop { background: #0a1420; backdrop-filter: none; z-index: 60; }
+.login-modal { width: min(400px, 100%); }
 .modal { width: min(650px, 100%); max-height: 90vh; overflow: auto; background: #0d1829; border: 1px solid var(--border); border-radius: 20px; box-shadow: var(--shadow); padding: 28px; }
 .modal h2 { margin: 0 0 7px; }
 .modal > p { color: var(--muted); margin: 0 0 25px; line-height: 1.6; }

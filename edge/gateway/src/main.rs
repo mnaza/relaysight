@@ -7,10 +7,12 @@ mod fake_camera;
 #[cfg(test)]
 mod fake_control_plane;
 mod icepath;
+mod identity;
 mod live;
 mod onvif;
 mod rtsp;
 mod snapshot;
+mod turn_bridge;
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -136,11 +138,23 @@ async fn main() -> anyhow::Result<()> {
     // Doubling from the probe interval. A camera that stops answering is dialled
     // less and less often instead of once every interval forever; see backoff.rs
     // for what that trades away.
-    let backoff = Arc::new(RwLock::new(Backoff::new(config.probe_interval, DEFAULT_CAP)));
+    let backoff = Arc::new(RwLock::new(Backoff::new(
+        config.probe_interval,
+        DEFAULT_CAP,
+    )));
     let started = Instant::now();
     let hostname = env::var("HOSTNAME").unwrap_or_else(|_| "edge-node".into());
 
-    enroll_if_requested(&mut config, &client, &hostname).await?;
+    let state_dir = env::var("GATEWAY_STATE_DIR").unwrap_or_else(|_| "data/gateway".into());
+    let store = identity::IdentityStore::open(
+        std::path::Path::new(&state_dir),
+        env::var("GATEWAY_STATE_KEY")
+            .ok()
+            .filter(|k| !k.is_empty())
+            .as_deref(),
+    )?;
+    let reenroll = env::var("GATEWAY_REENROLL").is_ok_and(|v| v == "true");
+    establish_identity(&mut config, &client, &hostname, &store, reenroll).await?;
     info!(gateway_id = %config.gateway_id, site_id = %config.site_id, camera_limit = config.camera_limit, "gateway started");
 
     let probe_task = tokio::spawn(probe_loop(
@@ -159,6 +173,54 @@ async fn main() -> anyhow::Result<()> {
         result = command_task => result??,
         result = heartbeat_task => result??,
         _ = tokio::signal::ctrl_c() => info!("shutdown requested"),
+    }
+    Ok(())
+}
+
+/// Boot-time identity: use what enrollment earned last time, or earn it now
+/// and write it down. See identity::boot_plan for the decision table.
+async fn establish_identity(
+    config: &mut Config,
+    client: &reqwest::Client,
+    hostname: &str,
+    store: &identity::IdentityStore,
+    reenroll: bool,
+) -> anyhow::Result<()> {
+    let loaded = if reenroll { Ok(None) } else { store.load() };
+    match identity::boot_plan(loaded, config.enrollment_token.is_some(), reenroll)? {
+        identity::BootPlan::UsePersisted(id) => {
+            info!(gateway_id = %id.gateway_id, site = %id.site_name, "using persisted gateway identity");
+            config.token = id.gateway_token;
+            config.gateway_id = id.gateway_id;
+            config.customer_id = id.customer_id;
+            config.customer_name = id.customer_name;
+            config.site_id = id.site_id;
+            config.site_name = id.site_name;
+            config.city = id.city;
+            config.camera_limit = id.camera_limit;
+            // The env token is one-shot and already burned; never spend it again.
+            config.enrollment_token = None;
+        }
+        identity::BootPlan::Enroll => {
+            if reenroll {
+                store.wipe()?;
+                warn!("GATEWAY_REENROLL: wiped persisted identity, enrolling fresh");
+            }
+            enroll_if_requested(config, client, hostname).await?;
+            store.save(&identity::GatewayIdentity {
+                version: identity::CURRENT_VERSION,
+                gateway_token: config.token.clone(),
+                gateway_id: config.gateway_id.clone(),
+                customer_id: config.customer_id.clone(),
+                customer_name: config.customer_name.clone(),
+                site_id: config.site_id.clone(),
+                site_name: config.site_name.clone(),
+                city: config.city.clone(),
+                camera_limit: config.camera_limit,
+            })?;
+            info!("gateway identity persisted");
+        }
+        identity::BootPlan::Bootstrap => {}
     }
     Ok(())
 }
@@ -285,7 +347,9 @@ async fn probe_loop(
                                     password: config.camera_password.clone(),
                                 },
                             );
-                            telemetry.push(probe_candidate(&config, &candidate, &reconnects, &backoff).await);
+                            telemetry.push(
+                                probe_candidate(&config, &candidate, &reconnects, &backoff).await,
+                            );
                         }
                         Err(error) => {
                             let identity = device
@@ -387,13 +451,8 @@ async fn probe_candidate(
         .clone()
         .or_else(|| candidate.model.clone())
         .unwrap_or_else(|| format!("Camera {}", &candidate.camera_id[..8]));
-    let (result, held_off) = probe_with_backoff(
-        config,
-        &candidate.camera_id,
-        &candidate.rtsp_uri,
-        backoff,
-    )
-    .await;
+    let (result, held_off) =
+        probe_with_backoff(config, &candidate.camera_id, &candidate.rtsp_uri, backoff).await;
     telemetry_from_probe(
         config,
         candidate.camera_id.clone(),
@@ -851,6 +910,7 @@ async fn execute_command(
             );
             let response = client
                 .post(endpoint)
+                .bearer_auth(&config.token)
                 .json(&request)
                 .send()
                 .await?
@@ -937,6 +997,7 @@ async fn upload_recording_object(
     );
     let response = client
         .post(endpoint)
+        .bearer_auth(&config.token)
         .json(&request)
         .send()
         .await?
@@ -1018,6 +1079,55 @@ mod tests {
 
     const TOKEN: &str = "gateway-token";
 
+    fn sample_identity() -> identity::GatewayIdentity {
+        identity::GatewayIdentity {
+            version: identity::CURRENT_VERSION,
+            gateway_token: "tok-1".into(),
+            gateway_id: "gw-1".into(),
+            customer_id: "cust-1".into(),
+            customer_name: "Customer".into(),
+            site_id: "site-1".into(),
+            site_name: "Site".into(),
+            city: "Barcelona".into(),
+            camera_limit: 3,
+        }
+    }
+
+    #[test]
+    fn the_boot_decision_covers_every_arm() {
+        use identity::{BootPlan, boot_plan};
+        // Reenroll without a token refuses rather than wiping.
+        assert!(boot_plan(Ok(None), false, true).is_err());
+        // Reenroll with a token enrolls, even over state that cannot be read.
+        assert!(matches!(
+            boot_plan(Err(anyhow::anyhow!("corrupt")), true, true),
+            Ok(BootPlan::Enroll)
+        ));
+        // Unreadable state without the reenroll escape hatch refuses to start,
+        // and the message names both fixes.
+        let err = boot_plan(Err(anyhow::anyhow!("bad key")), true, false).unwrap_err();
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("GATEWAY_REENROLL"),
+            "no recovery hint in: {text}"
+        );
+        assert!(text.contains("GATEWAY_STATE_KEY"), "no key hint in: {text}");
+        // A persisted identity wins and the burned env token is ignored.
+        assert!(matches!(
+            boot_plan(Ok(Some(sample_identity())), true, false),
+            Ok(BootPlan::UsePersisted(_))
+        ));
+        // Fresh state: a token enrolls; no token is today's bootstrap.
+        assert!(matches!(
+            boot_plan(Ok(None), true, false),
+            Ok(BootPlan::Enroll)
+        ));
+        assert!(matches!(
+            boot_plan(Ok(None), false, false),
+            Ok(BootPlan::Bootstrap)
+        ));
+    }
+
     /// A camera held off by backoff is not reconnecting, and the number an
     /// operator uses to judge a flaky link must not count the waiting.
     ///
@@ -1033,16 +1143,40 @@ mod tests {
         let reconnects = Arc::new(RwLock::new(HashMap::<String, u32>::new()));
 
         let real_failure = telemetry_from_probe(
-            &cfg, "cam".into(), "Cam".into(), None, None, None, None, None, None, None,
-            "rtsp://example.test/s", Err(anyhow!("RTSP DESCRIBE timeout")), false, &reconnects,
+            &cfg,
+            "cam".into(),
+            "Cam".into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            "rtsp://example.test/s",
+            Err(anyhow!("RTSP DESCRIBE timeout")),
+            false,
+            &reconnects,
         )
         .await;
         assert_eq!(real_failure.reconnects, 1);
 
         for _ in 0..5 {
             let waiting = telemetry_from_probe(
-                &cfg, "cam".into(), "Cam".into(), None, None, None, None, None, None, None,
-                "rtsp://example.test/s", Err(anyhow!("RTSP DESCRIBE timeout")), true, &reconnects,
+                &cfg,
+                "cam".into(),
+                "Cam".into(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                "rtsp://example.test/s",
+                Err(anyhow!("RTSP DESCRIBE timeout")),
+                true,
+                &reconnects,
             )
             .await;
             assert_eq!(
@@ -1188,6 +1322,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_gateway_token_goes_on_plugin_upload_requests() {
+        // The API's plugin endpoints demand a gateway bearer; an upload that
+        // goes out without one is refused and every recording then fails at
+        // its first object.
+        let camera = FakeCamera::start(false).await.unwrap();
+        let api = FakeControlPlane::start(vec![record_command("cmd-5", "cam-1")], 0).await;
+        let sources = sources_with("cam-1", &camera.url).await;
+        tokio::spawn(command_loop(
+            config(&api.url),
+            reqwest::Client::new(),
+            sources,
+        ));
+
+        api.wait_for_completions(1, Duration::from_secs(20)).await;
+        let seen = api.seen.read().await;
+        assert!(seen.uploads >= 1, "the recording never asked for an upload");
+        assert_eq!(
+            seen.upload_tokens.len() as u32,
+            seen.uploads,
+            "an upload request went out without a bearer token"
+        );
+        assert!(
+            seen.upload_tokens.iter().all(|t| t == TOKEN),
+            "an upload went out with the wrong token: {:?}",
+            seen.upload_tokens
+        );
+    }
+
+    #[tokio::test]
     async fn a_rejected_poll_does_not_end_the_loop() {
         // A gateway that gives up on one 401 stays dead until someone restarts
         // it, which on customer premises means a site visit.
@@ -1224,6 +1387,78 @@ mod tests {
         assert!(
             seen.completions.is_empty(),
             "nothing was queued to complete"
+        );
+    }
+
+    #[tokio::test]
+    async fn enrollment_is_persisted_and_a_restart_reuses_it_without_the_api() {
+        let api = FakeControlPlane::start(Vec::new(), 0).await;
+        let dir = tempfile::tempdir().unwrap();
+        let client = reqwest::Client::new();
+
+        let store = identity::IdentityStore::open(dir.path(), None).unwrap();
+        let mut cfg = config(&api.url);
+        cfg.enrollment_token = Some("ENROLL-1".into());
+        establish_identity(&mut cfg, &client, "edge-1", &store, false)
+            .await
+            .unwrap();
+        assert_eq!(cfg.token, "enrolled-1");
+        assert_eq!(cfg.customer_id, "cust-1");
+
+        // The restart: fresh env-derived config, same state dir, and the same
+        // burned token still sitting in the environment.
+        let store2 = identity::IdentityStore::open(dir.path(), None).unwrap();
+        let mut cfg2 = config(&api.url);
+        cfg2.enrollment_token = Some("ENROLL-1".into());
+        establish_identity(&mut cfg2, &client, "edge-1", &store2, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            cfg2.token, "enrolled-1",
+            "the restart must reuse the persisted token"
+        );
+        assert_eq!(
+            cfg2.site_name, "Site",
+            "the persisted identity carries the site"
+        );
+        assert_eq!(
+            api.seen.read().await.enrolls,
+            1,
+            "the burned enrollment token must not be spent again"
+        );
+    }
+
+    #[tokio::test]
+    async fn reenroll_wipes_state_and_spends_a_fresh_token() {
+        let api = FakeControlPlane::start(Vec::new(), 0).await;
+        let dir = tempfile::tempdir().unwrap();
+        let client = reqwest::Client::new();
+
+        let store = identity::IdentityStore::open(dir.path(), None).unwrap();
+        let mut cfg = config(&api.url);
+        cfg.enrollment_token = Some("ENROLL-1".into());
+        establish_identity(&mut cfg, &client, "edge-1", &store, false)
+            .await
+            .unwrap();
+
+        let mut cfg2 = config(&api.url);
+        cfg2.enrollment_token = Some("ENROLL-2".into());
+        establish_identity(&mut cfg2, &client, "edge-1", &store, true)
+            .await
+            .unwrap();
+        assert_eq!(cfg2.token, "enrolled-2", "reenroll must earn a fresh token");
+        assert_eq!(
+            store.load().unwrap().unwrap().gateway_token,
+            "enrolled-2",
+            "the fresh identity must be the one persisted"
+        );
+
+        // And the flag alone, with no token to re-enroll from, refuses.
+        let mut cfg3 = config(&api.url);
+        assert!(
+            establish_identity(&mut cfg3, &client, "edge-1", &store, true)
+                .await
+                .is_err()
         );
     }
 }

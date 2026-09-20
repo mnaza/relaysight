@@ -7,8 +7,12 @@ publish = false
 [dependencies]
 webrtc = "0.20.3"
 rtc = "0.20.3"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+webpki-roots = "1"
 digest_auth = "0.3.1"
 bytes = "1.12"
+chacha20poly1305 = "0.10"
 async-trait = "0.1"
 anyhow.workspace = true
 base64 = "0.22"
@@ -24,8 +28,11 @@ serde_json.workspace = true
 shiguredo_mp4 = "2026.4.0"
 url = "2"
 uuid = { workspace = true, features = ["v5"] }
-tokio.workspace = true
+tokio = { workspace = true, features = ["io-util"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 vms-domain = { path = "../../crates/domain" }
 vms-plugin-sdk = { path = "../../crates/plugin-sdk" }
+
+[dev-dependencies]
+tempfile = "3"

@@ -354,6 +354,43 @@ pub struct RecordingTimeline {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IncidentView {
+    pub camera_id: String,
+    pub camera_name: String,
+    pub site_id: String,
+    pub site_name: String,
+    pub started_at: DateTime<Utc>,
+    pub ended_at: Option<DateTime<Utc>>,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GatewayView {
+    pub gateway_id: String,
+    pub site_id: String,
+    pub site_name: String,
+    pub customer_name: String,
+    pub hostname: Option<String>,
+    pub version: Option<String>,
+    /// Holds a working token right now. Revoked gateways are not enrolled.
+    pub enrolled: bool,
+    pub revoked_at: Option<DateTime<Utc>>,
+    pub last_seen: Option<DateTime<Utc>>,
+    pub online: bool,
+    /// The live report, when the gateway has heartbeated this process.
+    pub heartbeat: Option<GatewayHeartbeat>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditView {
+    pub at: DateTime<Utc>,
+    pub actor: String,
+    pub action: String,
+    pub subject: String,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlaybackSegment {
     pub id: String,
     pub sequence: u32,

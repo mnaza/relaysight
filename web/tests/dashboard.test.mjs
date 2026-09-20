@@ -86,10 +86,10 @@ test('the counters agree with the data behind them', async () => {
 
   const cameras = demoFleet.customers.flatMap(c => c.sites).flatMap(s => s.cameras);
   const online = cameras.filter(c => c.status !== 'offline').length;
-  const alerts = cameras.filter(c => c.status !== 'healthy').length;
 
   assert.equal(document.querySelector('#stat-online').textContent, `${online} / ${cameras.length}`);
-  assert.equal(document.querySelector('#stat-alerts').textContent, String(alerts));
+  // #stat-alerts now counts open incidents (see incidents.test.mjs), not live
+  // camera status, so it is not asserted against camera counts here.
   assert.equal(
     document.querySelector('#stat-sites').textContent,
     String(demoFleet.customers.flatMap(c => c.sites).length),
@@ -176,7 +176,8 @@ test('a refresh repaints the stats from the new fleet', async () => {
   await app.refresh();
 
   assert.equal(document.querySelector('#stat-online').textContent, '0 / 1');
-  assert.equal(document.querySelector('#stat-alerts').textContent, '1');
+  // #stat-alerts now counts open incidents, not live camera status, so it is
+  // not asserted here — this test only stubs the fleet.
   assert.equal(document.querySelector('#stat-throughput').textContent, '0 kbps');
   app.stop();
 });

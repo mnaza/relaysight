@@ -24,6 +24,12 @@ pub struct Seen {
     /// Presigned upload requests, and the blob PUTs that followed them.
     pub uploads: u32,
     pub blobs: u32,
+    /// Bearer tokens seen specifically on /storage/uploads requests — the
+    /// API refuses uploads without one, so a test can pin that they go out.
+    pub upload_tokens: Vec<String>,
+    /// Enrollment attempts, and the enrollment tokens already claimed —
+    /// the real API burns each token on first claim, so the fake does too.
+    pub enrolls: u32,
 }
 
 pub struct FakeControlPlane {
@@ -41,10 +47,12 @@ impl FakeControlPlane {
         let seen = Arc::new(RwLock::new(Seen::default()));
         let recorder = Arc::clone(&seen);
         let queue = Arc::new(RwLock::new(commands.into_iter().collect::<Vec<_>>()));
+        let claimed = Arc::new(RwLock::new(std::collections::HashSet::<String>::new()));
         let self_url = url.clone();
 
         tokio::spawn(async move {
             let mut rejected = 0;
+            let claimed = Arc::clone(&claimed);
             loop {
                 let Ok((mut socket, _)) = listener.accept().await else {
                     return;
@@ -80,13 +88,50 @@ impl FakeControlPlane {
                         recorder.write().await.completions.push(value);
                     }
                     json_response("{}")
+                } else if first.starts_with("POST") && first.contains("/gateways/enroll") {
+                    recorder.write().await.enrolls += 1;
+                    let token = request
+                        .split_once("\r\n\r\n")
+                        .and_then(|(_, body)| serde_json::from_str::<serde_json::Value>(body).ok())
+                        .and_then(|v| v["enrollment_token"].as_str().map(str::to_owned))
+                        .unwrap_or_default();
+                    let mut claimed_tokens = claimed.write().await;
+                    if token.is_empty() || claimed_tokens.contains(&token) {
+                        // The real API answers Gone for a burned token.
+                        "HTTP/1.1 410 Gone\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                            .to_owned()
+                    } else {
+                        claimed_tokens.insert(token.clone());
+                        json_response(
+                            &serde_json::json!({
+                                "gateway_token": format!("enrolled-{}", claimed_tokens.len()),
+                                "entitlement": {
+                                    "edition": "community", "plan": "community",
+                                    "self_hosted": true, "managed": false,
+                                    "camera_limit": null, "capabilities": [],
+                                },
+                                "customer_id": "cust-1", "customer_name": "Customer",
+                                "site_id": "site-1", "site_name": "Site", "city": "Barcelona",
+                            })
+                            .to_string(),
+                        )
+                    }
                 } else if first.starts_with("POST") && first.contains("/storage/uploads") {
                     // Point the presigned PUT back at this server so the upload
                     // completes without a second fake. Without this the record
                     // command always fails at the first object and the test
                     // would never reach the manifest it is meant to check.
                     let object_ref = format!("obj-{}", uuid::Uuid::new_v4());
-                    recorder.write().await.uploads += 1;
+                    {
+                        let mut seen = recorder.write().await;
+                        seen.uploads += 1;
+                        if let Some(token) = request.lines().find_map(|l| {
+                            l.strip_prefix("authorization: Bearer ")
+                                .or_else(|| l.strip_prefix("Authorization: Bearer "))
+                        }) {
+                            seen.upload_tokens.push(token.trim().to_owned());
+                        }
+                    }
                     json_response(
                         &serde_json::json!({
                             "method": "PUT",

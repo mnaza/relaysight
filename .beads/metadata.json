@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "relaysight_vms",
+  "project_id": "7fedfdfe-6a73-4a2e-a61e-3e10622a4725"
+}

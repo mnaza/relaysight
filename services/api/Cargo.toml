@@ -19,6 +19,10 @@ uuid.workspace = true
 hmac = "0.12"
 sha1 = "0.10"
 base64 = "0.22"
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
+async-trait = "0.1"
+sha2 = "0.10"
+argon2 = { version = "0.6", features = ["getrandom"] }
 vms-domain = { path = "../../crates/domain" }
 vms-plugin-sdk = { path = "../../crates/plugin-sdk" }
 vms-plugin-runtime = { path = "../../crates/plugin-runtime" }

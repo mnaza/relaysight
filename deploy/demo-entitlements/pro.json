@@ -1,0 +1,19 @@
+{
+  "edition": "commercial",
+  "plan": "commercial-pro",
+  "self_hosted": false,
+  "managed": true,
+  "camera_limit": null,
+  "capabilities": [
+    "onvif",
+    "rtsp_health",
+    "plugins",
+    "ai_plugins",
+    "storage_plugins",
+    "local_users",
+    "multi_tenant",
+    "white_label",
+    "sso",
+    "priority_support"
+  ]
+}

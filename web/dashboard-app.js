@@ -15,6 +15,7 @@
 // hash of the rendered page — it comes out identical.
 
 import { brandMark, localeSelect, t } from './theme.js';
+import { wireAccountModal } from './auth.js';
 
 export async function startDashboard({ brand, locale, dict }) {
   document.documentElement.lang = locale;
@@ -56,7 +57,12 @@ export async function startDashboard({ brand, locale, dict }) {
     catch { return []; }
   }
 
-  let [fleet, telemetry, edition, plugins, gateways] = await Promise.all([loadFleet(), loadTelemetry(), loadEdition(), loadPlugins(), loadGateways()]);
+  async function loadIncidents() {
+    try { return await tryJson('api/v1/incidents'); }
+    catch { return []; }
+  }
+
+  let [fleet, telemetry, edition, plugins, gateways, incidents] = await Promise.all([loadFleet(), loadTelemetry(), loadEdition(), loadPlugins(), loadGateways(), loadIncidents()]);
   let telemetryById = new Map(telemetry.map(camera => [camera.camera_id, camera]));
   const isLive = fleet.source === 'live';
   const sourceTag = document.querySelector('#fleet-source');
@@ -79,7 +85,7 @@ export async function startDashboard({ brand, locale, dict }) {
     const throughput = allCameras.reduce((n, camera) => n + (camera.bitrate_kbps || 0), 0);
 
     document.querySelector('#stat-online').textContent = `${online} / ${allCameras.length}`;
-    document.querySelector('#stat-alerts').textContent = String(warning + offline);
+    document.querySelector('#stat-alerts').textContent = String(incidents.filter(incident => !incident.ended_at).length);
     document.querySelector('#stat-sites').textContent = String(rows.length);
     document.querySelector('#stat-throughput').textContent = throughput >= 1000
       ? `${(throughput / 1000).toFixed(1)} Mbps`
@@ -90,6 +96,35 @@ export async function startDashboard({ brand, locale, dict }) {
     fill('#sub-throughput', 'app.stat.sub.throughput', { cameras: allCameras.length });
   }
   paintStats();
+
+  function formatDuration(ms) {
+    const minutes = Math.max(1, Math.round(ms / 60000));
+    if (minutes < 60) return `${minutes} min`;
+    return `${Math.floor(minutes / 60)} h ${minutes % 60} min`;
+  }
+
+  function paintIncidents() {
+    const body = document.querySelector('#incidents-body');
+    body.replaceChildren();
+    document.querySelector('#incidents-empty').hidden = incidents.length > 0;
+    const cell = text => { const td = document.createElement('td'); td.textContent = text; return td; };
+    for (const incident of incidents) {
+      const row = document.createElement('tr');
+      const started = new Date(incident.started_at);
+      const duration = incident.ended_at
+        ? formatDuration(new Date(incident.ended_at) - started)
+        : t(dict, 'app.incidents.ongoing');
+      row.append(
+        cell(`${incident.camera_name} · ${incident.site_name || incident.site_id}`),
+        cell(started.toLocaleString()),
+        cell(duration),
+        cell(incident.detail || '—'),
+      );
+      body.appendChild(row);
+    }
+  }
+  paintIncidents();
+
   const planTitle = document.querySelector('#plan-title');
   const planUsage = document.querySelector('#free-usage');
   const usageWrap = document.querySelector('#usage-wrap');
@@ -492,15 +527,16 @@ export async function startDashboard({ brand, locale, dict }) {
     if (document.querySelector('.modal-backdrop.open')) return;
     let next;
     try {
-      next = await Promise.all([loadFleet(), loadTelemetry(), loadGateways()]);
+      next = await Promise.all([loadFleet(), loadTelemetry(), loadGateways(), loadIncidents()]);
     } catch {
       return;
     }
-    [fleet, telemetry, gateways] = next;
+    [fleet, telemetry, gateways, incidents] = next;
     telemetryById = new Map(telemetry.map(camera => [camera.camera_id, camera]));
     rows = fleet.customers.flatMap(customer => customer.sites.map(site => ({ customer, site })));
     allCameras = rows.flatMap(row => row.site.cameras);
     paintStats();
+    paintIncidents();
     render(currentFilter);
     renderGateways();
     markUpdated();
@@ -541,12 +577,16 @@ export async function startDashboard({ brand, locale, dict }) {
       return;
     }
     for (const gateway of gateways) {
-      const healthy = Number(gateway.healthy_cameras || 0);
-      const warn = Number(gateway.warning_cameras || 0);
-      const off = Number(gateway.offline_cameras || 0);
-      // A gateway is only as healthy as what it reports about. Offline cameras
-      // are the loud case; warnings are the one that gets ignored.
-      const status = off > 0 ? 'offline' : warn > 0 ? 'warning' : 'healthy';
+      const hb = gateway.heartbeat;
+      const healthy = Number(hb?.healthy_cameras || 0);
+      const warn = Number(hb?.warning_cameras || 0);
+      const off = Number(hb?.offline_cameras || 0);
+      const revoked = Boolean(gateway.revoked_at);
+      // Revoked outranks everything; a silent gateway is offline; a loud one
+      // is only as healthy as what it reports about.
+      const status = revoked ? 'offline'
+        : !gateway.online ? 'offline'
+        : off > 0 ? 'offline' : warn > 0 ? 'warning' : 'healthy';
       const card = document.createElement('article');
       card.className = 'plugin-card';
       card.innerHTML = `
@@ -562,16 +602,28 @@ export async function startDashboard({ brand, locale, dict }) {
         </div>`;
       const set = (sel, value) => { card.querySelector(sel).textContent = value; };
       set('.gw-name', gateway.hostname || gateway.gateway_id);
-      set('.gw-site', gateway.site_id || '');
-      set('.health-pill', t(dict, `app.${status}`));
+      set('.gw-site', gateway.site_name || gateway.site_id || '');
+      set('.health-pill', revoked ? t(dict, 'app.gateways.revoked') : t(dict, `app.${status}`));
       set('.gw-l-uptime', t(dict, 'app.gateways.uptime'));
       set('.gw-l-cameras', t(dict, 'app.gateways.cameras'));
       set('.gw-l-version', t(dict, 'app.gateways.version'));
       set('.gw-l-seen', t(dict, 'app.gateways.lastSeen'));
-      set('.gw-uptime', formatUptime(gateway.uptime_seconds));
-      set('.gw-cameras', `${healthy} / ${healthy + warn + off}`);
+      set('.gw-uptime', hb ? formatUptime(hb.uptime_seconds) : '—');
+      set('.gw-cameras', hb ? `${healthy} / ${healthy + warn + off}` : '—');
       set('.gw-version', gateway.version || '—');
-      set('.gw-seen', gateway.sent_at ? new Date(gateway.sent_at).toLocaleTimeString(locale, { hour: '2-digit', minute: '2-digit' }) : '—');
+      set('.gw-seen', gateway.last_seen ? new Date(gateway.last_seen).toLocaleTimeString(locale, { hour: '2-digit', minute: '2-digit' }) : '—');
+      if (gateway.enrolled && !revoked) {
+        const revoke = document.createElement('button');
+        revoke.className = 'button small gw-revoke';
+        revoke.textContent = t(dict, 'app.gateways.revoke');
+        revoke.addEventListener('click', async () => {
+          if (!confirm(t(dict, 'app.gateways.revokeConfirm'))) return;
+          const response = await fetch(`api/v1/gateways/${encodeURIComponent(gateway.gateway_id)}/revoke`, { method: 'POST' }).catch(() => null);
+          if (!response || !response.ok) alert(t(dict, 'app.gateways.revokeFailed'));
+          refresh();
+        });
+        card.appendChild(revoke);
+      }
       grid.appendChild(card);
     }
   }
@@ -641,6 +693,7 @@ export async function startDashboard({ brand, locale, dict }) {
   function closeModal(selector) { document.querySelector(selector).classList.remove('open'); }
 
   document.querySelector('#add-gateway').addEventListener('click', () => openModal('#onboarding-modal'));
+  wireAccountModal(dict);
   document.querySelectorAll('[data-close-modal]').forEach(node => node.addEventListener('click', () => closeModal('#onboarding-modal')));
   document.querySelectorAll('[data-close-live]').forEach(node => node.addEventListener('click', () => { closeActiveLive(); for (const url of activeAiSnapshotUrls) URL.revokeObjectURL(url); activeAiSnapshotUrls.clear(); closeModal('#live-modal'); }));
 

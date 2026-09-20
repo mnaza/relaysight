@@ -78,4 +78,8 @@ Removing the commercial service must leave a useful self-hosted VMS rather than 
 - `camera_limit`: `null` means unlimited
 - `capabilities[]`
 
-The gateway receives this during enrollment and applies the returned camera limit locally. The API enforces the same entitlement on telemetry ingress. Community returns `camera_limit = null`.
+The gateway receives this during enrollment and applies the returned camera limit locally. The API enforces the same entitlement on telemetry ingress: a batch over the limit is truncated and the rest stored, so cameras past the cap never reach the fleet and the gateway is told nothing.
+
+## Seeing both sides
+
+`make demo-community` and `make demo-commercial` run the free and the paid side on one machine, against a stand-in for the control plane that lives in this repository. `docs/DEMO.md` has the detail; `make check-editions` proves the three plans answer differently without a browser.

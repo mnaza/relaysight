@@ -1,0 +1,1431 @@
+//! SQLite implementation of the fleet store.
+
+use crate::store::{
+    CameraRecord, OrganizationRecord, SiteRecord, Store, StoreError, parse_ts, token_hash, ts,
+};
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use sqlx::Row;
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
+use std::str::FromStr;
+use vms_domain::{
+    AuditView, CameraTelemetryBatch, EnrollmentRequest, GatewayEnrollmentRequest, GatewayView,
+    IncidentView, RecordingManifest,
+};
+
+fn manifest_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<RecordingManifest, StoreError> {
+    serde_json::from_str(row.get::<String, _>("manifest").as_str())
+        .map_err(|err| StoreError::Internal(err.into()))
+}
+
+fn camera_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<CameraRecord, StoreError> {
+    Ok(CameraRecord {
+        id: row.get("id"),
+        gateway_id: row.get("gateway_id"),
+        site_id: row.get("site_id"),
+        name: row.get("name"),
+        manufacturer: row.get("manufacturer"),
+        model: row.get("model"),
+        firmware: row.get("firmware"),
+        codec: row.get("codec"),
+        width: row.get::<Option<i64>, _>("width").map(|v| v as u32),
+        height: row.get::<Option<i64>, _>("height").map(|v| v as u32),
+        first_seen: parse_ts(row.get::<String, _>("first_seen").as_str())?,
+        last_seen: parse_ts(row.get::<String, _>("last_seen").as_str())?,
+    })
+}
+
+fn enrollment_from_row(row: &sqlx::sqlite::SqliteRow) -> EnrollmentRequest {
+    EnrollmentRequest {
+        customer_id: row.get("org_id"),
+        customer_name: row.get("org_name"),
+        site_id: row.get("site_id"),
+        site_name: row.get("site_name"),
+        city: row.get("city"),
+    }
+}
+
+pub struct SqliteStore {
+    pool: SqlitePool,
+}
+
+impl SqliteStore {
+    /// Open (creating if missing) and migrate. `url` is `sqlite:<path>`.
+    pub async fn connect(url: &str) -> anyhow::Result<Self> {
+        let options = SqliteConnectOptions::from_str(url)?
+            .create_if_missing(true)
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new().connect_with(options).await?;
+        sqlx::migrate!("./migrations").run(&pool).await?;
+        Ok(Self { pool })
+    }
+
+    /// One permanent connection: an in-memory SQLite database lives exactly as
+    /// long as its connection, so the pool must never open a second one or
+    /// close the first.
+    #[cfg(test)]
+    pub async fn in_memory() -> anyhow::Result<Self> {
+        let options = SqliteConnectOptions::from_str("sqlite::memory:")?.foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .min_connections(1)
+            .max_connections(1)
+            .idle_timeout(None)
+            .max_lifetime(None)
+            .connect_with(options)
+            .await?;
+        sqlx::migrate!("./migrations").run(&pool).await?;
+        Ok(Self { pool })
+    }
+}
+
+#[async_trait]
+impl Store for SqliteStore {
+    async fn create_enrollment(
+        &self,
+        token: &str,
+        request: &EnrollmentRequest,
+        expires_at: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO enrollments (token_hash, org_id, org_name, site_id, site_name, city, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )
+        .bind(token_hash(token))
+        .bind(&request.customer_id)
+        .bind(&request.customer_name)
+        .bind(&request.site_id)
+        .bind(&request.site_name)
+        .bind(&request.city)
+        .bind(ts(&expires_at))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn enrollment_request(
+        &self,
+        token: &str,
+        now: DateTime<Utc>,
+    ) -> Result<EnrollmentRequest, StoreError> {
+        let row = sqlx::query(
+            "SELECT org_id, org_name, site_id, site_name, city, claimed, expires_at
+             FROM enrollments WHERE token_hash = ?1",
+        )
+        .bind(token_hash(token))
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(StoreError::NotFound)?;
+        let claimed: i64 = row.get("claimed");
+        let expires_at = parse_ts(row.get::<String, _>("expires_at").as_str())?;
+        if claimed != 0 || expires_at < now {
+            return Err(StoreError::Gone);
+        }
+        Ok(enrollment_from_row(&row))
+    }
+
+    async fn claim_enrollment(
+        &self,
+        token: &str,
+        now: DateTime<Utc>,
+    ) -> Result<EnrollmentRequest, StoreError> {
+        let claimed = sqlx::query(
+            "UPDATE enrollments SET claimed = 1
+             WHERE token_hash = ?1 AND claimed = 0 AND expires_at > ?2
+             RETURNING org_id, org_name, site_id, site_name, city",
+        )
+        .bind(token_hash(token))
+        .bind(ts(&now))
+        .fetch_optional(&self.pool)
+        .await?;
+        match claimed {
+            Some(row) => Ok(enrollment_from_row(&row)),
+            // Distinguish "never existed" from "existed, but claimed/expired".
+            None => match self.enrollment_request(token, now).await {
+                Err(StoreError::NotFound) => Err(StoreError::NotFound),
+                _ => Err(StoreError::Gone),
+            },
+        }
+    }
+
+    async fn enroll_gateway(
+        &self,
+        request: &EnrollmentRequest,
+        enroll: &GatewayEnrollmentRequest,
+        gateway_token: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO organizations (id, name) VALUES (?1, ?2)
+             ON CONFLICT(id) DO UPDATE SET name = excluded.name",
+        )
+        .bind(&request.customer_id)
+        .bind(&request.customer_name)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO sites (id, org_id, name, city) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(id) DO UPDATE SET org_id = excluded.org_id,
+                 name = excluded.name, city = excluded.city",
+        )
+        .bind(&request.site_id)
+        .bind(&request.customer_id)
+        .bind(&request.site_name)
+        .bind(&request.city)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO gateways (id, site_id, hostname, version, token_hash, enrolled_at, revoked_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)
+             ON CONFLICT(id) DO UPDATE SET site_id = excluded.site_id,
+                 hostname = excluded.hostname, version = excluded.version,
+                 token_hash = excluded.token_hash, enrolled_at = excluded.enrolled_at,
+                 revoked_at = NULL",
+        )
+        .bind(&enroll.gateway_id)
+        .bind(&request.site_id)
+        .bind(&enroll.hostname)
+        .bind(&enroll.version)
+        .bind(token_hash(gateway_token))
+        .bind(ts(&now))
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn verify_gateway_token(
+        &self,
+        gateway_id: &str,
+        token: &str,
+    ) -> Result<bool, StoreError> {
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT token_hash FROM gateways WHERE id = ?1")
+                .bind(gateway_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(stored.is_some_and(|hash| !hash.is_empty() && hash == token_hash(token)))
+    }
+
+    async fn verify_any_gateway_token(&self, token: &str) -> Result<bool, StoreError> {
+        // A bootstrap row's token_hash is the empty string, which no
+        // token_hash() output can ever equal, so it admits nothing here.
+        let row: Option<i64> = sqlx::query_scalar("SELECT 1 FROM gateways WHERE token_hash = ?1")
+            .bind(token_hash(token))
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.is_some())
+    }
+
+    async fn upsert_fleet_identity(
+        &self,
+        batch: &CameraTelemetryBatch,
+        now: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO organizations (id, name) VALUES (?1, ?2)
+             ON CONFLICT(id) DO UPDATE SET name = excluded.name",
+        )
+        .bind(&batch.customer_id)
+        .bind(&batch.customer_name)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO sites (id, org_id, name, city) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(id) DO UPDATE SET org_id = excluded.org_id,
+                 name = excluded.name, city = excluded.city",
+        )
+        .bind(&batch.site_id)
+        .bind(&batch.customer_id)
+        .bind(&batch.site_name)
+        .bind(&batch.city)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO gateways (id, site_id, last_seen) VALUES (?1, ?2, ?3)
+             ON CONFLICT(id) DO UPDATE SET site_id = excluded.site_id,
+                 last_seen = excluded.last_seen",
+        )
+        .bind(&batch.gateway_id)
+        .bind(&batch.site_id)
+        .bind(ts(&now))
+        .execute(&mut *tx)
+        .await?;
+        for camera in &batch.cameras {
+            sqlx::query(
+                "INSERT INTO cameras (id, gateway_id, site_id, name, manufacturer, model,
+                     firmware, codec, width, height, first_seen, last_seen)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)
+                 ON CONFLICT(id) DO UPDATE SET gateway_id = excluded.gateway_id,
+                     site_id = excluded.site_id, name = excluded.name,
+                     manufacturer = excluded.manufacturer, model = excluded.model,
+                     firmware = excluded.firmware, codec = excluded.codec,
+                     width = excluded.width, height = excluded.height,
+                     last_seen = excluded.last_seen",
+            )
+            .bind(&camera.camera_id)
+            .bind(&batch.gateway_id)
+            .bind(&camera.site_id)
+            .bind(&camera.name)
+            .bind(&camera.manufacturer)
+            .bind(&camera.model)
+            .bind(&camera.firmware)
+            .bind(&camera.codec)
+            .bind(camera.width.map(i64::from))
+            .bind(camera.height.map(i64::from))
+            .bind(ts(&now))
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn fleet_cameras(&self) -> Result<Vec<CameraRecord>, StoreError> {
+        let rows = sqlx::query("SELECT * FROM cameras ORDER BY name, id")
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter().map(camera_from_row).collect()
+    }
+
+    async fn fleet_identity(&self) -> Result<Vec<OrganizationRecord>, StoreError> {
+        let org_rows = sqlx::query("SELECT id, name FROM organizations ORDER BY id")
+            .fetch_all(&self.pool)
+            .await?;
+        let site_rows = sqlx::query("SELECT id, org_id, name, city FROM sites ORDER BY id")
+            .fetch_all(&self.pool)
+            .await?;
+        let camera_rows = sqlx::query("SELECT * FROM cameras ORDER BY name, id")
+            .fetch_all(&self.pool)
+            .await?;
+
+        let mut cameras_by_site: std::collections::HashMap<String, Vec<CameraRecord>> =
+            std::collections::HashMap::new();
+        for row in &camera_rows {
+            let camera = camera_from_row(row)?;
+            cameras_by_site
+                .entry(camera.site_id.clone())
+                .or_default()
+                .push(camera);
+        }
+
+        let mut sites_by_org: std::collections::HashMap<String, Vec<SiteRecord>> =
+            std::collections::HashMap::new();
+        for row in &site_rows {
+            let site = SiteRecord {
+                id: row.get("id"),
+                org_id: row.get("org_id"),
+                name: row.get("name"),
+                city: row.get("city"),
+                cameras: cameras_by_site
+                    .remove::<str>(row.get("id"))
+                    .unwrap_or_default(),
+            };
+            sites_by_org
+                .entry(site.org_id.clone())
+                .or_default()
+                .push(site);
+        }
+
+        Ok(org_rows
+            .iter()
+            .map(|row| OrganizationRecord {
+                id: row.get("id"),
+                name: row.get("name"),
+                sites: sites_by_org
+                    .remove::<str>(row.get("id"))
+                    .unwrap_or_default(),
+            })
+            .collect())
+    }
+
+    async fn save_recording(&self, manifest: &RecordingManifest) -> Result<(), StoreError> {
+        let json =
+            serde_json::to_string(manifest).map_err(|err| StoreError::Internal(err.into()))?;
+        sqlx::query(
+            "INSERT INTO recordings (id, camera_id, started_at, ended_at, delete_after, codec, manifest)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(id) DO UPDATE SET camera_id = excluded.camera_id,
+                 started_at = excluded.started_at, ended_at = excluded.ended_at,
+                 delete_after = excluded.delete_after, codec = excluded.codec,
+                 manifest = excluded.manifest",
+        )
+        .bind(&manifest.recording_id)
+        .bind(&manifest.camera_id)
+        .bind(ts(&manifest.started_at))
+        .bind(ts(&manifest.ended_at))
+        .bind(manifest.delete_after.as_ref().map(ts))
+        .bind(&manifest.codec)
+        .bind(json)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn recording(&self, recording_id: &str) -> Result<RecordingManifest, StoreError> {
+        let row = sqlx::query("SELECT manifest FROM recordings WHERE id = ?1")
+            .bind(recording_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or(StoreError::NotFound)?;
+        manifest_from_row(&row)
+    }
+
+    async fn camera_recordings(
+        &self,
+        camera_id: &str,
+    ) -> Result<Vec<RecordingManifest>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT manifest FROM recordings WHERE camera_id = ?1 ORDER BY started_at DESC",
+        )
+        .bind(camera_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(manifest_from_row).collect()
+    }
+
+    async fn expired_recordings(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<RecordingManifest>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT manifest FROM recordings
+             WHERE delete_after IS NOT NULL AND delete_after <= ?1",
+        )
+        .bind(ts(&now))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(manifest_from_row).collect()
+    }
+
+    async fn delete_recording(&self, recording_id: &str) -> Result<(), StoreError> {
+        sqlx::query("DELETE FROM recordings WHERE id = ?1")
+            .bind(recording_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn admin_password_hash(&self) -> Result<Option<String>, StoreError> {
+        Ok(
+            sqlx::query_scalar("SELECT password_hash FROM admin_credential WHERE id = 1")
+                .fetch_optional(&self.pool)
+                .await?,
+        )
+    }
+
+    async fn set_admin_password_hash(
+        &self,
+        phc: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO admin_credential (id, password_hash, updated_at) VALUES (1, ?1, ?2)
+             ON CONFLICT(id) DO UPDATE SET
+                 password_hash = excluded.password_hash,
+                 updated_at = excluded.updated_at",
+        )
+        .bind(phc)
+        .bind(ts(&now))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn create_session(
+        &self,
+        session_id: &str,
+        now: DateTime<Utc>,
+        expires_at: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        sqlx::query("INSERT INTO sessions (id_hash, created_at, expires_at) VALUES (?1, ?2, ?3)")
+            .bind(token_hash(session_id))
+            .bind(ts(&now))
+            .bind(ts(&expires_at))
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn session_is_valid(
+        &self,
+        session_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<bool, StoreError> {
+        let row: Option<i64> =
+            sqlx::query_scalar("SELECT 1 FROM sessions WHERE id_hash = ?1 AND expires_at > ?2")
+                .bind(token_hash(session_id))
+                .bind(ts(&now))
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.is_some())
+    }
+
+    async fn delete_session(&self, session_id: &str) -> Result<(), StoreError> {
+        sqlx::query("DELETE FROM sessions WHERE id_hash = ?1")
+            .bind(token_hash(session_id))
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn delete_all_sessions(&self) -> Result<(), StoreError> {
+        sqlx::query("DELETE FROM sessions")
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn delete_expired_sessions(&self, now: DateTime<Utc>) -> Result<(), StoreError> {
+        sqlx::query("DELETE FROM sessions WHERE expires_at <= ?1")
+            .bind(ts(&now))
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn open_incident(
+        &self,
+        camera_id: &str,
+        started_at: DateTime<Utc>,
+        detail: Option<&str>,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO incidents (id, camera_id, started_at, ended_at, detail)
+             VALUES (?1, ?2, ?3, NULL, ?4)
+             ON CONFLICT(camera_id) WHERE ended_at IS NULL DO NOTHING",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(camera_id)
+        .bind(ts(&started_at))
+        .bind(detail)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn close_incident(
+        &self,
+        camera_id: &str,
+        ended_at: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        sqlx::query("UPDATE incidents SET ended_at = ?2 WHERE camera_id = ?1 AND ended_at IS NULL")
+            .bind(camera_id)
+            .bind(ts(&ended_at))
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn incidents(&self, limit: i64) -> Result<Vec<IncidentView>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT i.camera_id,
+                    COALESCE(c.name, i.camera_id) AS camera_name,
+                    COALESCE(c.site_id, '') AS site_id,
+                    COALESCE(s.name, '') AS site_name,
+                    i.started_at, i.ended_at, i.detail
+             FROM incidents i
+             LEFT JOIN cameras c ON c.id = i.camera_id
+             LEFT JOIN sites s ON s.id = c.site_id
+             ORDER BY (i.ended_at IS NULL) DESC, i.started_at DESC
+             LIMIT ?1",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                Ok(IncidentView {
+                    camera_id: row.get("camera_id"),
+                    camera_name: row.get("camera_name"),
+                    site_id: row.get("site_id"),
+                    site_name: row.get("site_name"),
+                    started_at: parse_ts(row.get::<String, _>("started_at").as_str())?,
+                    ended_at: row
+                        .get::<Option<String>, _>("ended_at")
+                        .map(|value| parse_ts(&value))
+                        .transpose()?,
+                    detail: row.get("detail"),
+                })
+            })
+            .collect()
+    }
+
+    async fn delete_closed_incidents_before(
+        &self,
+        cutoff: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        sqlx::query("DELETE FROM incidents WHERE ended_at IS NOT NULL AND ended_at < ?1")
+            .bind(ts(&cutoff))
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn revoke_gateway(&self, gateway_id: &str, now: DateTime<Utc>) -> Result<(), StoreError> {
+        let result =
+            sqlx::query("UPDATE gateways SET revoked_at = ?2, token_hash = '' WHERE id = ?1")
+                .bind(gateway_id)
+                .bind(ts(&now))
+                .execute(&self.pool)
+                .await?;
+        if result.rows_affected() == 0 {
+            return Err(StoreError::NotFound);
+        }
+        Ok(())
+    }
+
+    async fn gateway_revoked(&self, gateway_id: &str) -> Result<bool, StoreError> {
+        let revoked: Option<Option<String>> =
+            sqlx::query_scalar("SELECT revoked_at FROM gateways WHERE id = ?1")
+                .bind(gateway_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(revoked.flatten().is_some())
+    }
+
+    async fn gateway_views(&self) -> Result<Vec<GatewayView>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT g.id, g.site_id,
+                    COALESCE(s.name, '') AS site_name,
+                    COALESCE(o.name, '') AS customer_name,
+                    g.hostname, g.version,
+                    (g.token_hash != '') AS enrolled,
+                    g.revoked_at, g.last_seen
+             FROM gateways g
+             LEFT JOIN sites s ON s.id = g.site_id
+             LEFT JOIN organizations o ON o.id = s.org_id
+             ORDER BY g.id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                Ok(GatewayView {
+                    gateway_id: row.get("id"),
+                    site_id: row.get("site_id"),
+                    site_name: row.get("site_name"),
+                    customer_name: row.get("customer_name"),
+                    hostname: row.get("hostname"),
+                    version: row.get("version"),
+                    enrolled: row.get::<i64, _>("enrolled") != 0,
+                    revoked_at: row
+                        .get::<Option<String>, _>("revoked_at")
+                        .map(|v| parse_ts(&v))
+                        .transpose()?,
+                    last_seen: row
+                        .get::<Option<String>, _>("last_seen")
+                        .map(|v| parse_ts(&v))
+                        .transpose()?,
+                    online: false,
+                    heartbeat: None,
+                })
+            })
+            .collect()
+    }
+
+    async fn record_audit(
+        &self,
+        at: DateTime<Utc>,
+        actor: &str,
+        action: &str,
+        subject: &str,
+        detail: Option<&str>,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO audit_log (id, at, actor, action, subject, detail)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(ts(&at))
+        .bind(actor)
+        .bind(action)
+        .bind(subject)
+        .bind(detail)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn audit_entries(&self, limit: i64) -> Result<Vec<AuditView>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT at, actor, action, subject, detail FROM audit_log
+             ORDER BY at DESC LIMIT ?1",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                Ok(AuditView {
+                    at: parse_ts(row.get::<String, _>("at").as_str())?,
+                    actor: row.get("actor"),
+                    action: row.get("action"),
+                    subject: row.get("subject"),
+                    detail: row.get("detail"),
+                })
+            })
+            .collect()
+    }
+
+    async fn delete_audit_before(&self, cutoff: DateTime<Utc>) -> Result<(), StoreError> {
+        sqlx::query("DELETE FROM audit_log WHERE at < ?1")
+            .bind(ts(&cutoff))
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::{Store, StoreError, token_hash};
+    use chrono::{Duration, Utc};
+    use vms_domain::{
+        CameraTelemetry, CameraTelemetryBatch, EnrollmentRequest, GatewayEnrollmentRequest,
+        HealthStatus, RecordingManifest, RecordingObject,
+    };
+
+    fn manifest(
+        id: &str,
+        camera_id: &str,
+        delete_after: Option<chrono::DateTime<Utc>>,
+    ) -> RecordingManifest {
+        let now = Utc::now();
+        RecordingManifest {
+            recording_id: id.into(),
+            camera_id: camera_id.into(),
+            gateway_id: "gw-1".into(),
+            started_at: now - Duration::seconds(10),
+            ended_at: now,
+            codec: "avc1.640028".into(),
+            width: 1920,
+            height: 1080,
+            init: RecordingObject {
+                storage_plugin_id: "storage-s3".into(),
+                object_ref: format!("{id}/init.mp4"),
+                object_key: format!("{id}/init.mp4"),
+                content_type: "video/mp4".into(),
+                size_bytes: 1024,
+            },
+            segments: vec![],
+            delete_after,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_saved_recording_survives_a_restart() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let url = format!("sqlite:{}", file.path().display());
+        {
+            let store = SqliteStore::connect(&url).await.unwrap();
+            store
+                .save_recording(&manifest("rec-1", "cam-1", None))
+                .await
+                .unwrap();
+        }
+        let reopened = SqliteStore::connect(&url).await.unwrap();
+        let loaded = reopened
+            .recording("rec-1")
+            .await
+            .expect("recording survives");
+        assert_eq!(loaded.init.object_ref, "rec-1/init.mp4");
+        assert!(matches!(
+            reopened.recording("rec-none").await,
+            Err(StoreError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_timeline_is_per_camera_and_newest_first() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let mut older = manifest("rec-old", "cam-1", None);
+        older.started_at = Utc::now() - Duration::hours(2);
+        store.save_recording(&older).await.unwrap();
+        store
+            .save_recording(&manifest("rec-new", "cam-1", None))
+            .await
+            .unwrap();
+        store
+            .save_recording(&manifest("rec-other", "cam-2", None))
+            .await
+            .unwrap();
+        let timeline = store.camera_recordings("cam-1").await.unwrap();
+        let ids: Vec<_> = timeline.iter().map(|r| r.recording_id.as_str()).collect();
+        assert_eq!(ids, vec!["rec-new", "rec-old"]);
+    }
+
+    #[tokio::test]
+    async fn expiry_returns_exactly_the_overdue_manifests() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let now = Utc::now();
+        store
+            .save_recording(&manifest(
+                "rec-overdue",
+                "cam-1",
+                Some(now - Duration::minutes(1)),
+            ))
+            .await
+            .unwrap();
+        store
+            .save_recording(&manifest(
+                "rec-later",
+                "cam-1",
+                Some(now + Duration::hours(1)),
+            ))
+            .await
+            .unwrap();
+        store
+            .save_recording(&manifest("rec-keep-forever", "cam-1", None))
+            .await
+            .unwrap();
+        let expired = store.expired_recordings(now).await.unwrap();
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].recording_id, "rec-overdue");
+        store.delete_recording("rec-overdue").await.unwrap();
+        assert!(store.expired_recordings(now).await.unwrap().is_empty());
+        assert!(matches!(
+            store.recording("rec-overdue").await,
+            Err(StoreError::NotFound)
+        ));
+    }
+
+    fn batch_with_camera(gateway_id: &str, camera_id: &str, name: &str) -> CameraTelemetryBatch {
+        CameraTelemetryBatch {
+            gateway_id: gateway_id.into(),
+            customer_id: "cust-1".into(),
+            customer_name: "Customer".into(),
+            site_id: "site-1".into(),
+            site_name: "Site".into(),
+            city: "Barcelona".into(),
+            sent_at: Utc::now(),
+            cameras: vec![CameraTelemetry {
+                camera_id: camera_id.into(),
+                gateway_id: gateway_id.into(),
+                site_id: "site-1".into(),
+                name: name.into(),
+                status: HealthStatus::Healthy,
+                manufacturer: Some("Dahua".into()),
+                model: None,
+                firmware: None,
+                profile_name: None,
+                codec: Some("h264".into()),
+                width: Some(1920),
+                height: Some(1080),
+                fps: Some(25.0),
+                bitrate_kbps: Some(1800),
+                packet_loss: 0,
+                reconnects: 0,
+                rtsp_endpoint: Some("rtsp://192.0.2.1/stream".into()),
+                last_seen: Utc::now(),
+                last_error: None,
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn telemetry_creates_identity_and_repeats_preserve_first_seen() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let first = Utc::now();
+        store
+            .upsert_fleet_identity(&batch_with_camera("gw-1", "cam-1", "Entrance"), first)
+            .await
+            .unwrap();
+        let later = first + Duration::minutes(5);
+        let mut renamed = batch_with_camera("gw-1", "cam-1", "Front entrance");
+        renamed.customer_name = "Customer Renamed".into();
+        store.upsert_fleet_identity(&renamed, later).await.unwrap();
+
+        let cameras = store.fleet_cameras().await.unwrap();
+        assert_eq!(cameras.len(), 1);
+        assert_eq!(cameras[0].name, "Front entrance");
+        assert_eq!(
+            cameras[0].first_seen.timestamp_micros(),
+            first.timestamp_micros()
+        );
+        assert_eq!(
+            cameras[0].last_seen.timestamp_micros(),
+            later.timestamp_micros()
+        );
+
+        let orgs = store.fleet_identity().await.unwrap();
+        assert_eq!(orgs.len(), 1);
+        assert_eq!(orgs[0].name, "Customer Renamed");
+        assert_eq!(orgs[0].sites.len(), 1);
+        assert_eq!(orgs[0].sites[0].cameras.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn telemetry_does_not_clobber_an_enrolled_gateways_token() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        store
+            .enroll_gateway(&request(), &enroll_req("gw-1"), "gw-1-token", Utc::now())
+            .await
+            .unwrap();
+        store
+            .upsert_fleet_identity(&batch_with_camera("gw-1", "cam-1", "Entrance"), Utc::now())
+            .await
+            .unwrap();
+        assert!(
+            store
+                .verify_gateway_token("gw-1", "gw-1-token")
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bootstrap_gateway_gets_a_row_but_no_usable_token() {
+        // Telemetry via the shared GATEWAY_TOKEN may arrive before any enrollment.
+        let store = SqliteStore::in_memory().await.unwrap();
+        store
+            .upsert_fleet_identity(
+                &batch_with_camera("gw-boot", "cam-1", "Entrance"),
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        assert!(!store.verify_gateway_token("gw-boot", "").await.unwrap());
+        assert_eq!(store.fleet_cameras().await.unwrap().len(), 1);
+    }
+
+    fn enroll_req(gateway_id: &str) -> GatewayEnrollmentRequest {
+        GatewayEnrollmentRequest {
+            enrollment_token: "unused-here".into(),
+            gateway_id: gateway_id.into(),
+            hostname: "edge-1".into(),
+            version: "0.1.0".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_enrolled_gateway_survives_a_restart() {
+        // The reason this store exists: reopen the same file, the token still works.
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let url = format!("sqlite:{}", file.path().display());
+        {
+            let store = SqliteStore::connect(&url).await.unwrap();
+            store
+                .enroll_gateway(&request(), &enroll_req("gw-1"), "gw-1-token", Utc::now())
+                .await
+                .unwrap();
+            assert!(
+                store
+                    .verify_gateway_token("gw-1", "gw-1-token")
+                    .await
+                    .unwrap()
+            );
+        } // store dropped: the "restart"
+        let reopened = SqliteStore::connect(&url).await.unwrap();
+        assert!(
+            reopened
+                .verify_gateway_token("gw-1", "gw-1-token")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !reopened
+                .verify_gateway_token("gw-1", "wrong-token")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !reopened
+                .verify_gateway_token("gw-2", "gw-1-token")
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_tokens_are_not_stored_in_plaintext() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        store
+            .enroll_gateway(&request(), &enroll_req("gw-1"), "gw-1-token", Utc::now())
+            .await
+            .unwrap();
+        let stored: String =
+            sqlx::query_scalar("SELECT token_hash FROM gateways WHERE id = 'gw-1'")
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        assert_eq!(stored, token_hash("gw-1-token"));
+        assert_ne!(stored, "gw-1-token");
+    }
+
+    #[tokio::test]
+    async fn any_enrolled_gateways_token_is_recognised_without_naming_the_gateway() {
+        // The plugin endpoints the edge calls carry no gateway id, so their
+        // check is "does this token belong to any enrolled gateway".
+        let store = SqliteStore::in_memory().await.unwrap();
+        store
+            .enroll_gateway(&request(), &enroll_req("gw-1"), "gw-1-token", Utc::now())
+            .await
+            .unwrap();
+        store
+            .upsert_fleet_identity(
+                &batch_with_camera("gw-boot", "cam-1", "Entrance"),
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        assert!(store.verify_any_gateway_token("gw-1-token").await.unwrap());
+        assert!(!store.verify_any_gateway_token("wrong-token").await.unwrap());
+        // A bootstrap gateway row (empty token_hash) must not admit anything,
+        // least of all an empty bearer.
+        assert!(!store.verify_any_gateway_token("").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn re_enrollment_rotates_the_token() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        store
+            .enroll_gateway(&request(), &enroll_req("gw-1"), "old-token", Utc::now())
+            .await
+            .unwrap();
+        store
+            .enroll_gateway(&request(), &enroll_req("gw-1"), "new-token", Utc::now())
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .verify_gateway_token("gw-1", "old-token")
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .verify_gateway_token("gw-1", "new-token")
+                .await
+                .unwrap()
+        );
+    }
+
+    fn request() -> EnrollmentRequest {
+        EnrollmentRequest {
+            customer_id: "cust-1".into(),
+            customer_name: "Customer".into(),
+            site_id: "site-1".into(),
+            site_name: "Site".into(),
+            city: "Barcelona".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_enrollment_claims_exactly_once() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let now = Utc::now();
+        store
+            .create_enrollment("TOKEN-A", &request(), now + Duration::minutes(30))
+            .await
+            .unwrap();
+
+        let claimed = store
+            .claim_enrollment("TOKEN-A", now)
+            .await
+            .expect("first claim");
+        assert_eq!(claimed.customer_id, "cust-1");
+
+        match store.claim_enrollment("TOKEN-A", now).await {
+            Err(StoreError::Gone) => {}
+            other => panic!("second claim must be Gone, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_expired_enrollment_is_gone_and_an_unknown_one_is_not_found() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let now = Utc::now();
+        store
+            .create_enrollment("TOKEN-B", &request(), now - Duration::seconds(1))
+            .await
+            .unwrap();
+        assert!(matches!(
+            store.claim_enrollment("TOKEN-B", now).await,
+            Err(StoreError::Gone)
+        ));
+        assert!(matches!(
+            store.claim_enrollment("NEVER-ISSUED", now).await,
+            Err(StoreError::NotFound)
+        ));
+        assert!(matches!(
+            store.enrollment_request("NEVER-ISSUED", now).await,
+            Err(StoreError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn enrollment_tokens_are_not_stored_in_plaintext() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let now = Utc::now();
+        store
+            .create_enrollment("SECRET-TOKEN", &request(), now + Duration::minutes(30))
+            .await
+            .unwrap();
+        let stored: String = sqlx::query_scalar("SELECT token_hash FROM enrollments")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_ne!(stored, "SECRET-TOKEN");
+        assert_eq!(stored, token_hash("SECRET-TOKEN"));
+        assert_eq!(stored.len(), 64);
+    }
+
+    #[tokio::test]
+    async fn connect_applies_migrations() {
+        let store = SqliteStore::in_memory().await.expect("in-memory store");
+        let tables: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+                .fetch_all(&store.pool)
+                .await
+                .expect("list tables");
+        for expected in [
+            "organizations",
+            "sites",
+            "gateways",
+            "enrollments",
+            "cameras",
+            "recordings",
+            "admin_credential",
+            "sessions",
+            "incidents",
+            "audit_log",
+        ] {
+            assert!(
+                tables.iter().any(|t| t == expected),
+                "missing table {expected}, have {tables:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn revoking_kills_the_token_and_a_fresh_enrollment_clears_it() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        store
+            .enroll_gateway(&request(), &enroll_req("gw-1"), "tok-old", Utc::now())
+            .await
+            .unwrap();
+        assert!(store.verify_gateway_token("gw-1", "tok-old").await.unwrap());
+        assert!(!store.gateway_revoked("gw-1").await.unwrap());
+
+        store.revoke_gateway("gw-1", Utc::now()).await.unwrap();
+        assert!(store.gateway_revoked("gw-1").await.unwrap());
+        assert!(
+            !store.verify_gateway_token("gw-1", "tok-old").await.unwrap(),
+            "a revoked gateway's token must stop working"
+        );
+        assert!(
+            !store.verify_any_gateway_token("tok-old").await.unwrap(),
+            "the cleared hash must not match the any-gateway check either"
+        );
+
+        // A fresh admin-issued enrollment is the un-revoke.
+        store
+            .enroll_gateway(&request(), &enroll_req("gw-1"), "tok-new", Utc::now())
+            .await
+            .unwrap();
+        assert!(!store.gateway_revoked("gw-1").await.unwrap());
+        assert!(store.verify_gateway_token("gw-1", "tok-new").await.unwrap());
+
+        // Unknown ids: revoking is NotFound, the check is a calm false.
+        assert!(matches!(
+            store.revoke_gateway("gw-never", Utc::now()).await,
+            Err(StoreError::NotFound)
+        ));
+        assert!(!store.gateway_revoked("gw-never").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn the_gateway_roster_carries_names_flags_and_revocation() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        store
+            .enroll_gateway(&request(), &enroll_req("gw-1"), "tok-1", Utc::now())
+            .await
+            .unwrap();
+        store
+            .upsert_fleet_identity(
+                &batch_with_camera("gw-boot", "cam-1", "Entrance"),
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        store.revoke_gateway("gw-1", Utc::now()).await.unwrap();
+
+        let views = store.gateway_views().await.unwrap();
+        assert_eq!(views.len(), 2);
+        let gw1 = views.iter().find(|v| v.gateway_id == "gw-1").unwrap();
+        assert_eq!(gw1.site_name, "Site");
+        assert_eq!(gw1.customer_name, "Customer");
+        assert!(gw1.revoked_at.is_some());
+        assert!(!gw1.enrolled, "a revoked gateway has no working token");
+        assert!(
+            !gw1.online && gw1.heartbeat.is_none(),
+            "the store never claims liveness"
+        );
+        let boot = views.iter().find(|v| v.gateway_id == "gw-boot").unwrap();
+        assert!(!boot.enrolled && boot.revoked_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn audit_rows_insert_list_newest_first_and_prune_by_cutoff() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let now = Utc::now();
+        store
+            .record_audit(
+                now - Duration::days(400),
+                "system",
+                "password.reset",
+                "",
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .record_audit(
+                now - Duration::minutes(5),
+                "admin",
+                "login.failed",
+                "",
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .record_audit(
+                now,
+                "admin",
+                "gateway.revoked",
+                "gw-1",
+                Some("from the dashboard"),
+            )
+            .await
+            .unwrap();
+
+        let entries = store.audit_entries(10).await.unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].action, "gateway.revoked");
+        assert_eq!(entries[0].subject, "gw-1");
+        assert_eq!(entries[0].detail.as_deref(), Some("from the dashboard"));
+        assert_eq!(entries[2].action, "password.reset");
+
+        store
+            .delete_audit_before(now - Duration::days(365))
+            .await
+            .unwrap();
+        let entries = store.audit_entries(10).await.unwrap();
+        assert_eq!(entries.len(), 2, "only the 400-day-old row goes");
+        assert_eq!(
+            store.audit_entries(1).await.unwrap().len(),
+            1,
+            "the limit caps the page"
+        );
+    }
+
+    #[tokio::test]
+    async fn at_most_one_open_incident_per_camera_and_a_flap_is_two_rows() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let now = Utc::now();
+        store
+            .open_incident("cam-1", now, Some("gateway telemetry is stale"))
+            .await
+            .unwrap();
+        store
+            .open_incident("cam-1", now + Duration::minutes(1), None)
+            .await
+            .unwrap();
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM incidents")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 1, "the second open must be a no-op");
+
+        store
+            .close_incident("cam-1", now + Duration::minutes(5))
+            .await
+            .unwrap();
+        // Closing nothing is Ok — the reconciler closes unconditionally.
+        store
+            .close_incident("cam-1", now + Duration::minutes(6))
+            .await
+            .unwrap();
+        store
+            .open_incident("cam-1", now + Duration::minutes(10), None)
+            .await
+            .unwrap();
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM incidents")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 2, "a flap is two incidents, not one reopened row");
+    }
+
+    #[tokio::test]
+    async fn incidents_come_open_first_with_joined_names() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        store
+            .upsert_fleet_identity(&batch_with_camera("gw-1", "cam-1", "Entrance"), Utc::now())
+            .await
+            .unwrap();
+        let now = Utc::now();
+        store
+            .open_incident("cam-1", now - Duration::hours(2), None)
+            .await
+            .unwrap();
+        store
+            .close_incident("cam-1", now - Duration::hours(1))
+            .await
+            .unwrap();
+        store
+            .open_incident(
+                "cam-1",
+                now - Duration::minutes(5),
+                Some("rtsp: connection refused"),
+            )
+            .await
+            .unwrap();
+        store
+            .open_incident("cam-gone", now - Duration::days(3), None)
+            .await
+            .unwrap();
+
+        let incidents = store.incidents(10).await.unwrap();
+        assert_eq!(incidents.len(), 3);
+        assert!(
+            incidents[0].ended_at.is_none() && incidents[1].ended_at.is_none(),
+            "open incidents come first: {incidents:?}"
+        );
+        assert_eq!(
+            incidents[0].camera_name, "Entrance",
+            "names join from the roster"
+        );
+        assert_eq!(incidents[0].site_name, "Site");
+        assert_eq!(
+            incidents[0].detail.as_deref(),
+            Some("rtsp: connection refused")
+        );
+        // A camera no longer in the roster still shows, under its id.
+        assert_eq!(incidents[1].camera_name, "cam-gone");
+        assert!(incidents[2].ended_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn pruning_removes_only_old_closed_incidents() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let now = Utc::now();
+        store
+            .open_incident("cam-old", now - Duration::days(120), None)
+            .await
+            .unwrap();
+        store
+            .close_incident("cam-old", now - Duration::days(119))
+            .await
+            .unwrap();
+        store
+            .open_incident("cam-recent", now - Duration::days(2), None)
+            .await
+            .unwrap();
+        store
+            .close_incident("cam-recent", now - Duration::days(1))
+            .await
+            .unwrap();
+        store
+            .open_incident("cam-stuck", now - Duration::days(200), None)
+            .await
+            .unwrap();
+
+        store
+            .delete_closed_incidents_before(now - Duration::days(90))
+            .await
+            .unwrap();
+        let left = store.incidents(10).await.unwrap();
+        assert_eq!(left.len(), 2, "only the old closed incident goes: {left:?}");
+        assert!(
+            left.iter()
+                .any(|i| i.camera_id == "cam-stuck" && i.ended_at.is_none()),
+            "an open incident is never pruned, however old"
+        );
+        assert!(left.iter().any(|i| i.camera_id == "cam-recent"));
+    }
+
+    #[tokio::test]
+    async fn the_admin_credential_is_a_single_replaceable_row() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        assert_eq!(store.admin_password_hash().await.unwrap(), None);
+        store
+            .set_admin_password_hash("$argon2id$fake-one", Utc::now())
+            .await
+            .unwrap();
+        store
+            .set_admin_password_hash("$argon2id$fake-two", Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(
+            store.admin_password_hash().await.unwrap().as_deref(),
+            Some("$argon2id$fake-two")
+        );
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM admin_credential")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 1, "the second seed must replace, not accumulate");
+    }
+
+    #[tokio::test]
+    async fn sessions_validate_until_expiry_and_ids_are_not_stored_in_plaintext() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let now = Utc::now();
+        store
+            .create_session("session-secret", now, now + Duration::days(7))
+            .await
+            .unwrap();
+        assert!(store.session_is_valid("session-secret", now).await.unwrap());
+        assert!(
+            !store
+                .session_is_valid("session-secret", now + Duration::days(8))
+                .await
+                .unwrap()
+        );
+        assert!(!store.session_is_valid("never-issued", now).await.unwrap());
+        let stored: String = sqlx::query_scalar("SELECT id_hash FROM sessions")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(stored, token_hash("session-secret"));
+        assert_ne!(stored, "session-secret");
+    }
+
+    #[tokio::test]
+    async fn deleting_sessions_one_all_and_expired() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let now = Utc::now();
+        store
+            .create_session("s1", now, now + Duration::days(7))
+            .await
+            .unwrap();
+        store
+            .create_session("s2", now, now + Duration::days(7))
+            .await
+            .unwrap();
+        store
+            .create_session("s3", now, now - Duration::seconds(1))
+            .await
+            .unwrap();
+
+        store.delete_session("s1").await.unwrap();
+        assert!(!store.session_is_valid("s1", now).await.unwrap());
+        // Logging out twice must not error.
+        store.delete_session("s1").await.unwrap();
+
+        store.delete_expired_sessions(now).await.unwrap();
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(left, 1, "only the live s2 row should remain");
+
+        store.delete_all_sessions().await.unwrap();
+        assert!(!store.session_is_valid("s2", now).await.unwrap());
+    }
+}

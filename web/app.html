@@ -7,6 +7,15 @@
   <title>Dashboard</title>
 </head>
 <body class="app-body">
+  <div id="login-view" class="modal-backdrop login-backdrop">
+    <form id="login-form" class="modal login-modal">
+      <h2 data-i18n="app.auth.title"></h2>
+      <p data-i18n="app.auth.subtitle"></p>
+      <label class="field"><span data-i18n="app.auth.password"></span><input name="password" type="password" required autocomplete="current-password" /></label>
+      <div id="login-error" class="form-error" hidden data-i18n="app.auth.failed"></div>
+      <div class="modal-actions"><button class="button primary" type="submit" data-i18n="app.auth.signIn"></button></div>
+    </form>
+  </div>
   <div class="app-shell">
     <aside class="sidebar">
       <div id="app-brand"></div>
@@ -15,9 +24,7 @@
         <a class="sidebar-link" href="#fleet"><span class="nav-icon">◎</span><span data-i18n="app.customers"></span></a>
         <a class="sidebar-link" href="#fleet"><span class="nav-icon">◇</span><span data-i18n="app.sites"></span></a>
         <a class="sidebar-link" href="#fleet"><span class="nav-icon">◉</span><span data-i18n="app.cameras"></span></a>
-        <!-- No events view exists yet. A link that goes nowhere is worse than a
-             link that says so, so this one is disabled rather than dead. -->
-        <a class="sidebar-link disabled" aria-disabled="true"><span class="nav-icon">△</span><span data-i18n="app.events"></span></a>
+        <a class="sidebar-link" href="#incidents"><span class="nav-icon">△</span><span data-i18n="app.events"></span></a>
         <a class="sidebar-link" href="#gateways"><span class="nav-icon">⇄</span><span data-i18n="app.gateways"></span></a>
         <a id="plugins-link" class="sidebar-link" href="#plugins"><span class="nav-icon">✦</span><span data-i18n="app.plugins"></span></a>
         <a id="brand-settings-link" class="sidebar-link" href="#branding"><span class="nav-icon">⚙</span><span data-i18n="app.settings"></span></a>
@@ -60,6 +67,19 @@
               <tbody id="fleet-body"></tbody>
             </table>
           </div>
+        </section>
+
+        <section id="incidents" class="panel">
+          <div class="panel-head">
+            <div><strong data-i18n="app.incidents.title"></strong><div class="metric-sub" data-i18n="app.incidents.subtitle"></div></div>
+          </div>
+          <div style="overflow-x:auto">
+            <table class="fleet-table">
+              <thead><tr><th data-i18n="app.incidents.camera"></th><th data-i18n="app.incidents.started"></th><th data-i18n="app.incidents.duration"></th><th data-i18n="app.incidents.cause"></th></tr></thead>
+              <tbody id="incidents-body"></tbody>
+            </table>
+          </div>
+          <div id="incidents-empty" class="metric-sub" hidden data-i18n="app.incidents.empty"></div>
         </section>
 
         <section id="gateways" class="panel">
@@ -126,6 +146,22 @@
     </div>
   </div>
 
+
+  <div id="account-modal" class="modal-backdrop">
+    <form id="password-form" class="modal login-modal">
+      <h2 data-i18n="app.auth.accountTitle"></h2>
+      <p data-i18n="app.auth.accountSubtitle"></p>
+      <label class="field"><span data-i18n="app.auth.currentPassword"></span><input name="current" type="password" required autocomplete="current-password" /></label>
+      <label class="field"><span data-i18n="app.auth.newPassword"></span><input name="new" type="password" required minlength="12" autocomplete="new-password" /></label>
+      <div id="password-error" class="form-error" hidden data-i18n="app.auth.changeFailed"></div>
+      <div id="password-done" class="metric-sub" hidden data-i18n="app.auth.changed"></div>
+      <div class="modal-actions">
+        <button id="logout-button" type="button" class="button" data-i18n="app.auth.signOut"></button>
+        <button type="button" class="button" data-close-account data-i18n="app.close"></button>
+        <button type="submit" class="button primary" data-i18n="app.auth.change"></button>
+      </div>
+    </form>
+  </div>
 
   <div id="brand-modal" class="modal-backdrop">
     <form id="brand-form" class="modal">

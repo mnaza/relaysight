@@ -137,7 +137,8 @@ mod tests {
         b.record_failure("cam", "RTSP DESCRIBE timeout", now);
 
         assert_eq!(
-            b.skip_reason("cam", now + Duration::from_secs(5)).as_deref(),
+            b.skip_reason("cam", now + Duration::from_secs(5))
+                .as_deref(),
             Some("RTSP DESCRIBE timeout"),
             "the reason it is offline has to survive the wait, or the dashboard forgets why"
         );
@@ -172,7 +173,13 @@ mod tests {
         for _ in 0..6 {
             b.record_failure("broken", "down", now);
         }
-        assert!(b.skip_reason("broken", now + Duration::from_secs(120)).is_some());
-        assert_eq!(b.skip_reason("working", now + Duration::from_secs(120)), None);
+        assert!(
+            b.skip_reason("broken", now + Duration::from_secs(120))
+                .is_some()
+        );
+        assert_eq!(
+            b.skip_reason("working", now + Duration::from_secs(120)),
+            None
+        );
     }
 }

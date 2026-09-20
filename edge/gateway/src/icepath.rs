@@ -78,14 +78,14 @@ pub fn entry_is_candidate(entry_id: &str, candidate_id: &str) -> bool {
             .is_some_and(|prefix| prefix.ends_with('_'))
 }
 
-/// Read the path a connected peer settled on.
+/// The path, and the selected local candidate's TURN URL when it has one.
 ///
 /// Thin glue over `busiest_pair`, which carries the logic and the tests. Anything
 /// missing maps to `Unknown` rather than to a guess: this number goes into a cost
 /// model, and a wrong label there is worse than an absent one.
-pub async fn observed(
+pub async fn observed_candidate(
     peer: &std::sync::Arc<dyn webrtc::peer_connection::PeerConnection>,
-) -> PathKind {
+) -> (PathKind, Option<String>) {
     use rtc::peer_connection::transport::RTCIceCandidateType;
     use rtc::statistics::StatsSelector;
     use rtc::statistics::report::RTCStatsReportEntry;
@@ -100,7 +100,7 @@ pub async fn observed(
             p.bytes_sent + p.bytes_received,
         )
     })) else {
-        return PathKind::Unknown;
+        return (PathKind::Unknown, None);
     };
 
     let found = report.iter().find_map(|e| match e {
@@ -111,14 +111,17 @@ pub async fn observed(
     });
 
     match found {
-        Some(c) => match c.candidate_type {
-            RTCIceCandidateType::Host => PathKind::Host,
-            RTCIceCandidateType::Srflx => PathKind::ServerReflexive,
-            RTCIceCandidateType::Prflx => PathKind::PeerReflexive,
-            RTCIceCandidateType::Relay => PathKind::Relay,
-            _ => PathKind::Unknown,
-        },
-        None => PathKind::Unknown,
+        Some(c) => {
+            let kind = match c.candidate_type {
+                RTCIceCandidateType::Host => PathKind::Host,
+                RTCIceCandidateType::Srflx => PathKind::ServerReflexive,
+                RTCIceCandidateType::Prflx => PathKind::PeerReflexive,
+                RTCIceCandidateType::Relay => PathKind::Relay,
+                _ => PathKind::Unknown,
+            };
+            (kind, (!c.url.is_empty()).then(|| c.url.clone()))
+        }
+        None => (PathKind::Unknown, None),
     }
 }
 

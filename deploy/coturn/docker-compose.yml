@@ -12,6 +12,12 @@
 #     docker compose -f deploy/coturn/docker-compose.yml up -d
 #
 # The same secret goes to the API as RTC_TURN_SECRET. Nothing else is shared.
+# TURN over TLS on 443 needs a certificate in ./certs before this starts;
+# docs/TURN-DEPLOY.md says how.
+
+# Fixed, so the containers carry the same project label wherever this file is
+# run from. The certificate hook finds the relay by that label.
+name: coturn
 
 services:
   coturn:
@@ -21,8 +27,35 @@ services:
     # needless hop on every packet. It also lets coturn see real client
     # addresses instead of the bridge's.
     network_mode: host
+    # coturn runs as the image's own user, nobody. Under host networking,
+    # binding 443 takes exactly one capability, so it is declared here rather
+    # than inherited from Docker's defaults, and everything else is dropped.
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    # The key is installed 0640 in this group: nobody's own group in
+    # production. The relay check sets it to the caller's group so it can run
+    # the real permission rule without root.
+    group_add: ["${RTC_TURN_CERT_GROUP:-65534}"]
     volumes:
       - ./turnserver.conf:/etc/coturn/turnserver.conf:ro
+      - ./healthcheck.sh:/etc/coturn/healthcheck.sh:ro
+      - ${RTC_TURN_CERT_DIR:-./certs}:/etc/coturn/certs:ro
+    # coturn takes its realm as a flag, not from here; the healthcheck needs it
+    # to know which name the certificate has to be for.
+    environment:
+      RTC_TURN_REALM: ${RTC_TURN_REALM:?set the realm, e.g. relay.example.com}
+    # A missing or unreadable certificate does not stop coturn: it runs with no
+    # TLS listener and logs that once. An expired or wrong-name certificate is
+    # worse still, because the handshake succeeds and only browsers refuse it.
+    # healthcheck.sh covers all three, rather than sites that quietly cannot
+    # connect. Every ten seconds: a relay that loses TLS should be noticed in
+    # seconds, at the cost of coturn logging each handshake.
+    healthcheck:
+      test: ["CMD", "bash", "/etc/coturn/healthcheck.sh"]
+      interval: 10s
+      timeout: 8s
+      retries: 3
+      start_period: 10s
     # coturn does not read these from the environment, so they arrive as flags.
     # They are visible in `ps` on the host: acceptable when the host is yours,
     # and worth knowing when it is not.

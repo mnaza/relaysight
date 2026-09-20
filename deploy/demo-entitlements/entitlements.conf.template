@@ -1,0 +1,23 @@
+# A stand-in for the commercial control plane, for the editions demo only.
+#
+# The real service (private repository `relaysight-platform`) decides per
+# customer and carries the subscription logic. This one answers every customer
+# id with the same plan — whichever DEMO_PLAN names — because all the demo needs
+# is for Community Core to receive a commercial entitlement and act on it.
+# See docs/DEMO.md.
+
+server {
+    listen 8088;
+
+    location = /healthz {
+        default_type text/plain;
+        return 200 "ok\n";
+    }
+
+    # GET /api/v1/entitlements/<customer id> — the shape
+    # services/api/src/entitlements.rs asks for.
+    location /api/v1/entitlements/ {
+        root /srv;
+        try_files /entitlements/${DEMO_PLAN}.json =404;
+    }
+}

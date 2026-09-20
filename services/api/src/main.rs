@@ -1,3 +1,5 @@
+mod auth;
+mod store;
 mod turn;
 
 /// Seconds since the epoch. Used for TURN credential expiry.
@@ -34,12 +36,12 @@ use tower_http::{
 use tracing::{info, warn};
 use uuid::Uuid;
 use vms_domain::{
-    AiAnalysisRequest as CameraAiAnalysisRequest, CameraSummary, CameraTelemetry,
+    AiAnalysisRequest as CameraAiAnalysisRequest, AuditView, CameraSummary, CameraTelemetry,
     CameraTelemetryBatch, CommandAccepted, CustomerSummary, EditionEntitlement, EnrollmentCreated,
     EnrollmentRequest, FleetSnapshot, FleetSource, GatewayCommand, GatewayCommandKind,
     GatewayCommandResult, GatewayCommandStatus, GatewayCommandView, GatewayEnrollmentRequest,
-    GatewayEnrollmentResponse, GatewayHeartbeat, HealthStatus, LiveSessionRequest,
-    PlaybackManifest, PlaybackSegment, RecordingManifest, RecordingRequest, RecordingTimeline,
+    GatewayEnrollmentResponse, GatewayHeartbeat, GatewayView, HealthStatus, IncidentView,
+    LiveSessionRequest, PlaybackManifest, PlaybackSegment, RecordingRequest, RecordingTimeline,
     RtcConfigResponse, SiteSummary,
 };
 use vms_plugin_runtime::PluginRegistry;
@@ -55,8 +57,7 @@ use crate::entitlements::EntitlementResolver;
 struct AppState {
     gateways: Arc<RwLock<HashMap<String, GatewayHeartbeat>>>,
     camera_batches: Arc<RwLock<HashMap<String, CameraTelemetryBatch>>>,
-    enrollments: Arc<RwLock<HashMap<String, Enrollment>>>,
-    gateway_tokens: Arc<RwLock<HashMap<String, String>>>,
+    store: Arc<dyn crate::store::Store>,
     gateway_token: Arc<str>,
     stale_camera_seconds: i64,
     entitlements: EntitlementResolver,
@@ -64,18 +65,18 @@ struct AppState {
     plugin_dir: Arc<PathBuf>,
     command_queues: Arc<RwLock<HashMap<String, VecDeque<String>>>>,
     commands: Arc<RwLock<HashMap<String, GatewayCommandView>>>,
-    recordings: Arc<RwLock<HashMap<String, RecordingManifest>>>,
     default_storage_plugin: Arc<str>,
     default_ai_plugin: Arc<str>,
     rtc: Arc<crate::turn::RtcConfig>,
     default_retention_days: i64,
-}
-
-#[derive(Clone)]
-struct Enrollment {
-    request: EnrollmentRequest,
-    expires_at: chrono::DateTime<Utc>,
-    claimed: bool,
+    login_throttle: Arc<tokio::sync::Mutex<crate::auth::LoginThrottle>>,
+    cookie_secure: bool,
+    /// No incident sweeps until the API has been up this long — right after a
+    /// restart every camera looks silent until its gateway re-reports.
+    incident_grace: Duration,
+    incident_retention_days: i64,
+    audit_retention_days: i64,
+    up_since: std::time::Instant,
 }
 
 #[derive(Serialize)]
@@ -113,24 +114,39 @@ async fn main() -> anyhow::Result<()> {
     }
     let plugin_dir = PathBuf::from(env::var("PLUGIN_DIR").unwrap_or_else(|_| "plugins.d".into()));
     let plugins = PluginRegistry::load_dir(&plugin_dir).await?;
+    // A failed open or migration refuses to start — a half-up API that forgot
+    // its fleet is worse than a crash loop.
+    let database_url = env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite:data/vms.db".into());
+    if let Some(path) = database_url.strip_prefix("sqlite:")
+        && let Some(parent) = std::path::Path::new(path).parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let store: Arc<dyn store::Store> = Arc::new(store::SqliteStore::connect(&database_url).await?);
+    info!(%database_url, "fleet store open");
+    let admin_password = env::var("ADMIN_PASSWORD")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let force_reset = env::var("ADMIN_PASSWORD_RESET").is_ok_and(|value| value == "true");
+    auth::seed_admin_credential(store.as_ref(), admin_password.as_deref(), force_reset).await?;
+    let stale_camera_seconds: i64 = env::var("STALE_CAMERA_SECONDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(75);
     let state = AppState {
         gateways: Arc::new(RwLock::new(HashMap::new())),
         camera_batches: Arc::new(RwLock::new(HashMap::new())),
-        enrollments: Arc::new(RwLock::new(HashMap::new())),
-        gateway_tokens: Arc::new(RwLock::new(HashMap::new())),
+        store,
         gateway_token: Arc::from(
             env::var("GATEWAY_TOKEN").unwrap_or_else(|_| "demo-local-token".into()),
         ),
-        stale_camera_seconds: env::var("STALE_CAMERA_SECONDS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(75),
+        stale_camera_seconds,
         entitlements: EntitlementResolver::from_env(),
         plugins,
         plugin_dir: Arc::new(plugin_dir),
         command_queues: Arc::new(RwLock::new(HashMap::new())),
         commands: Arc::new(RwLock::new(HashMap::new())),
-        recordings: Arc::new(RwLock::new(HashMap::new())),
         default_storage_plugin: Arc::from(
             env::var("DEFAULT_STORAGE_PLUGIN").unwrap_or_else(|_| "storage-s3".into()),
         ),
@@ -142,6 +158,18 @@ async fn main() -> anyhow::Result<()> {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(30),
+        login_throttle: Arc::new(tokio::sync::Mutex::new(auth::LoginThrottle::default())),
+        cookie_secure: env::var("AUTH_COOKIE_SECURE").is_ok_and(|value| value == "true"),
+        incident_grace: Duration::from_secs(stale_camera_seconds.max(0) as u64),
+        incident_retention_days: env::var("INCIDENT_RETENTION_DAYS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(90),
+        audit_retention_days: env::var("AUDIT_RETENTION_DAYS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+        up_since: std::time::Instant::now(),
     };
 
     let app = build_router(state.clone());
@@ -157,21 +185,27 @@ async fn main() -> anyhow::Result<()> {
 
 /// Build the HTTP surface. Split out of `main` so tests can drive it with a
 /// `AppState` of their own rather than a live socket and the environment.
+///
+/// Three groups. `open` is health, the login pair, and the gateway machine
+/// endpoints, which carry their own per-gateway bearer checks in the
+/// handlers. `machine_plugins` is the two plugin endpoints the edge calls —
+/// no gateway id in the path, so one middleware accepts any gateway
+/// credential. Everything else is `protected` behind the session middleware —
+/// a route added there is covered by construction, and must also be added to
+/// PROTECTED_ROUTES in the tests.
 fn build_router(state: AppState) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
         .allow_headers(Any);
-    Router::new()
+    let open = Router::new()
         .route("/healthz", get(healthz))
         .route("/api/v1/system/edition", get(system_edition))
-        .route("/api/v1/fleet", get(fleet))
-        .route("/api/v1/enrollments", post(create_enrollment))
-        .route("/api/v1/gateways/enroll", post(gateway_enroll))
-        .route("/api/v1/cameras", get(cameras))
+        .route("/api/v1/auth/login", post(crate::auth::auth_login))
+        .route("/api/v1/auth/session", get(crate::auth::auth_session))
         .route("/api/v1/cameras/telemetry", post(camera_telemetry))
-        .route("/api/v1/gateways", get(gateways))
         .route("/api/v1/gateways/heartbeat", post(gateway_heartbeat))
+        .route("/api/v1/gateways/enroll", post(gateway_enroll))
         .route(
             "/api/v1/gateways/{gateway_id}/commands/next",
             get(gateway_next_command),
@@ -179,7 +213,28 @@ fn build_router(state: AppState) -> Router {
         .route(
             "/api/v1/gateways/{gateway_id}/commands/{command_id}/complete",
             post(gateway_complete_command),
+        );
+    let machine_plugins = Router::new()
+        .route(
+            "/api/v1/plugins/{plugin_id}/ai/analyze",
+            post(plugin_ai_analyze),
         )
+        .route(
+            "/api/v1/plugins/{plugin_id}/storage/uploads",
+            post(plugin_storage_upload),
+        )
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_machine_bearer,
+        ));
+    let protected = Router::new()
+        .route("/api/v1/fleet", get(fleet))
+        .route("/api/v1/incidents", get(incidents))
+        .route("/api/v1/audit", get(audit_entries))
+        .route("/api/v1/enrollments", post(create_enrollment))
+        .route("/api/v1/cameras", get(cameras))
+        .route("/api/v1/gateways", get(gateways))
+        .route("/api/v1/gateways/{gateway_id}/revoke", post(revoke_gateway))
         .route("/api/v1/commands/{command_id}", get(command_view))
         .route("/api/v1/rtc/config", get(rtc_config))
         .route(
@@ -202,14 +257,6 @@ fn build_router(state: AppState) -> Router {
         .route("/api/v1/plugins/reload", post(plugins_reload))
         .route("/api/v1/plugins/{plugin_id}/health", get(plugin_health))
         .route(
-            "/api/v1/plugins/{plugin_id}/ai/analyze",
-            post(plugin_ai_analyze),
-        )
-        .route(
-            "/api/v1/plugins/{plugin_id}/storage/uploads",
-            post(plugin_storage_upload),
-        )
-        .route(
             "/api/v1/plugins/{plugin_id}/storage/downloads",
             post(plugin_storage_download),
         )
@@ -217,6 +264,17 @@ fn build_router(state: AppState) -> Router {
             "/api/v1/plugins/{plugin_id}/storage/delete",
             post(plugin_storage_delete),
         )
+        .route("/api/v1/auth/logout", post(crate::auth::auth_logout))
+        .route(
+            "/api/v1/auth/password",
+            post(crate::auth::auth_change_password),
+        )
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::auth::require_session,
+        ));
+    open.merge(machine_plugins)
+        .merge(protected)
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -276,6 +334,9 @@ async fn camera_telemetry(
     {
         batch.cameras.truncate(limit);
     }
+    if let Err(err) = state.store.upsert_fleet_identity(&batch, Utc::now()).await {
+        return store_status(err);
+    }
     state
         .camera_batches
         .write()
@@ -284,81 +345,172 @@ async fn camera_telemetry(
     StatusCode::NO_CONTENT
 }
 
-async fn authorized_gateway(headers: &HeaderMap, state: &AppState, gateway_id: &str) -> bool {
-    let Some(token) = headers
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
-    else {
+}
+
+async fn authorized_gateway(headers: &HeaderMap, state: &AppState, gateway_id: &str) -> bool {
+    let Some(token) = bearer_token(headers) else {
         return false;
     };
+    // A revoked gateway is refused every credential, the bootstrap secret
+    // included — revocation must actually evict. A store failure reads as
+    // not-revoked so a database hiccup cannot 401 the whole fleet; the
+    // per-token check below still fails closed on its own.
+    if state
+        .store
+        .gateway_revoked(gateway_id)
+        .await
+        .unwrap_or(false)
+    {
+        return false;
+    }
     if token == state.gateway_token.as_ref() {
         return true;
     }
     state
-        .gateway_tokens
-        .read()
+        .store
+        .verify_gateway_token(gateway_id, token)
         .await
-        .get(gateway_id)
-        .map(|saved| saved == token)
         .unwrap_or(false)
+}
+
+/// The layer on the plugin endpoints the edge gateway calls. They carry no
+/// gateway id in the path, so any credential that identifies a gateway
+/// passes: the shared bootstrap token or any enrolled gateway's own token.
+/// A dashboard session cookie is deliberately not accepted — these are
+/// machine endpoints. A store failure answers 401: fail closed.
+async fn require_machine_bearer(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let authorized = match bearer_token(request.headers()) {
+        Some(token) => {
+            token == state.gateway_token.as_ref()
+                || state
+                    .store
+                    .verify_any_gateway_token(token)
+                    .await
+                    .unwrap_or(false)
+        }
+        None => false,
+    };
+    if authorized {
+        next.run(request).await
+    } else {
+        StatusCode::UNAUTHORIZED.into_response()
+    }
+}
+
+/// The live camera map from the gateway batches, deduped by newest
+/// `last_seen`. Batches are keyed by gateway and never pruned, so a camera
+/// that moved gateways exists in two batches until a restart — an arbitrary
+/// winner here could show a false offline, or persist a false incident.
+fn newest_camera_map(
+    batches: &HashMap<String, CameraTelemetryBatch>,
+) -> HashMap<String, CameraTelemetry> {
+    let mut live: HashMap<String, CameraTelemetry> = HashMap::new();
+    for camera in batches.values().flat_map(|batch| batch.cameras.iter()) {
+        match live.get(&camera.camera_id) {
+            Some(existing) if existing.last_seen >= camera.last_seen => {}
+            _ => {
+                live.insert(camera.camera_id.clone(), camera.clone());
+            }
+        }
+    }
+    live
+}
+
+fn store_status(err: crate::store::StoreError) -> StatusCode {
+    match err {
+        crate::store::StoreError::NotFound => StatusCode::NOT_FOUND,
+        crate::store::StoreError::Gone => StatusCode::GONE,
+        crate::store::StoreError::Internal(err) => {
+            warn!(error = %err, "store failure");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}
+
+/// Fire-and-forget: the trail matters, but never enough to fail the request
+/// it describes. Secrets never reach `detail` — that is the caller's oath.
+async fn audit(state: &AppState, actor: &str, action: &str, subject: &str, detail: Option<&str>) {
+    if let Err(err) = state
+        .store
+        .record_audit(Utc::now(), actor, action, subject, detail)
+        .await
+    {
+        warn!(action, error = %err, "audit write failed");
+    }
 }
 
 async fn create_enrollment(
     State(state): State<AppState>,
     Json(request): Json<EnrollmentRequest>,
-) -> Json<EnrollmentCreated> {
+) -> Result<Json<EnrollmentCreated>, StatusCode> {
     let enrollment_token = Uuid::new_v4().simple().to_string().to_uppercase();
     let expires_at = Utc::now() + chrono::Duration::minutes(30);
-    state.enrollments.write().await.insert(
-        enrollment_token.clone(),
-        Enrollment {
-            request,
-            expires_at,
-            claimed: false,
-        },
-    );
-    Json(EnrollmentCreated {
+    state
+        .store
+        .create_enrollment(&enrollment_token, &request, expires_at)
+        .await
+        .map_err(store_status)?;
+    audit(
+        &state,
+        "admin",
+        "enrollment.created",
+        &request.site_id,
+        Some(&format!(
+            "{} / {}",
+            request.customer_name, request.site_name
+        )),
+    )
+    .await;
+    Ok(Json(EnrollmentCreated {
         enrollment_token,
         expires_at,
-    })
+    }))
 }
 
 async fn gateway_enroll(
     State(state): State<AppState>,
     Json(request): Json<GatewayEnrollmentRequest>,
 ) -> Result<Json<GatewayEnrollmentResponse>, StatusCode> {
-    let enrollment_request = {
-        let enrollments = state.enrollments.read().await;
-        let enrollment = enrollments
-            .get(&request.enrollment_token)
-            .ok_or(StatusCode::NOT_FOUND)?;
-        if enrollment.claimed || enrollment.expires_at < Utc::now() {
-            return Err(StatusCode::GONE);
-        }
-        enrollment.request.clone()
-    };
+    // Look, resolve, then claim — an entitlement outage must not burn the token.
+    let enrollment_request = state
+        .store
+        .enrollment_request(&request.enrollment_token, Utc::now())
+        .await
+        .map_err(store_status)?;
     let entitlement = state
         .entitlements
         .resolve(&enrollment_request.customer_id)
         .await
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-    {
-        let mut enrollments = state.enrollments.write().await;
-        let enrollment = enrollments
-            .get_mut(&request.enrollment_token)
-            .ok_or(StatusCode::NOT_FOUND)?;
-        if enrollment.claimed || enrollment.expires_at < Utc::now() {
-            return Err(StatusCode::GONE);
-        }
-        enrollment.claimed = true;
-    }
+    let enrollment_request = state
+        .store
+        .claim_enrollment(&request.enrollment_token, Utc::now())
+        .await
+        .map_err(store_status)?;
     let gateway_token = Uuid::new_v4().simple().to_string();
     state
-        .gateway_tokens
-        .write()
+        .store
+        .enroll_gateway(&enrollment_request, &request, &gateway_token, Utc::now())
         .await
-        .insert(request.gateway_id, gateway_token.clone());
+        .map_err(store_status)?;
+    audit(
+        &state,
+        &format!("gateway:{}", request.gateway_id),
+        "gateway.enrolled",
+        &request.gateway_id,
+        None,
+    )
+    .await;
     Ok(Json(GatewayEnrollmentResponse {
         gateway_token,
         entitlement,
@@ -370,19 +522,92 @@ async fn gateway_enroll(
     }))
 }
 
-async fn gateways(State(state): State<AppState>) -> Json<Vec<GatewayHeartbeat>> {
-    let mut values: Vec<_> = state.gateways.read().await.values().cloned().collect();
-    values.sort_by(|a, b| a.gateway_id.cmp(&b.gateway_id));
-    Json(values)
+async fn revoke_gateway(
+    State(state): State<AppState>,
+    Path(gateway_id): Path<String>,
+) -> Result<StatusCode, StatusCode> {
+    let now = Utc::now();
+    state
+        .store
+        .revoke_gateway(&gateway_id, now)
+        .await
+        .map_err(store_status)?;
+    audit(&state, "admin", "gateway.revoked", &gateway_id, None).await;
+    // A revoke is deliberate and audited, not an outage: its cameras leave the
+    // incident timeline now. Failure only warns — the incident pass closes
+    // whatever this misses.
+    match state.store.fleet_cameras().await {
+        Ok(cameras) => {
+            for camera in cameras
+                .iter()
+                .filter(|camera| camera.gateway_id == gateway_id)
+            {
+                if let Err(err) = state.store.close_incident(&camera.id, now).await {
+                    warn!(camera_id = %camera.id, error = %err, "revoke could not close an incident");
+                }
+            }
+        }
+        Err(err) => warn!(gateway_id = %gateway_id, error = %err, "revoke could not list cameras"),
+    }
+    // Drop its live presence so the dashboard stops showing a healthy
+    // reporter it will never hear from again.
+    state.gateways.write().await.remove(&gateway_id);
+    state.camera_batches.write().await.remove(&gateway_id);
+    Ok(StatusCode::NO_CONTENT)
 }
 
-async fn cameras(State(state): State<AppState>) -> Json<Vec<CameraTelemetry>> {
-    let batches = state.camera_batches.read().await;
+async fn gateways(State(state): State<AppState>) -> Result<Json<Vec<GatewayView>>, StatusCode> {
+    // The store is the roster, memory is the liveness — same split as /cameras.
+    let mut views = state.store.gateway_views().await.map_err(store_status)?;
     let now = Utc::now();
-    let mut values: Vec<_> = batches
-        .values()
-        .flat_map(|batch| batch.cameras.clone())
+    let live = state.gateways.read().await;
+    for view in &mut views {
+        if let Some(heartbeat) = live.get(&view.gateway_id) {
+            view.online = (now - heartbeat.sent_at).num_seconds() <= state.stale_camera_seconds;
+            view.last_seen = Some(match view.last_seen {
+                Some(seen) => seen.max(heartbeat.sent_at),
+                None => heartbeat.sent_at,
+            });
+            view.heartbeat = Some(heartbeat.clone());
+        }
+    }
+    // A live gateway the store has not caught up with yet still shows.
+    for (id, heartbeat) in live.iter() {
+        if !views.iter().any(|view| view.gateway_id == *id) {
+            views.push(GatewayView {
+                gateway_id: id.clone(),
+                site_id: heartbeat.site_id.clone(),
+                site_name: String::new(),
+                customer_name: String::new(),
+                hostname: Some(heartbeat.hostname.clone()),
+                version: Some(heartbeat.version.clone()),
+                enrolled: false,
+                revoked_at: None,
+                last_seen: Some(heartbeat.sent_at),
+                online: (now - heartbeat.sent_at).num_seconds() <= state.stale_camera_seconds,
+                heartbeat: Some(heartbeat.clone()),
+            });
+        }
+    }
+    drop(live);
+    views.sort_by(|a, b| a.gateway_id.cmp(&b.gateway_id));
+    Ok(Json(views))
+}
+
+async fn cameras(State(state): State<AppState>) -> Result<Json<Vec<CameraTelemetry>>, StatusCode> {
+    // The store is the roster, memory is the liveness.
+    let records = state.store.fleet_cameras().await.map_err(store_status)?;
+    let now = Utc::now();
+    let mut live = newest_camera_map(&*state.camera_batches.read().await);
+    let mut values: Vec<CameraTelemetry> = records
+        .into_iter()
+        .map(|record| match live.remove(&record.id) {
+            Some(camera) => camera,
+            None => offline_camera(record),
+        })
         .collect();
+    // A live camera the store has not caught up with yet still shows.
+    values.extend(live.into_values());
     for camera in &mut values {
         if (now - camera.last_seen).num_seconds() > state.stale_camera_seconds {
             camera.status = HealthStatus::Offline;
@@ -396,18 +621,99 @@ async fn cameras(State(state): State<AppState>) -> Json<Vec<CameraTelemetry>> {
             .cmp(&b.name)
             .then_with(|| a.camera_id.cmp(&b.camera_id))
     });
-    Json(values)
+    Ok(Json(values))
 }
 
-async fn fleet(State(state): State<AppState>) -> Json<FleetSnapshot> {
-    let batches = state.camera_batches.read().await;
-    if batches.values().any(|batch| !batch.cameras.is_empty()) {
-        return Json(live_fleet(
-            batches.values().cloned().collect(),
-            state.stale_camera_seconds,
-        ));
+fn offline_camera(record: crate::store::CameraRecord) -> CameraTelemetry {
+    CameraTelemetry {
+        camera_id: record.id,
+        gateway_id: record.gateway_id,
+        site_id: record.site_id,
+        name: record.name,
+        status: HealthStatus::Offline,
+        manufacturer: record.manufacturer,
+        model: record.model,
+        firmware: record.firmware,
+        profile_name: None,
+        codec: record.codec,
+        width: record.width,
+        height: record.height,
+        fps: None,
+        bitrate_kbps: None,
+        packet_loss: 0,
+        reconnects: 0,
+        rtsp_endpoint: None,
+        last_seen: record.last_seen,
+        last_error: Some("no telemetry since the API restarted".into()),
     }
-    Json(demo_fleet())
+}
+
+async fn fleet(State(state): State<AppState>) -> Result<Json<FleetSnapshot>, StatusCode> {
+    // Identity from the store, status from memory.
+    let orgs = state.store.fleet_identity().await.map_err(store_status)?;
+    let batches = state.camera_batches.read().await;
+    if orgs.is_empty() {
+        if batches.values().any(|batch| !batch.cameras.is_empty()) {
+            return Ok(Json(live_fleet(
+                batches.values().cloned().collect(),
+                state.stale_camera_seconds,
+            )));
+        }
+        return Ok(Json(demo_fleet()));
+    }
+    let now = Utc::now();
+    let live = newest_camera_map(&batches);
+    let customers = orgs
+        .into_iter()
+        .map(|org| CustomerSummary {
+            id: org.id.clone(),
+            name: org.name,
+            sites: org
+                .sites
+                .into_iter()
+                .map(|site| SiteSummary {
+                    id: site.id,
+                    customer_id: org.id.clone(),
+                    name: site.name,
+                    city: site.city,
+                    cameras: site
+                        .cameras
+                        .into_iter()
+                        .map(|record| {
+                            let (status, fps, bitrate, last_seen) = match live.get(&record.id) {
+                                Some(camera)
+                                    if (now - camera.last_seen).num_seconds()
+                                        <= state.stale_camera_seconds =>
+                                {
+                                    (
+                                        camera.status.clone(),
+                                        camera.fps,
+                                        camera.bitrate_kbps,
+                                        camera.last_seen,
+                                    )
+                                }
+                                _ => (HealthStatus::Offline, None, None, record.last_seen),
+                            };
+                            CameraSummary {
+                                id: record.id,
+                                name: record.name,
+                                site_id: record.site_id,
+                                status,
+                                fps,
+                                bitrate_kbps: bitrate,
+                                last_seen,
+                            }
+                        })
+                        .collect(),
+                })
+                .collect(),
+        })
+        .collect();
+    Ok(Json(FleetSnapshot {
+        generated_at: Utc::now(),
+        source: FleetSource::Live,
+        customers,
+    }))
 }
 
 async fn plugins_list(State(state): State<AppState>) -> Json<Vec<RegisteredPlugin>> {
@@ -715,11 +1021,9 @@ async fn gateway_complete_command(
     {
         recording.delete_after = (state.default_retention_days > 0)
             .then(|| recording.ended_at + chrono::Duration::days(state.default_retention_days));
-        state
-            .recordings
-            .write()
-            .await
-            .insert(recording.recording_id.clone(), recording.clone());
+        if state.store.save_recording(recording).await.is_err() {
+            return StatusCode::INTERNAL_SERVER_ERROR;
+        }
     }
     view.status = result.status.clone();
     view.result = Some(result);
@@ -743,20 +1047,36 @@ async fn command_view(
 async fn camera_timeline(
     State(state): State<AppState>,
     Path(camera_id): Path<String>,
-) -> Json<RecordingTimeline> {
-    let mut recordings: Vec<_> = state
-        .recordings
-        .read()
+) -> Result<Json<RecordingTimeline>, StatusCode> {
+    // Already newest-first from the store.
+    let recordings = state
+        .store
+        .camera_recordings(&camera_id)
         .await
-        .values()
-        .filter(|recording| recording.camera_id == camera_id)
-        .cloned()
-        .collect();
-    recordings.sort_by_key(|r| std::cmp::Reverse(r.started_at));
-    Json(RecordingTimeline {
+        .map_err(store_status)?;
+    Ok(Json(RecordingTimeline {
         camera_id,
         recordings,
-    })
+    }))
+}
+
+async fn incidents(State(state): State<AppState>) -> Result<Json<Vec<IncidentView>>, StatusCode> {
+    // Open first, newest-closed after; 200 is plenty for a screen.
+    state
+        .store
+        .incidents(200)
+        .await
+        .map(Json)
+        .map_err(store_status)
+}
+
+async fn audit_entries(State(state): State<AppState>) -> Result<Json<Vec<AuditView>>, StatusCode> {
+    state
+        .store
+        .audit_entries(500)
+        .await
+        .map(Json)
+        .map_err(store_status)
 }
 
 async fn recording_playback(
@@ -764,12 +1084,10 @@ async fn recording_playback(
     Path(recording_id): Path<String>,
 ) -> Result<Json<PlaybackManifest>, StatusCode> {
     let recording = state
-        .recordings
-        .read()
+        .store
+        .recording(&recording_id)
         .await
-        .get(&recording_id)
-        .cloned()
-        .ok_or(StatusCode::NOT_FOUND)?;
+        .map_err(store_status)?;
     let context = vms_plugin_sdk::PluginInvocationContext {
         camera_id: Some(recording.camera_id.clone()),
         ..Default::default()
@@ -828,51 +1146,146 @@ async fn retention_loop(state: AppState) {
     let mut interval = tokio::time::interval(Duration::from_secs(60));
     loop {
         interval.tick().await;
-        let now = Utc::now();
-        let expired: Vec<_> = state
-            .recordings
-            .read()
-            .await
-            .values()
-            .filter(|recording| recording.delete_after.as_ref().is_some_and(|at| at <= &now))
-            .cloned()
-            .collect();
-        for recording in expired {
-            let mut ok = true;
-            let context = vms_plugin_sdk::PluginInvocationContext {
-                camera_id: Some(recording.camera_id.clone()),
-                ..Default::default()
+        retention_pass(&state).await;
+        incident_pass(&state).await;
+    }
+}
+
+async fn retention_pass(state: &AppState) {
+    if let Err(err) = state.store.delete_expired_sessions(Utc::now()).await {
+        warn!(error = %err, "retention could not sweep expired sessions");
+    }
+    let expired = match state.store.expired_recordings(Utc::now()).await {
+        Ok(expired) => expired,
+        Err(err) => {
+            warn!(error = %err, "retention could not list expired recordings");
+            return;
+        }
+    };
+    for recording in expired {
+        let mut ok = true;
+        let context = vms_plugin_sdk::PluginInvocationContext {
+            camera_id: Some(recording.camera_id.clone()),
+            ..Default::default()
+        };
+        let mut objects = Vec::with_capacity(recording.segments.len() + 1);
+        objects.push(recording.init.clone());
+        objects.extend(
+            recording
+                .segments
+                .iter()
+                .map(|segment| segment.object.clone()),
+        );
+        for object in objects {
+            let request = StorageDeleteRequest {
+                context: context.clone(),
+                object_ref: object.object_ref,
             };
-            let mut objects = Vec::with_capacity(recording.segments.len() + 1);
-            objects.push(recording.init.clone());
-            objects.extend(
-                recording
-                    .segments
-                    .iter()
-                    .map(|segment| segment.object.clone()),
-            );
-            for object in objects {
-                let request = StorageDeleteRequest {
-                    context: context.clone(),
-                    object_ref: object.object_ref,
-                };
-                match state
-                    .plugins
-                    .storage_delete(&object.storage_plugin_id, &request)
-                    .await
-                {
-                    Ok(response) if response.deleted => {}
-                    _ => ok = false,
-                }
+            match state
+                .plugins
+                .storage_delete(&object.storage_plugin_id, &request)
+                .await
+            {
+                Ok(response) if response.deleted => {}
+                _ => ok = false,
             }
-            if ok {
-                state
-                    .recordings
-                    .write()
-                    .await
-                    .remove(&recording.recording_id);
-                info!(recording_id = %recording.recording_id, "retention removed recording objects");
+        }
+        if ok {
+            if let Err(err) = state.store.delete_recording(&recording.recording_id).await {
+                warn!(recording_id = %recording.recording_id, error = %err,
+                    "retention deleted objects but could not drop the manifest");
+                continue;
             }
+            info!(recording_id = %recording.recording_id, "retention removed recording objects");
+        }
+    }
+    if state.incident_retention_days > 0
+        && let Err(err) = state
+            .store
+            .delete_closed_incidents_before(
+                Utc::now() - chrono::Duration::days(state.incident_retention_days),
+            )
+            .await
+    {
+        warn!(error = %err, "retention could not prune closed incidents");
+    }
+    if state.audit_retention_days > 0
+        && let Err(err) = state
+            .store
+            .delete_audit_before(Utc::now() - chrono::Duration::days(state.audit_retention_days))
+            .await
+    {
+        warn!(error = %err, "retention could not prune the audit log");
+    }
+}
+
+/// Record disconnects and recoveries. One writer, on the retention cadence.
+/// Effective status follows the same rule as the /cameras view: reported
+/// offline, or silent past the stale window. Idempotent against the store's
+/// one-open-incident-per-camera invariant, so no read-modify-write.
+async fn incident_pass(state: &AppState) {
+    if state.up_since.elapsed() < state.incident_grace {
+        return;
+    }
+    let records = match state.store.fleet_cameras().await {
+        Ok(records) => records,
+        Err(err) => {
+            warn!(error = %err, "incident pass could not list cameras");
+            return;
+        }
+    };
+    let now = Utc::now();
+    let live = newest_camera_map(&*state.camera_batches.read().await);
+    let mut revoked_gateways: std::collections::HashMap<String, bool> =
+        std::collections::HashMap::new();
+    for record in records {
+        let revoked = match revoked_gateways.get(&record.gateway_id) {
+            Some(&revoked) => revoked,
+            None => {
+                // A store failure reads as not revoked, as in authorized_gateway,
+                // so a hiccup leaves the pass behaving as it always did.
+                let revoked = state
+                    .store
+                    .gateway_revoked(&record.gateway_id)
+                    .await
+                    .unwrap_or(false);
+                revoked_gateways.insert(record.gateway_id.clone(), revoked);
+                revoked
+            }
+        };
+        if revoked {
+            // Not an outage. Closing every pass also heals an incident the
+            // revoke itself failed to close, or one opened before this rule.
+            if let Err(err) = state.store.close_incident(&record.id, now).await {
+                warn!(camera_id = %record.id, error = %err, "incident pass store failure");
+            }
+            continue;
+        }
+        let (last_seen, reported_offline, last_error) = match live.get(&record.id) {
+            Some(camera) => (
+                camera.last_seen,
+                camera.status == HealthStatus::Offline,
+                camera.last_error.clone(),
+            ),
+            None => (record.last_seen, false, None),
+        };
+        let stale = (now - last_seen).num_seconds() > state.stale_camera_seconds;
+        let result = if stale {
+            let started = last_seen + chrono::Duration::seconds(state.stale_camera_seconds);
+            state
+                .store
+                .open_incident(&record.id, started, Some("gateway telemetry is stale"))
+                .await
+        } else if reported_offline {
+            state
+                .store
+                .open_incident(&record.id, now, last_error.as_deref())
+                .await
+        } else {
+            state.store.close_incident(&record.id, now).await
+        };
+        if let Err(err) = result {
+            warn!(camera_id = %record.id, error = %err, "incident pass store failure");
         }
     }
 }
@@ -1060,15 +1473,31 @@ mod tests {
     use tower::ServiceExt;
 
     const SHARED_TOKEN: &str = "shared-bootstrap-token";
+    const ADMIN_PASSWORD: &str = "correct horse battery staple";
+
+    /// Seed the admin credential the way main() does at startup.
+    async fn seed_admin(state: &AppState) {
+        crate::auth::seed_admin_credential(state.store.as_ref(), Some(ADMIN_PASSWORD), false)
+            .await
+            .expect("seed admin credential");
+    }
 
     async fn test_state() -> AppState {
+        let store: Arc<dyn crate::store::Store> = Arc::new(
+            crate::store::SqliteStore::in_memory()
+                .await
+                .expect("in-memory store"),
+        );
+        test_state_with(store).await
+    }
+
+    async fn test_state_with(store: Arc<dyn crate::store::Store>) -> AppState {
         let dir = tempfile::tempdir().expect("temp plugin dir");
         let plugin_dir = dir.keep();
         AppState {
             gateways: Arc::new(RwLock::new(HashMap::new())),
             camera_batches: Arc::new(RwLock::new(HashMap::new())),
-            enrollments: Arc::new(RwLock::new(HashMap::new())),
-            gateway_tokens: Arc::new(RwLock::new(HashMap::new())),
+            store,
             gateway_token: Arc::from(SHARED_TOKEN),
             stale_camera_seconds: 75,
             // No ENTITLEMENTS_URL is set under test, so this resolves the
@@ -1080,11 +1509,18 @@ mod tests {
             plugin_dir: Arc::new(plugin_dir),
             command_queues: Arc::new(RwLock::new(HashMap::new())),
             commands: Arc::new(RwLock::new(HashMap::new())),
-            recordings: Arc::new(RwLock::new(HashMap::new())),
             default_storage_plugin: Arc::from("storage-s3"),
             default_ai_plugin: Arc::from("ai-http-adapter"),
             rtc: Arc::new(crate::turn::RtcConfig::default()),
             default_retention_days: 30,
+            login_throttle: Arc::new(tokio::sync::Mutex::new(
+                crate::auth::LoginThrottle::default(),
+            )),
+            cookie_secure: false,
+            incident_grace: Duration::ZERO,
+            incident_retention_days: 90,
+            audit_retention_days: 0,
+            up_since: std::time::Instant::now(),
         }
     }
 
@@ -1110,6 +1546,14 @@ mod tests {
         builder.body(Body::from(body.to_string())).unwrap()
     }
 
+    /// Attach a session cookie (from `login_cookie`) to an already-built request.
+    fn with_cookie(mut request: Request<Body>, cookie: &str) -> Request<Body> {
+        request
+            .headers_mut()
+            .insert("cookie", cookie.parse().unwrap());
+        request
+    }
+
     fn get(uri: &str) -> Request<Body> {
         Request::builder().uri(uri).body(Body::empty()).unwrap()
     }
@@ -1125,6 +1569,223 @@ mod tests {
             "sent_at": chrono::Utc::now(),
             "cameras": [],
         })
+    }
+
+    #[tokio::test]
+    async fn enrollment_and_gateway_token_live_in_the_store_not_in_memory() {
+        // Two AppStates sharing one store simulate an API restart: the second
+        // state has empty in-memory maps but the same database.
+        let file = tempfile::NamedTempFile::new().expect("temp db");
+        let url = format!("sqlite:{}", file.path().display());
+        let store: Arc<dyn crate::store::Store> = Arc::new(
+            crate::store::SqliteStore::connect(&url)
+                .await
+                .expect("store"),
+        );
+        let state = test_state_with(store.clone()).await;
+        seed_admin(&state).await;
+        let cookie = login_cookie(&state).await;
+
+        let (_, created) = send(
+            &state,
+            with_cookie(
+                post(
+                    "/api/v1/enrollments",
+                    None,
+                    serde_json::json!({
+                        "customer_id": "cust-1", "customer_name": "Customer",
+                        "site_id": "site-1", "site_name": "Site", "city": "Barcelona",
+                    }),
+                ),
+                &cookie,
+            ),
+        )
+        .await;
+        let enrollment_token = created["enrollment_token"].as_str().unwrap().to_owned();
+        let (status, enrolled) = send(
+            &state,
+            post(
+                "/api/v1/gateways/enroll",
+                None,
+                serde_json::json!({
+                    "enrollment_token": enrollment_token,
+                    "gateway_id": "gw-1", "hostname": "edge-1", "version": "0.1.0",
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let gateway_token = enrolled["gateway_token"].as_str().unwrap().to_owned();
+
+        // "Restart": a fresh AppState over a freshly opened store on the same file.
+        let store2: Arc<dyn crate::store::Store> = Arc::new(
+            crate::store::SqliteStore::connect(&url)
+                .await
+                .expect("reopen"),
+        );
+        let restarted = test_state_with(store2).await;
+        let (status, _) = send(
+            &restarted,
+            post(
+                "/api/v1/cameras/telemetry",
+                Some(&gateway_token),
+                telemetry_batch("gw-1"),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NO_CONTENT,
+            "an enrolled gateway must survive an API restart without re-enrolling"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_known_camera_reports_offline_after_a_restart_instead_of_vanishing() {
+        let file = tempfile::NamedTempFile::new().expect("temp db");
+        let url = format!("sqlite:{}", file.path().display());
+        let store: Arc<dyn crate::store::Store> = Arc::new(
+            crate::store::SqliteStore::connect(&url)
+                .await
+                .expect("store"),
+        );
+        let state = test_state_with(store).await;
+        seed_admin(&state).await;
+        with_camera(&state, "cam-1", "gw-1").await;
+
+        let store2: Arc<dyn crate::store::Store> = Arc::new(
+            crate::store::SqliteStore::connect(&url)
+                .await
+                .expect("reopen"),
+        );
+        let restarted = test_state_with(store2).await;
+        let cookie = login_cookie(&restarted).await;
+
+        let (status, cameras) =
+            send(&restarted, with_cookie(get("/api/v1/cameras"), &cookie)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            cameras.as_array().map(Vec::len),
+            Some(1),
+            "the camera vanished: {cameras}"
+        );
+        assert_eq!(cameras[0]["camera_id"], "cam-1");
+        assert_eq!(cameras[0]["status"], "offline");
+
+        let (_, fleet) = send(&restarted, with_cookie(get("/api/v1/fleet"), &cookie)).await;
+        assert_eq!(
+            fleet["source"], "live",
+            "a restart must not demote the dashboard to demo data"
+        );
+        assert_eq!(
+            fleet["customers"][0]["sites"][0]["cameras"][0]["status"],
+            "offline"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_completed_recording_survives_a_restart_and_appears_on_the_timeline() {
+        let file = tempfile::NamedTempFile::new().expect("temp db");
+        let url = format!("sqlite:{}", file.path().display());
+        let store: Arc<dyn crate::store::Store> = Arc::new(
+            crate::store::SqliteStore::connect(&url)
+                .await
+                .expect("store"),
+        );
+        let state = test_state_with(store).await;
+        seed_admin(&state).await;
+        with_camera(&state, "cam-1", "gw-1").await;
+        let cookie = login_cookie(&state).await;
+
+        let (_, accepted) = send(
+            &state,
+            with_cookie(
+                post(
+                    "/api/v1/cameras/cam-1/recordings",
+                    None,
+                    serde_json::json!({"duration_seconds": 10, "segment_seconds": 2}),
+                ),
+                &cookie,
+            ),
+        )
+        .await;
+        let command_id = accepted["command_id"].as_str().unwrap().to_owned();
+        // Collect it so completion is legal, then complete with a manifest.
+        let (_, _) = send(
+            &state,
+            Request::builder()
+                .uri("/api/v1/gateways/gw-1/commands/next")
+                .header("authorization", format!("Bearer {SHARED_TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        let now = chrono::Utc::now();
+        let (status, _) = send(
+            &state,
+            post(
+                &format!("/api/v1/gateways/gw-1/commands/{command_id}/complete"),
+                Some(SHARED_TOKEN),
+                serde_json::json!({
+                    "command_id": command_id, "gateway_id": "gw-1",
+                    "status": "succeeded", "completed_at": now, "error": null,
+                    "live": null, "analysis": null,
+                    "recording": {
+                        "recording_id": "rec-1", "camera_id": "cam-1", "gateway_id": "gw-1",
+                        "started_at": now, "ended_at": now,
+                        "codec": "avc1.640028", "width": 1920, "height": 1080,
+                        "init": {"storage_plugin_id": "storage-s3", "object_ref": "rec-1/init.mp4",
+                                  "object_key": "rec-1/init.mp4", "content_type": "video/mp4", "size_bytes": 1024},
+                        "segments": [], "delete_after": null,
+                    },
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let store2: Arc<dyn crate::store::Store> = Arc::new(
+            crate::store::SqliteStore::connect(&url)
+                .await
+                .expect("reopen"),
+        );
+        let restarted = test_state_with(store2).await;
+        let restarted_cookie = login_cookie(&restarted).await;
+        let (status, timeline) = send(
+            &restarted,
+            with_cookie(get("/api/v1/cameras/cam-1/recordings"), &restarted_cookie),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            timeline["recordings"][0]["recording_id"], "rec-1",
+            "a recording made before the restart must still be on the timeline"
+        );
+    }
+
+    #[tokio::test]
+    async fn retention_keeps_the_manifest_when_storage_delete_fails() {
+        // The storage plugin registry is empty under test, so every delete
+        // fails — after a retention pass the row must still be there, or a
+        // transient storage outage would orphan objects forever.
+        let state = test_state().await;
+        let mut expired = serde_json::from_value::<vms_domain::RecordingManifest>(serde_json::json!({
+            "recording_id": "rec-exp", "camera_id": "cam-1", "gateway_id": "gw-1",
+            "started_at": chrono::Utc::now(), "ended_at": chrono::Utc::now(),
+            "codec": "avc1.640028", "width": 1920, "height": 1080,
+            "init": {"storage_plugin_id": "storage-s3", "object_ref": "rec-exp/init.mp4",
+                      "object_key": "rec-exp/init.mp4", "content_type": "video/mp4", "size_bytes": 1},
+            "segments": [], "delete_after": null,
+        })).unwrap();
+        expired.delete_after = Some(chrono::Utc::now() - chrono::Duration::minutes(1));
+        state.store.save_recording(&expired).await.unwrap();
+
+        retention_pass(&state).await;
+
+        assert!(
+            state.store.recording("rec-exp").await.is_ok(),
+            "retention deleted the manifest although storage still holds the objects"
+        );
     }
 
     #[tokio::test]
@@ -1209,19 +1870,24 @@ mod tests {
     #[tokio::test]
     async fn an_enrolled_gateway_token_works_and_does_not_cover_other_gateways() {
         let state = test_state().await;
+        seed_admin(&state).await;
+        let cookie = login_cookie(&state).await;
 
         let (status, created) = send(
             &state,
-            post(
-                "/api/v1/enrollments",
-                None,
-                serde_json::json!({
-                    "customer_id": "cust-1",
-                    "customer_name": "Customer",
-                    "site_id": "site-1",
-                    "site_name": "Site",
-                    "city": "Barcelona",
-                }),
+            with_cookie(
+                post(
+                    "/api/v1/enrollments",
+                    None,
+                    serde_json::json!({
+                        "customer_id": "cust-1",
+                        "customer_name": "Customer",
+                        "site_id": "site-1",
+                        "site_name": "Site",
+                        "city": "Barcelona",
+                    }),
+                ),
+                &cookie,
             ),
         )
         .await;
@@ -1277,18 +1943,23 @@ mod tests {
     #[tokio::test]
     async fn an_enrollment_token_cannot_be_used_twice() {
         let state = test_state().await;
+        seed_admin(&state).await;
+        let cookie = login_cookie(&state).await;
         let (_, created) = send(
             &state,
-            post(
-                "/api/v1/enrollments",
-                None,
-                serde_json::json!({
-                    "customer_id": "cust-1",
-                    "customer_name": "Customer",
-                    "site_id": "site-1",
-                    "site_name": "Site",
-                    "city": "Barcelona",
-                }),
+            with_cookie(
+                post(
+                    "/api/v1/enrollments",
+                    None,
+                    serde_json::json!({
+                        "customer_id": "cust-1",
+                        "customer_name": "Customer",
+                        "site_id": "site-1",
+                        "site_name": "Site",
+                        "city": "Barcelona",
+                    }),
+                ),
+                &cookie,
             ),
         )
         .await;
@@ -1349,13 +2020,15 @@ mod tests {
         // 502 says "the upstream failed", which invites a retry. There is no
         // upstream here — the id is wrong, and no amount of retrying fixes that.
         let state = test_state().await;
+        seed_admin(&state).await;
+        let cookie = login_cookie(&state).await;
         for path in [
             "/api/v1/plugins/nope/health",
             "/api/v1/plugins/nope/ai/analyze",
             "/api/v1/plugins/nope/storage/uploads",
         ] {
             let request = if path.ends_with("health") {
-                get(path)
+                with_cookie(get(path), &cookie)
             } else {
                 post(path, None, serde_json::json!({}))
             };
@@ -1366,14 +2039,24 @@ mod tests {
                 "{path} reported an outage for a plugin that does not exist"
             );
         }
-        let (status, _) = send(&state, get("/api/v1/plugins/nope/health")).await;
+        let (status, _) = send(
+            &state,
+            with_cookie(get("/api/v1/plugins/nope/health"), &cookie),
+        )
+        .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
     async fn an_unknown_command_is_a_404_not_a_500() {
         let state = test_state().await;
-        let (status, _) = send(&state, get("/api/v1/commands/does-not-exist")).await;
+        seed_admin(&state).await;
+        let cookie = login_cookie(&state).await;
+        let (status, _) = send(
+            &state,
+            with_cookie(get("/api/v1/commands/does-not-exist"), &cookie),
+        )
+        .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
@@ -1411,14 +2094,19 @@ mod tests {
         // The whole point of the outbound design: the cloud never dials the
         // gateway, it parks a command that the gateway picks up on its own poll.
         let state = test_state().await;
+        seed_admin(&state).await;
+        let cookie = login_cookie(&state).await;
         with_camera(&state, "cam-1", "gw-1").await;
 
         let (status, accepted) = send(
             &state,
-            post(
-                "/api/v1/cameras/cam-1/live",
-                None,
-                serde_json::json!({"offer_sdp": "v=0\r\n", "offer_type": "offer"}),
+            with_cookie(
+                post(
+                    "/api/v1/cameras/cam-1/live",
+                    None,
+                    serde_json::json!({"offer_sdp": "v=0\r\n", "offer_type": "offer"}),
+                ),
+                &cookie,
             ),
         )
         .await;
@@ -1492,7 +2180,11 @@ mod tests {
             "completing a collected command failed with {status}"
         );
 
-        let (status, view) = send(&state, get(&format!("/api/v1/commands/{command_id}"))).await;
+        let (status, view) = send(
+            &state,
+            with_cookie(get(&format!("/api/v1/commands/{command_id}")), &cookie),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(view["command"]["id"], command_id.as_str());
         assert_eq!(
@@ -1504,16 +2196,878 @@ mod tests {
     #[tokio::test]
     async fn a_live_request_for_an_unknown_camera_is_a_404() {
         let state = test_state().await;
+        seed_admin(&state).await;
+        let cookie = login_cookie(&state).await;
         let (status, _) = send(
             &state,
-            post(
-                "/api/v1/cameras/no-such-camera/live",
-                None,
-                serde_json::json!({"offer_sdp": "v=0\r\n"}),
+            with_cookie(
+                post(
+                    "/api/v1/cameras/no-such-camera/live",
+                    None,
+                    serde_json::json!({"offer_sdp": "v=0\r\n"}),
+                ),
+                &cookie,
             ),
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// Enroll gw-1 end to end and return its per-gateway token.
+    async fn enrolled_gateway_token(state: &AppState, cookie: &str) -> String {
+        let mut request = post(
+            "/api/v1/enrollments",
+            None,
+            serde_json::json!({
+                "customer_id": "cust-1", "customer_name": "Customer",
+                "site_id": "site-1", "site_name": "Site", "city": "Barcelona",
+            }),
+        );
+        request
+            .headers_mut()
+            .insert("cookie", cookie.parse().unwrap());
+        let (_, created) = send(state, request).await;
+        let enrollment_token = created["enrollment_token"].as_str().unwrap().to_owned();
+        let (_, enrolled) = send(
+            state,
+            post(
+                "/api/v1/gateways/enroll",
+                None,
+                serde_json::json!({
+                    "enrollment_token": enrollment_token,
+                    "gateway_id": "gw-1", "hostname": "edge-1", "version": "0.1.0",
+                }),
+            ),
+        )
+        .await;
+        enrolled["gateway_token"].as_str().unwrap().to_owned()
+    }
+
+    #[tokio::test]
+    async fn a_revoked_gateway_is_refused_every_credential_until_it_reenrolls() {
+        let state = test_state().await;
+        seed_admin(&state).await;
+        let cookie = login_cookie(&state).await;
+        let gateway_token = enrolled_gateway_token(&state, &cookie).await;
+
+        // Sanity: both credentials work before the revoke.
+        let (status, _) = send(
+            &state,
+            post(
+                "/api/v1/cameras/telemetry",
+                Some(&gateway_token),
+                telemetry_batch("gw-1"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, _) = send(
+            &state,
+            post(
+                "/api/v1/cameras/telemetry",
+                Some(SHARED_TOKEN),
+                telemetry_batch("gw-1"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let mut request = post("/api/v1/gateways/gw-1/revoke", None, serde_json::json!({}));
+        request
+            .headers_mut()
+            .insert("cookie", cookie.parse().unwrap());
+        let (status, _) = send(&state, request).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (status, _) = send(
+            &state,
+            post(
+                "/api/v1/cameras/telemetry",
+                Some(&gateway_token),
+                telemetry_batch("gw-1"),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "the revoked token still worked"
+        );
+        let (status, _) = send(
+            &state,
+            post(
+                "/api/v1/cameras/telemetry",
+                Some(SHARED_TOKEN),
+                telemetry_batch("gw-1"),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "revocation must beat the bootstrap secret"
+        );
+
+        // A fresh admin-issued enrollment is the un-revoke.
+        let new_token = enrolled_gateway_token(&state, &cookie).await;
+        let (status, _) = send(
+            &state,
+            post(
+                "/api/v1/cameras/telemetry",
+                Some(&new_token),
+                telemetry_batch("gw-1"),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NO_CONTENT,
+            "re-enrollment must restore access"
+        );
+
+        // Revoking an unknown gateway is a 404, not a silent success.
+        let mut request = post(
+            "/api/v1/gateways/gw-nope/revoke",
+            None,
+            serde_json::json!({}),
+        );
+        request
+            .headers_mut()
+            .insert("cookie", cookie.parse().unwrap());
+        let (status, _) = send(&state, request).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_revocation_survives_a_restart() {
+        let file = tempfile::NamedTempFile::new().expect("temp db");
+        let url = format!("sqlite:{}", file.path().display());
+        let store: Arc<dyn crate::store::Store> = Arc::new(
+            crate::store::SqliteStore::connect(&url)
+                .await
+                .expect("store"),
+        );
+        let state = test_state_with(store).await;
+        seed_admin(&state).await;
+        let cookie = login_cookie(&state).await;
+        let gateway_token = enrolled_gateway_token(&state, &cookie).await;
+        let mut request = post("/api/v1/gateways/gw-1/revoke", None, serde_json::json!({}));
+        request
+            .headers_mut()
+            .insert("cookie", cookie.parse().unwrap());
+        send(&state, request).await;
+
+        let store2: Arc<dyn crate::store::Store> = Arc::new(
+            crate::store::SqliteStore::connect(&url)
+                .await
+                .expect("reopen"),
+        );
+        let restarted = test_state_with(store2).await;
+        let (status, _) = send(
+            &restarted,
+            post(
+                "/api/v1/cameras/telemetry",
+                Some(&gateway_token),
+                telemetry_batch("gw-1"),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "a restart must not resurrect a revoked gateway"
+        );
+        let (status, _) = send(
+            &restarted,
+            post(
+                "/api/v1/cameras/telemetry",
+                Some(SHARED_TOKEN),
+                telemetry_batch("gw-1"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn the_gateways_screen_shows_the_roster_not_just_the_loud() {
+        let state = test_state().await;
+        seed_admin(&state).await;
+        let cookie = login_cookie(&state).await;
+        let _ = enrolled_gateway_token(&state, &cookie).await; // gw-1, enrolled, silent
+        let mut request = post("/api/v1/gateways/gw-1/revoke", None, serde_json::json!({}));
+        request
+            .headers_mut()
+            .insert("cookie", cookie.parse().unwrap());
+        send(&state, request).await;
+
+        // gw-live heartbeats but is not in the store roster.
+        let (status, _) = send(
+            &state,
+            post(
+                "/api/v1/gateways/heartbeat",
+                Some(SHARED_TOKEN),
+                serde_json::json!({
+                    "gateway_id": "gw-live", "site_id": "site-9", "hostname": "edge-9",
+                    "version": "0.1.0", "uptime_seconds": 60, "cpu_percent": 1.0,
+                    "memory_percent": 1.0, "cameras_seen": 0, "healthy_cameras": 0,
+                    "warning_cameras": 0, "offline_cameras": 0, "sent_at": chrono::Utc::now(),
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let mut request = get("/api/v1/gateways");
+        request
+            .headers_mut()
+            .insert("cookie", cookie.parse().unwrap());
+        let (status, body) = send(&state, request).await;
+        assert_eq!(status, StatusCode::OK);
+        let list = body.as_array().expect("a list");
+        assert_eq!(list.len(), 2, "roster + live must both show: {body}");
+        let gw1 = list.iter().find(|v| v["gateway_id"] == "gw-1").unwrap();
+        assert!(
+            !gw1["revoked_at"].is_null(),
+            "the revoked flag must reach the screen"
+        );
+        assert_eq!(gw1["online"], false);
+        let live = list.iter().find(|v| v["gateway_id"] == "gw-live").unwrap();
+        assert_eq!(live["online"], true);
+        assert!(
+            !live["heartbeat"].is_null(),
+            "a live gateway carries its report"
+        );
+    }
+
+    /// Every route the browser touches. The router in build_router has exactly
+    /// two groups; when you add a protected route there, add it here or the
+    /// with-a-session test below cannot vouch for it.
+    const PROTECTED_ROUTES: &[(&str, &str)] = &[
+        ("GET", "/api/v1/fleet"),
+        ("GET", "/api/v1/incidents"),
+        ("GET", "/api/v1/audit"),
+        ("GET", "/api/v1/cameras"),
+        ("GET", "/api/v1/gateways"),
+        ("POST", "/api/v1/gateways/gw-1/revoke"),
+        ("POST", "/api/v1/enrollments"),
+        ("GET", "/api/v1/commands/cmd-1"),
+        ("GET", "/api/v1/rtc/config"),
+        ("POST", "/api/v1/cameras/cam-1/live"),
+        ("POST", "/api/v1/cameras/cam-1/analyze"),
+        ("POST", "/api/v1/cameras/cam-1/recordings"),
+        ("GET", "/api/v1/cameras/cam-1/recordings"),
+        ("GET", "/api/v1/recordings/rec-1/playback"),
+        ("GET", "/api/v1/plugins"),
+        ("POST", "/api/v1/plugins/reload"),
+        ("GET", "/api/v1/plugins/p-1/health"),
+        ("POST", "/api/v1/plugins/p-1/storage/downloads"),
+        ("POST", "/api/v1/plugins/p-1/storage/delete"),
+        ("POST", "/api/v1/auth/logout"),
+        ("POST", "/api/v1/auth/password"),
+    ];
+
+    fn protected_request(method: &str, uri: &str) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap()
+    }
+
+    async fn login_cookie(state: &AppState) -> String {
+        let response = build_router(state.clone())
+            .oneshot(post(
+                "/api/v1/auth/login",
+                None,
+                serde_json::json!({ "password": ADMIN_PASSWORD }),
+            ))
+            .await
+            .expect("router responds");
+        assert_eq!(response.status(), StatusCode::NO_CONTENT, "login refused");
+        let set_cookie = response
+            .headers()
+            .get(axum::http::header::SET_COOKIE)
+            .expect("login must set a cookie")
+            .to_str()
+            .unwrap();
+        assert!(
+            set_cookie.contains("HttpOnly"),
+            "cookie missing HttpOnly: {set_cookie}"
+        );
+        assert!(
+            set_cookie.contains("SameSite=Lax"),
+            "cookie missing SameSite: {set_cookie}"
+        );
+        set_cookie.split(';').next().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn the_incident_list_needs_a_session_and_shows_open_incidents() {
+        let state = test_state().await;
+        seed_admin(&state).await;
+        let (status, _) = send(&state, get("/api/v1/incidents")).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        state
+            .store
+            .open_incident("cam-1", Utc::now(), Some("gateway telemetry is stale"))
+            .await
+            .unwrap();
+        let cookie = login_cookie(&state).await;
+        let mut request = get("/api/v1/incidents");
+        request
+            .headers_mut()
+            .insert("cookie", cookie.parse().unwrap());
+        let (status, body) = send(&state, request).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body[0]["camera_id"], "cam-1");
+        assert!(body[0]["ended_at"].is_null());
+        assert_eq!(body[0]["detail"], "gateway telemetry is stale");
+    }
+
+    #[tokio::test]
+    async fn an_open_incident_survives_a_restart_and_recovery_closes_it() {
+        let file = tempfile::NamedTempFile::new().expect("temp db");
+        let url = format!("sqlite:{}", file.path().display());
+        let store: Arc<dyn crate::store::Store> = Arc::new(
+            crate::store::SqliteStore::connect(&url)
+                .await
+                .expect("store"),
+        );
+        let state = test_state_with(store).await;
+        let went_dark = Utc::now() - chrono::Duration::seconds(300);
+        state
+            .store
+            .upsert_fleet_identity(
+                &typed_batch("gw-1", "cam-1", HealthStatus::Healthy, went_dark, None),
+                went_dark,
+            )
+            .await
+            .unwrap();
+        incident_pass(&state).await;
+        assert_eq!(state.store.incidents(10).await.unwrap().len(), 1);
+
+        let store2: Arc<dyn crate::store::Store> = Arc::new(
+            crate::store::SqliteStore::connect(&url)
+                .await
+                .expect("reopen"),
+        );
+        let restarted = test_state_with(store2).await;
+        let open = restarted.store.incidents(10).await.unwrap();
+        assert_eq!(open.len(), 1, "the incident vanished across the restart");
+        assert!(open[0].ended_at.is_none());
+
+        restarted.camera_batches.write().await.insert(
+            "gw-1".into(),
+            typed_batch("gw-1", "cam-1", HealthStatus::Healthy, Utc::now(), None),
+        );
+        incident_pass(&restarted).await;
+        assert!(
+            restarted.store.incidents(10).await.unwrap()[0]
+                .ended_at
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn retention_prunes_old_closed_incidents_but_never_open_ones() {
+        let state = test_state().await;
+        let now = Utc::now();
+        state
+            .store
+            .open_incident("cam-old", now - chrono::Duration::days(120), None)
+            .await
+            .unwrap();
+        state
+            .store
+            .close_incident("cam-old", now - chrono::Duration::days(119))
+            .await
+            .unwrap();
+        state
+            .store
+            .open_incident("cam-stuck", now - chrono::Duration::days(200), None)
+            .await
+            .unwrap();
+
+        retention_pass(&state).await;
+
+        let left = state.store.incidents(10).await.unwrap();
+        assert_eq!(
+            left.len(),
+            1,
+            "the 119-day-old closed incident must be pruned: {left:?}"
+        );
+        assert_eq!(left[0].camera_id, "cam-stuck");
+        assert!(left[0].ended_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn incident_retention_zero_keeps_everything() {
+        let mut state = test_state().await;
+        state.incident_retention_days = 0;
+        let now = Utc::now();
+        state
+            .store
+            .open_incident("cam-old", now - chrono::Duration::days(400), None)
+            .await
+            .unwrap();
+        state
+            .store
+            .close_incident("cam-old", now - chrono::Duration::days(399))
+            .await
+            .unwrap();
+
+        retention_pass(&state).await;
+
+        assert_eq!(state.store.incidents(10).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn every_protected_route_is_401_without_a_session() {
+        let state = test_state().await;
+        seed_admin(&state).await;
+        for (method, uri) in PROTECTED_ROUTES {
+            let (status, _) = send(&state, protected_request(method, uri)).await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "{method} {uri} answered without a session"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn with_a_session_no_protected_route_says_unauthorized() {
+        let state = test_state().await;
+        seed_admin(&state).await;
+        // A fresh session per route: the table contains logout, which kills the session it is called with.
+        for (method, uri) in PROTECTED_ROUTES {
+            let cookie = login_cookie(&state).await;
+            let mut request = protected_request(method, uri);
+            request
+                .headers_mut()
+                .insert("cookie", cookie.parse().unwrap());
+            let (status, _) = send(&state, request).await;
+            assert_ne!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "{method} {uri} rejected a valid session"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_wrong_password_is_401_and_counts_against_the_throttle() {
+        let state = test_state().await;
+        seed_admin(&state).await;
+        let (status, _) = send(
+            &state,
+            post(
+                "/api/v1/auth/login",
+                None,
+                serde_json::json!({ "password": "wrong" }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(state.login_throttle.lock().await.consecutive(), 1);
+
+        // A later success resets the count.
+        let _ = login_cookie(&state).await;
+        assert_eq!(state.login_throttle.lock().await.consecutive(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_failed_login_is_audited_with_how_many_in_a_row() {
+        let state = test_state().await;
+        seed_admin(&state).await;
+        for _ in 0..2 {
+            let (status, _) = send(
+                &state,
+                post(
+                    "/api/v1/auth/login",
+                    None,
+                    serde_json::json!({ "password": "wrong" }),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+        }
+        let details: Vec<_> = state
+            .store
+            .audit_entries(10)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.action == "login.failed")
+            .map(|e| e.detail)
+            .collect();
+        // An operator reading the log sees a burst, not two identical rows.
+        assert!(
+            details.contains(&Some("1 wrong password in a row".to_string()))
+                && details.contains(&Some("2 wrong passwords in a row".to_string())),
+            "the failed-login rows must count the run: {details:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_wrong_current_password_leaves_an_audit_row() {
+        let state = test_state().await;
+        seed_admin(&state).await;
+        let cookie = login_cookie(&state).await;
+        let mut request = post(
+            "/api/v1/auth/password",
+            None,
+            serde_json::json!({ "current": "not the password", "new": "an entirely new passphrase" }),
+        );
+        request
+            .headers_mut()
+            .insert("cookie", cookie.parse().unwrap());
+        let (status, _) = send(&state, request).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        // Every credential failure leaves a row, or the count a failed login
+        // reports covers attempts with nothing behind them.
+        let rows: Vec<_> = state
+            .store
+            .audit_entries(10)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.action == "password.change.failed")
+            .collect();
+        assert_eq!(rows.len(), 1, "one failed change, one row");
+        assert_eq!(
+            rows[0].detail,
+            Some("1 wrong password in a row".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn the_session_check_reports_alive_or_not() {
+        let state = test_state().await;
+        seed_admin(&state).await;
+        let (status, _) = send(&state, get("/api/v1/auth/session")).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let cookie = login_cookie(&state).await;
+        let mut request = get("/api/v1/auth/session");
+        request
+            .headers_mut()
+            .insert("cookie", cookie.parse().unwrap());
+        let (status, _) = send(&state, request).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        // A forged cookie is not a session.
+        let mut request = get("/api/v1/auth/session");
+        request
+            .headers_mut()
+            .insert("cookie", "vms_session=forged".parse().unwrap());
+        let (status, _) = send(&state, request).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn logout_invalidates_the_session_and_clears_the_cookie() {
+        let state = test_state().await;
+        seed_admin(&state).await;
+        let cookie = login_cookie(&state).await;
+
+        let mut request = post("/api/v1/auth/logout", None, serde_json::json!({}));
+        request
+            .headers_mut()
+            .insert("cookie", cookie.parse().unwrap());
+        let response = build_router(state.clone()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let cleared = response
+            .headers()
+            .get(axum::http::header::SET_COOKIE)
+            .expect("logout must clear the cookie")
+            .to_str()
+            .unwrap();
+        assert!(
+            cleared.contains("Max-Age=0"),
+            "not a clearing cookie: {cleared}"
+        );
+
+        let mut request = get("/api/v1/auth/session");
+        request
+            .headers_mut()
+            .insert("cookie", cookie.parse().unwrap());
+        let (status, _) = send(&state, request).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "the session survived logout"
+        );
+    }
+
+    #[tokio::test]
+    async fn changing_the_password_kills_other_sessions_and_keeps_the_caller() {
+        let state = test_state().await;
+        seed_admin(&state).await;
+        let other = login_cookie(&state).await;
+        let caller = login_cookie(&state).await;
+
+        let mut request = post(
+            "/api/v1/auth/password",
+            None,
+            serde_json::json!({ "current": ADMIN_PASSWORD, "new": "an entirely new passphrase" }),
+        );
+        request
+            .headers_mut()
+            .insert("cookie", caller.parse().unwrap());
+        let response = build_router(state.clone()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let fresh = response
+            .headers()
+            .get(axum::http::header::SET_COOKIE)
+            .expect("password change must re-mint the caller's session")
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+
+        // The other session is dead, the fresh one lives.
+        let mut request = get("/api/v1/auth/session");
+        request
+            .headers_mut()
+            .insert("cookie", other.parse().unwrap());
+        let (status, _) = send(&state, request).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "the old session outlived the change"
+        );
+        let mut request = get("/api/v1/auth/session");
+        request
+            .headers_mut()
+            .insert("cookie", fresh.parse().unwrap());
+        let (status, _) = send(&state, request).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        // And only the new password logs in now.
+        let (status, _) = send(
+            &state,
+            post(
+                "/api/v1/auth/login",
+                None,
+                serde_json::json!({ "password": ADMIN_PASSWORD }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, _) = send(
+            &state,
+            post(
+                "/api/v1/auth/login",
+                None,
+                serde_json::json!({ "password": "an entirely new passphrase" }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn a_password_change_needs_the_current_password_and_a_long_enough_new_one() {
+        let state = test_state().await;
+        seed_admin(&state).await;
+        let cookie = login_cookie(&state).await;
+
+        let mut request = post(
+            "/api/v1/auth/password",
+            None,
+            serde_json::json!({ "current": "not the password", "new": "long enough replacement" }),
+        );
+        request
+            .headers_mut()
+            .insert("cookie", cookie.parse().unwrap());
+        let (status, _) = send(&state, request).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        let mut request = post(
+            "/api/v1/auth/password",
+            None,
+            serde_json::json!({ "current": ADMIN_PASSWORD, "new": "short" }),
+        );
+        request
+            .headers_mut()
+            .insert("cookie", cookie.parse().unwrap());
+        let (status, _) = send(&state, request).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+        // Both refusals left the credential untouched.
+        let (status, _) = send(
+            &state,
+            post(
+                "/api/v1/auth/login",
+                None,
+                serde_json::json!({ "password": ADMIN_PASSWORD }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn a_wrong_current_password_on_change_counts_against_the_throttle() {
+        // A stolen session must not be an unthrottled oracle for guessing the
+        // real password; wrong `current` costs the same growing delay a failed
+        // login does.
+        let state = test_state().await;
+        seed_admin(&state).await;
+        let cookie = login_cookie(&state).await;
+
+        let mut request = post(
+            "/api/v1/auth/password",
+            None,
+            serde_json::json!({ "current": "not the password", "new": "long enough replacement" }),
+        );
+        request
+            .headers_mut()
+            .insert("cookie", cookie.parse().unwrap());
+        let (status, _) = send(&state, request).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            state.login_throttle.lock().await.consecutive(),
+            1,
+            "a wrong current password must register a throttle failure"
+        );
+
+        // Proving knowledge of the password resets the counter, same as login.
+        let mut request = post(
+            "/api/v1/auth/password",
+            None,
+            serde_json::json!({ "current": ADMIN_PASSWORD, "new": "an entirely fresh passphrase" }),
+        );
+        request
+            .headers_mut()
+            .insert("cookie", cookie.parse().unwrap());
+        let (status, _) = send(&state, request).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(state.login_throttle.lock().await.consecutive(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_machine_plugin_endpoints_demand_a_gateway_bearer() {
+        // These two are what the edge gateway calls to mint signed upload
+        // URLs and spend AI quota; leaving them open let anyone do both.
+        let state = test_state().await;
+        seed_admin(&state).await;
+        for uri in [
+            "/api/v1/plugins/p-1/ai/analyze",
+            "/api/v1/plugins/p-1/storage/uploads",
+        ] {
+            let (status, _) = send(&state, post(uri, None, serde_json::json!({}))).await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "{uri} answered without a bearer"
+            );
+
+            let (status, _) = send(
+                &state,
+                post(uri, Some("not-a-token"), serde_json::json!({})),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "{uri} accepted a wrong bearer"
+            );
+
+            // A dashboard session cookie is not a machine credential.
+            let cookie = login_cookie(&state).await;
+            let mut request = post(uri, None, serde_json::json!({}));
+            request
+                .headers_mut()
+                .insert("cookie", cookie.parse().unwrap());
+            let (status, _) = send(&state, request).await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "{uri} accepted a session cookie"
+            );
+
+            // The shared bootstrap token passes; 404 (no such plugin) is fine.
+            let (status, _) =
+                send(&state, post(uri, Some(SHARED_TOKEN), serde_json::json!({}))).await;
+            assert_ne!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "{uri} refused the shared token"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_enrolled_gateways_token_opens_the_machine_plugin_endpoints() {
+        let state = test_state().await;
+        seed_admin(&state).await;
+        let cookie = login_cookie(&state).await;
+        let mut request = post(
+            "/api/v1/enrollments",
+            None,
+            serde_json::json!({
+                "customer_id": "cust-1", "customer_name": "Customer",
+                "site_id": "site-1", "site_name": "Site", "city": "Barcelona",
+            }),
+        );
+        request
+            .headers_mut()
+            .insert("cookie", cookie.parse().unwrap());
+        let (_, created) = send(&state, request).await;
+        let enrollment_token = created["enrollment_token"].as_str().unwrap().to_owned();
+        let (_, enrolled) = send(
+            &state,
+            post(
+                "/api/v1/gateways/enroll",
+                None,
+                serde_json::json!({
+                    "enrollment_token": enrollment_token,
+                    "gateway_id": "gw-1", "hostname": "edge-1", "version": "0.1.0",
+                }),
+            ),
+        )
+        .await;
+        let gateway_token = enrolled["gateway_token"].as_str().unwrap().to_owned();
+
+        let (status, _) = send(
+            &state,
+            post(
+                "/api/v1/plugins/p-1/storage/uploads",
+                Some(&gateway_token),
+                serde_json::json!({}),
+            ),
+        )
+        .await;
+        assert_ne!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "an enrolled gateway's own token must open the machine plugin endpoints"
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_machine_endpoints_take_bearer_tokens_not_cookies() {
+        // The middleware must not swallow the machine surface.
+        let state = test_state().await;
+        seed_admin(&state).await;
+        let (status, _) = send(
+            &state,
+            post(
+                "/api/v1/cameras/telemetry",
+                Some(SHARED_TOKEN),
+                telemetry_batch("gw-1"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
     }
 
     #[tokio::test]
@@ -1522,10 +3076,26 @@ mod tests {
         // against it and not merely be present.
         let state = test_state().await;
         state
-            .gateway_tokens
-            .write()
+            .store
+            .enroll_gateway(
+                &EnrollmentRequest {
+                    customer_id: "cust-1".into(),
+                    customer_name: "Customer".into(),
+                    site_id: "site-1".into(),
+                    site_name: "Site".into(),
+                    city: "Barcelona".into(),
+                },
+                &GatewayEnrollmentRequest {
+                    enrollment_token: String::new(),
+                    gateway_id: "gw-1".into(),
+                    hostname: "edge".into(),
+                    version: "0.1.0".into(),
+                },
+                "token-for-gw-1",
+                Utc::now(),
+            )
             .await
-            .insert("gw-1".into(), "token-for-gw-1".into());
+            .unwrap();
         let (status, _) = send(
             &state,
             Request::builder()
@@ -1536,5 +3106,611 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn the_retention_pass_sweeps_expired_sessions() {
+        let state = test_state().await;
+        let now = Utc::now();
+        state
+            .store
+            .create_session(
+                "expired",
+                now - chrono::Duration::days(8),
+                now - chrono::Duration::days(1),
+            )
+            .await
+            .unwrap();
+        state
+            .store
+            .create_session("alive", now, now + chrono::Duration::days(7))
+            .await
+            .unwrap();
+
+        retention_pass(&state).await;
+
+        assert!(
+            !state
+                .store
+                .session_is_valid("expired", now - chrono::Duration::days(2))
+                .await
+                .unwrap(),
+            "the expired row should be gone even for a past `now`"
+        );
+        assert!(state.store.session_is_valid("alive", now).await.unwrap());
+    }
+
+    fn typed_batch(
+        gateway_id: &str,
+        camera_id: &str,
+        status: HealthStatus,
+        last_seen: chrono::DateTime<chrono::Utc>,
+        last_error: Option<&str>,
+    ) -> CameraTelemetryBatch {
+        CameraTelemetryBatch {
+            gateway_id: gateway_id.into(),
+            customer_id: "cust-1".into(),
+            customer_name: "Customer".into(),
+            site_id: "site-1".into(),
+            site_name: "Site".into(),
+            city: "Barcelona".into(),
+            sent_at: last_seen,
+            cameras: vec![CameraTelemetry {
+                camera_id: camera_id.into(),
+                gateway_id: gateway_id.into(),
+                site_id: "site-1".into(),
+                name: "Entrance".into(),
+                status,
+                manufacturer: None,
+                model: None,
+                firmware: None,
+                profile_name: None,
+                codec: None,
+                width: None,
+                height: None,
+                fps: None,
+                bitrate_kbps: None,
+                packet_loss: 0,
+                reconnects: 0,
+                rtsp_endpoint: None,
+                last_seen,
+                last_error: last_error.map(Into::into),
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn a_silent_camera_opens_a_backdated_incident_and_recovery_closes_it() {
+        let state = test_state().await;
+        let went_dark = Utc::now() - chrono::Duration::seconds(300);
+        // In the roster with an old last_seen and no live telemetry: silence.
+        state
+            .store
+            .upsert_fleet_identity(
+                &typed_batch("gw-1", "cam-1", HealthStatus::Healthy, went_dark, None),
+                went_dark,
+            )
+            .await
+            .unwrap();
+
+        incident_pass(&state).await;
+
+        let incidents = state.store.incidents(10).await.unwrap();
+        assert_eq!(incidents.len(), 1);
+        assert!(incidents[0].ended_at.is_none());
+        let expected_start = went_dark + chrono::Duration::seconds(state.stale_camera_seconds);
+        assert_eq!(
+            incidents[0].started_at.timestamp(),
+            expected_start.timestamp(),
+            "silence must backdate to when the camera actually went dark"
+        );
+        assert_eq!(
+            incidents[0].detail.as_deref(),
+            Some("gateway telemetry is stale")
+        );
+
+        // A second silent pass must not open another one.
+        incident_pass(&state).await;
+        assert_eq!(state.store.incidents(10).await.unwrap().len(), 1);
+
+        // Fresh healthy telemetry closes it.
+        state.camera_batches.write().await.insert(
+            "gw-1".into(),
+            typed_batch("gw-1", "cam-1", HealthStatus::Healthy, Utc::now(), None),
+        );
+        incident_pass(&state).await;
+        let incidents = state.store.incidents(10).await.unwrap();
+        assert_eq!(incidents.len(), 1);
+        assert!(
+            incidents[0].ended_at.is_some(),
+            "recovery must close the incident"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_camera_reported_offline_opens_an_incident_with_its_error() {
+        let state = test_state().await;
+        let now = Utc::now();
+        state
+            .store
+            .upsert_fleet_identity(
+                &typed_batch(
+                    "gw-1",
+                    "cam-1",
+                    HealthStatus::Offline,
+                    now,
+                    Some("rtsp: connection refused"),
+                ),
+                now,
+            )
+            .await
+            .unwrap();
+        state.camera_batches.write().await.insert(
+            "gw-1".into(),
+            typed_batch(
+                "gw-1",
+                "cam-1",
+                HealthStatus::Offline,
+                now,
+                Some("rtsp: connection refused"),
+            ),
+        );
+
+        incident_pass(&state).await;
+
+        let incidents = state.store.incidents(10).await.unwrap();
+        assert_eq!(incidents.len(), 1);
+        assert!(incidents[0].ended_at.is_none());
+        assert_eq!(
+            incidents[0].detail.as_deref(),
+            Some("rtsp: connection refused")
+        );
+    }
+
+    #[test]
+    fn the_newest_report_wins_when_a_camera_appears_in_two_batches() {
+        // Batches are keyed by gateway and never pruned, so a camera that
+        // moved gateways exists in two of them until a restart. The winner
+        // must be the freshest report, not whichever the map iterated last.
+        let old = Utc::now() - chrono::Duration::seconds(300);
+        let fresh = Utc::now();
+        let mut batches = HashMap::new();
+        batches.insert(
+            "gw-old".to_string(),
+            typed_batch(
+                "gw-old",
+                "cam-1",
+                HealthStatus::Offline,
+                old,
+                Some("stale copy"),
+            ),
+        );
+        batches.insert(
+            "gw-new".to_string(),
+            typed_batch("gw-new", "cam-1", HealthStatus::Healthy, fresh, None),
+        );
+
+        let live = newest_camera_map(&batches);
+
+        assert_eq!(live.len(), 1);
+        assert_eq!(live["cam-1"].gateway_id, "gw-new");
+        assert_eq!(live["cam-1"].status, HealthStatus::Healthy);
+    }
+
+    #[tokio::test]
+    async fn a_camera_that_moved_gateways_is_not_blamed_for_its_old_gateways_ghost() {
+        // The false-incident scenario from the final review: the dead
+        // gateway's last batch lingers with a stale offline copy. Eight
+        // ghosts make an arbitrary-winner implementation fail reliably.
+        let state = test_state().await;
+        let now = Utc::now();
+        state
+            .store
+            .upsert_fleet_identity(
+                &typed_batch("gw-new", "cam-1", HealthStatus::Healthy, now, None),
+                now,
+            )
+            .await
+            .unwrap();
+        let stale = now - chrono::Duration::seconds(300);
+        for n in 0..8 {
+            state.camera_batches.write().await.insert(
+                format!("gw-ghost-{n}"),
+                typed_batch(
+                    &format!("gw-ghost-{n}"),
+                    "cam-1",
+                    HealthStatus::Offline,
+                    stale,
+                    Some("stale copy"),
+                ),
+            );
+        }
+        state.camera_batches.write().await.insert(
+            "gw-new".into(),
+            typed_batch("gw-new", "cam-1", HealthStatus::Healthy, now, None),
+        );
+
+        incident_pass(&state).await;
+        assert!(
+            state.store.incidents(10).await.unwrap().is_empty(),
+            "a moved camera must not get an incident from its old gateway's ghost"
+        );
+
+        seed_admin(&state).await;
+        let cookie = login_cookie(&state).await;
+        let mut request = get("/api/v1/cameras");
+        request
+            .headers_mut()
+            .insert("cookie", cookie.parse().unwrap());
+        let (status, cameras) = send(&state, request).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(cameras[0]["camera_id"], "cam-1");
+        assert_eq!(
+            cameras[0]["status"], "healthy",
+            "the live view must agree with the incident history: {cameras}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_flap_is_two_incidents() {
+        let state = test_state().await;
+        let now = Utc::now();
+        state
+            .store
+            .upsert_fleet_identity(
+                &typed_batch("gw-1", "cam-1", HealthStatus::Offline, now, None),
+                now,
+            )
+            .await
+            .unwrap();
+        state.camera_batches.write().await.insert(
+            "gw-1".into(),
+            typed_batch("gw-1", "cam-1", HealthStatus::Offline, now, None),
+        );
+        incident_pass(&state).await;
+        state.camera_batches.write().await.insert(
+            "gw-1".into(),
+            typed_batch("gw-1", "cam-1", HealthStatus::Healthy, Utc::now(), None),
+        );
+        incident_pass(&state).await;
+        state.camera_batches.write().await.insert(
+            "gw-1".into(),
+            typed_batch("gw-1", "cam-1", HealthStatus::Offline, Utc::now(), None),
+        );
+        incident_pass(&state).await;
+
+        let incidents = state.store.incidents(10).await.unwrap();
+        assert_eq!(incidents.len(), 2);
+        assert_eq!(incidents.iter().filter(|i| i.ended_at.is_none()).count(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_startup_grace_skips_sweeps_until_gateways_can_report() {
+        let mut state = test_state().await;
+        state.incident_grace = Duration::from_secs(3600);
+        let went_dark = Utc::now() - chrono::Duration::seconds(300);
+        state
+            .store
+            .upsert_fleet_identity(
+                &typed_batch("gw-1", "cam-1", HealthStatus::Healthy, went_dark, None),
+                went_dark,
+            )
+            .await
+            .unwrap();
+
+        incident_pass(&state).await;
+
+        assert!(
+            state.store.incidents(10).await.unwrap().is_empty(),
+            "a sweep inside the grace window must not blame a deploy on the cameras"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_survives_an_api_restart() {
+        let file = tempfile::NamedTempFile::new().expect("temp db");
+        let url = format!("sqlite:{}", file.path().display());
+        let store: Arc<dyn crate::store::Store> = Arc::new(
+            crate::store::SqliteStore::connect(&url)
+                .await
+                .expect("store"),
+        );
+        let state = test_state_with(store).await;
+        seed_admin(&state).await;
+        let cookie = login_cookie(&state).await;
+
+        let store2: Arc<dyn crate::store::Store> = Arc::new(
+            crate::store::SqliteStore::connect(&url)
+                .await
+                .expect("reopen"),
+        );
+        let restarted = test_state_with(store2).await;
+        let mut request = get("/api/v1/auth/session");
+        request
+            .headers_mut()
+            .insert("cookie", cookie.parse().unwrap());
+        let (status, _) = send(&restarted, request).await;
+        assert_eq!(
+            status,
+            StatusCode::NO_CONTENT,
+            "a login must survive an API restart; that is what storing sessions is for"
+        );
+    }
+
+    async fn audit_actions(state: &AppState, cookie: &str) -> Vec<String> {
+        let mut request = get("/api/v1/audit");
+        request
+            .headers_mut()
+            .insert("cookie", cookie.parse().unwrap());
+        let (status, body) = send(state, request).await;
+        assert_eq!(status, StatusCode::OK);
+        body.as_array()
+            .expect("a list")
+            .iter()
+            .map(|entry| entry["action"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn security_events_land_in_the_audit_log() {
+        let state = test_state().await;
+        seed_admin(&state).await;
+
+        // A failed login, then a good one.
+        let (_, _) = send(
+            &state,
+            post(
+                "/api/v1/auth/login",
+                None,
+                serde_json::json!({ "password": "wrong" }),
+            ),
+        )
+        .await;
+        let cookie = login_cookie(&state).await;
+
+        // Enrollment token minted, gateway enrolled, then revoked.
+        let _ = enrolled_gateway_token(&state, &cookie).await;
+        let mut request = post("/api/v1/gateways/gw-1/revoke", None, serde_json::json!({}));
+        request
+            .headers_mut()
+            .insert("cookie", cookie.parse().unwrap());
+        send(&state, request).await;
+
+        // Password changed (which re-mints the caller's session).
+        let mut request = post(
+            "/api/v1/auth/password",
+            None,
+            serde_json::json!({ "current": ADMIN_PASSWORD, "new": "an entirely new passphrase" }),
+        );
+        request
+            .headers_mut()
+            .insert("cookie", cookie.parse().unwrap());
+        let response = build_router(state.clone()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let fresh = response
+            .headers()
+            .get(axum::http::header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+
+        let actions = audit_actions(&state, &fresh).await;
+        for expected in [
+            "login.failed",
+            "login.ok",
+            "enrollment.created",
+            "gateway.enrolled",
+            "gateway.revoked",
+            "password.changed",
+        ] {
+            assert!(
+                actions.iter().any(|a| a == expected),
+                "missing {expected} in {actions:?}"
+            );
+        }
+        // Nothing secret in any row.
+        let mut request = get("/api/v1/audit");
+        request
+            .headers_mut()
+            .insert("cookie", fresh.parse().unwrap());
+        let (_, body) = send(&state, request).await;
+        let dump = body.to_string();
+        assert!(
+            !dump.contains(ADMIN_PASSWORD),
+            "a password reached the audit log"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_forced_password_reset_is_audited() {
+        let state = test_state().await;
+        seed_admin(&state).await;
+        crate::auth::seed_admin_credential(
+            state.store.as_ref(),
+            Some("a replacement passphrase"),
+            true,
+        )
+        .await
+        .unwrap();
+        let entries = state.store.audit_entries(10).await.unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.action == "password.reset" && e.actor == "system"),
+            "the loud reset must leave a row: {entries:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn audit_retention_prunes_only_when_told_to() {
+        let state = test_state().await;
+        let now = Utc::now();
+        state
+            .store
+            .record_audit(
+                now - chrono::Duration::days(400),
+                "admin",
+                "login.ok",
+                "",
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Default 0: keep forever.
+        retention_pass(&state).await;
+        assert_eq!(state.store.audit_entries(10).await.unwrap().len(), 1);
+
+        let mut state = state;
+        state.audit_retention_days = 365;
+        retention_pass(&state).await;
+        assert!(state.store.audit_entries(10).await.unwrap().is_empty());
+    }
+
+    fn incident_for<'a>(incidents: &'a [IncidentView], camera_id: &str) -> Vec<&'a IncidentView> {
+        incidents
+            .iter()
+            .filter(|incident| incident.camera_id == camera_id)
+            .collect()
+    }
+
+    async fn revoke_through_the_dashboard(state: &AppState, cookie: &str, gateway_id: &str) {
+        let mut request = post(
+            &format!("/api/v1/gateways/{gateway_id}/revoke"),
+            None,
+            serde_json::json!({}),
+        );
+        request
+            .headers_mut()
+            .insert("cookie", cookie.parse().unwrap());
+        let (status, _) = send(state, request).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn revoking_a_gateway_closes_its_camera_incidents_and_the_pass_leaves_them_closed() {
+        let state = test_state().await;
+        seed_admin(&state).await;
+        let cookie = login_cookie(&state).await;
+        let went_dark = Utc::now() - chrono::Duration::seconds(300);
+        for (gateway, camera) in [("gw-1", "cam-1"), ("gw-2", "cam-2")] {
+            state
+                .store
+                .upsert_fleet_identity(
+                    &typed_batch(gateway, camera, HealthStatus::Healthy, went_dark, None),
+                    went_dark,
+                )
+                .await
+                .unwrap();
+        }
+        incident_pass(&state).await;
+        assert_eq!(
+            state
+                .store
+                .incidents(10)
+                .await
+                .unwrap()
+                .iter()
+                .filter(|i| i.ended_at.is_none())
+                .count(),
+            2
+        );
+
+        revoke_through_the_dashboard(&state, &cookie, "gw-1").await;
+
+        let incidents = state.store.incidents(10).await.unwrap();
+        assert!(
+            incident_for(&incidents, "cam-1")[0].ended_at.is_some(),
+            "the revoke itself must close the revoked gateway's incident"
+        );
+        assert!(
+            incident_for(&incidents, "cam-2")[0].ended_at.is_none(),
+            "another gateway's outage is still an outage"
+        );
+
+        incident_pass(&state).await;
+        let incidents = state.store.incidents(10).await.unwrap();
+        let cam1 = incident_for(&incidents, "cam-1");
+        assert_eq!(
+            cam1.len(),
+            1,
+            "the pass reopened a revoked gateway's camera: {cam1:?}"
+        );
+        assert!(cam1[0].ended_at.is_some());
+        assert!(incident_for(&incidents, "cam-2")[0].ended_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn the_pass_closes_an_incident_left_open_on_a_revoked_gateway() {
+        // A gateway revoked before this policy existed, or a revoke whose own
+        // close failed: the store says revoked, the incident is still open.
+        let state = test_state().await;
+        let went_dark = Utc::now() - chrono::Duration::seconds(300);
+        state
+            .store
+            .upsert_fleet_identity(
+                &typed_batch("gw-1", "cam-1", HealthStatus::Healthy, went_dark, None),
+                went_dark,
+            )
+            .await
+            .unwrap();
+        incident_pass(&state).await;
+        state
+            .store
+            .revoke_gateway("gw-1", Utc::now())
+            .await
+            .unwrap();
+        assert!(
+            state.store.incidents(10).await.unwrap()[0]
+                .ended_at
+                .is_none()
+        );
+
+        incident_pass(&state).await;
+
+        let incidents = state.store.incidents(10).await.unwrap();
+        assert_eq!(incidents.len(), 1);
+        assert!(
+            incidents[0].ended_at.is_some(),
+            "the pass must heal a stranded open incident"
+        );
+    }
+
+    #[tokio::test]
+    async fn reenrolling_a_revoked_gateway_resumes_incident_tracking() {
+        let state = test_state().await;
+        seed_admin(&state).await;
+        let cookie = login_cookie(&state).await;
+        let _ = enrolled_gateway_token(&state, &cookie).await;
+        let went_dark = Utc::now() - chrono::Duration::seconds(300);
+        state
+            .store
+            .upsert_fleet_identity(
+                &typed_batch("gw-1", "cam-1", HealthStatus::Healthy, went_dark, None),
+                went_dark,
+            )
+            .await
+            .unwrap();
+        revoke_through_the_dashboard(&state, &cookie, "gw-1").await;
+        incident_pass(&state).await;
+        assert!(
+            state.store.incidents(10).await.unwrap().is_empty(),
+            "a revoked gateway's camera opened an incident"
+        );
+
+        let _ = enrolled_gateway_token(&state, &cookie).await;
+        incident_pass(&state).await;
+
+        let incidents = state.store.incidents(10).await.unwrap();
+        assert_eq!(
+            incidents.len(),
+            1,
+            "re-enrollment must bring the camera back under watch"
+        );
+        assert!(incidents[0].ended_at.is_none());
     }
 }

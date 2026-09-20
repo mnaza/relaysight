@@ -70,6 +70,7 @@ test('the app chrome that is still hardcoded is exactly this list', () => {
     '.field',
     '.field',
     '.live-player',
+    '.login-backdrop',
     '.modal',
     '.sidebar',
     '.telemetry-metric',

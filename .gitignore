@@ -4,3 +4,12 @@ target/
 *.log
 node_modules/
 docker-compose.override.yml
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+
+# TLS material for the relay. Installed on the relay host, never committed.
+deploy/coturn/certs/*
+!deploy/coturn/certs/.gitkeep

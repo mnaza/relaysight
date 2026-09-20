@@ -1,0 +1,15 @@
+{
+  "edition": "commercial",
+  "plan": "hosted-free",
+  "self_hosted": false,
+  "managed": true,
+  "camera_limit": 3,
+  "capabilities": [
+    "onvif",
+    "rtsp_health",
+    "plugins",
+    "ai_plugins",
+    "storage_plugins",
+    "local_users"
+  ]
+}

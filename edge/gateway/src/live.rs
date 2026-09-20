@@ -13,7 +13,7 @@ use rtc::{
     media_stream::MediaStreamTrack,
     peer_connection::{
         configuration::{
-            RTCConfigurationBuilder,
+            RTCConfigurationBuilder, RTCIceTransportPolicy,
             interceptor_registry::register_default_interceptors,
             media_engine::{MIME_TYPE_H264, MediaEngine},
         },
@@ -84,6 +84,33 @@ pub async fn start_h264(
     ice_servers: Vec<RtcIceServerConfig>,
     session_seconds: u32,
 ) -> anyhow::Result<LiveSessionAnswer> {
+    start_h264_with(
+        rtsp_uri,
+        username,
+        password,
+        offer_sdp,
+        offer_type,
+        ice_servers,
+        session_seconds,
+        None,
+    )
+    .await
+    .map(|(answer, _)| answer)
+}
+
+/// `start_h264`, optionally forcing an ICE transport policy, also returning the
+/// counters of any TURN bridges the session uses. Production passes `None`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn start_h264_with(
+    rtsp_uri: String,
+    username: Option<String>,
+    password: Option<String>,
+    offer_sdp: String,
+    offer_type: String,
+    ice_servers: Vec<RtcIceServerConfig>,
+    session_seconds: u32,
+    ice_transport_policy: Option<RTCIceTransportPolicy>,
+) -> anyhow::Result<(LiveSessionAnswer, Vec<Arc<crate::turn_bridge::BridgeStats>>)> {
     if !offer_type.eq_ignore_ascii_case("offer") {
         anyhow::bail!("unsupported SDP type {offer_type}; expected offer");
     }
@@ -102,6 +129,10 @@ pub async fn start_h264(
     };
     media_engine.register_codec(video_codec.clone(), RtpCodecKind::Video)?;
     let registry = register_default_interceptors(Registry::new(), &mut media_engine)?;
+    // Relays this site cannot reach over UDP go through local TLS/TCP bridges;
+    // the guard keeps them running for the life of the session.
+    let (ice_servers, bridges) = crate::turn_bridge::plan(ice_servers).await;
+    let bridge_stats = bridges.stats();
     let rtc_servers = ice_servers
         .into_iter()
         .map(|server| RTCIceServer {
@@ -110,9 +141,11 @@ pub async fn start_h264(
             credential: server.credential,
         })
         .collect();
-    let rtc_config = RTCConfigurationBuilder::new()
-        .with_ice_servers(rtc_servers)
-        .build();
+    let mut rtc_config = RTCConfigurationBuilder::new().with_ice_servers(rtc_servers);
+    if let Some(policy) = ice_transport_policy {
+        rtc_config = rtc_config.with_ice_transport_policy(policy);
+    }
+    let rtc_config = rtc_config.build();
 
     let gather_complete = Arc::new(Notify::new());
     let connected = Arc::new(Notify::new());
@@ -194,11 +227,17 @@ pub async fn start_h264(
             // Log the path this session settled on. Relayed sessions are the ones
             // that cost bandwidth, and their share decides the hosting model — see
             // docs/TURN-COSTS.md. It cannot be guessed, so every session says.
-            let path = crate::icepath::observed(&peer_stats).await;
+            let (path, candidate_url) = crate::icepath::observed_candidate(&peer_stats).await;
+            // Which way a relayed session reaches the relay: plain UDP, or a TLS/TCP bridge.
+            let relay_transport = candidate_url
+                .filter(|_| path.is_relayed())
+                .and_then(|url| bridges.transport_for_url(&url))
+                .map_or_else(|| "-".to_owned(), |transport| transport.to_string());
             info!(
                 session_id = %task_session_id,
                 path = %path,
                 relayed = path.is_relayed(),
+                relay_transport = %relay_transport,
                 "WebRTC peer connected; starting RTSP forwarding"
             );
             forward_rtsp_h264(
@@ -216,15 +255,29 @@ pub async fn start_h264(
             warn!(session_id = %task_session_id, %error, "WebRTC live session ended with error");
         }
         let _ = peer_task.close().await;
+        // What each bridge carried: the per-session relay byte count the cost model wants.
+        for stats in bridges.stats() {
+            info!(
+                session_id = %task_session_id,
+                bytes_up = stats.bytes_up(),
+                bytes_down = stats.bytes_down(),
+                "TURN bridge closed"
+            );
+        }
+        // The bridges outlive the peer connection by exactly this long.
+        drop(bridges);
     });
 
-    Ok(LiveSessionAnswer {
-        session_id,
-        sdp,
-        sdp_type,
-        codec: "H264".into(),
-        expires_at,
-    })
+    Ok((
+        LiveSessionAnswer {
+            session_id,
+            sdp,
+            sdp_type,
+            codec: "H264".into(),
+            expires_at,
+        },
+        bridge_stats,
+    ))
 }
 
 async fn negotiated_payload_type(sender: &Arc<dyn RtpSender>) -> anyhow::Result<PayloadType> {
@@ -470,6 +523,62 @@ mod tests {
                 .await
                 .is_err(),
             "media must not arrive from a camera that refused the session"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a local TLS relay; run make check-gateway-relay"]
+    async fn a_session_relays_over_tls_when_udp_to_the_relay_is_blocked() {
+        let var = |name: &str| {
+            std::env::var(name)
+                .unwrap_or_else(|_| panic!("set {name}; run make check-gateway-relay"))
+        };
+        let camera = FakeCamera::start(false).await.unwrap();
+        let browser = FakeBrowser::offer().await.unwrap();
+        let ice_servers = vec![vms_domain::RtcIceServerConfig {
+            urls: vec![
+                var("RELAYSIGHT_TEST_TURN_UDP_URL"),
+                var("RELAYSIGHT_TEST_TURNS_URL"),
+            ],
+            username: var("RELAYSIGHT_TEST_TURN_USER"),
+            credential: var("RELAYSIGHT_TEST_TURN_PASS"),
+        }];
+
+        let (answer, bridges) = super::start_h264_with(
+            camera.url.clone(),
+            None,
+            None,
+            browser.offer_sdp().to_owned(),
+            "offer".into(),
+            ice_servers,
+            20,
+            Some(rtc::peer_connection::configuration::RTCIceTransportPolicy::Relay),
+        )
+        .await
+        .expect("the gateway answers with a relayed candidate");
+        assert_eq!(
+            bridges.len(),
+            1,
+            "UDP to the relay is blocked, so exactly one TLS bridge must carry the session"
+        );
+
+        browser.accept_answer(&answer.sdp).await.unwrap();
+        let received = browser
+            .wait_for_media(Duration::from_secs(20))
+            .await
+            .expect("media must arrive through the relay");
+        assert!(
+            received.payload_bytes > 1000,
+            "only {} payload bytes arrived",
+            received.payload_bytes
+        );
+        // Limited to relay candidates, the only way out is the bridge, so the
+        // video has to show up in its counter.
+        assert!(
+            bridges[0].bytes_up() > received.payload_bytes,
+            "{} bytes crossed the TLS bridge for {} payload bytes received",
+            bridges[0].bytes_up(),
+            received.payload_bytes
         );
     }
 }
