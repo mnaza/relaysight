@@ -28,7 +28,8 @@
   "gateway": {
     "image": "vms-gateway:latest",
     "apiBaseUrl": "",
-    "installCommandTemplate": "docker run --rm --network host \\\n  -e API_URL='{apiUrl}' \\\n  -e ENROLLMENT_TOKEN='{enrollmentToken}' \\\n  -e GATEWAY_ID='{gatewayId}' \\\n  -e CAMERA_LIMIT='{cameraLimit}' \\\n  -e CAMERA_USERNAME='admin' \\\n  -e CAMERA_PASSWORD='YOUR_CAMERA_PASSWORD' \\\n  {image}"
+    "installerUrl": "https://github.com/mnaza/relaysight/releases/latest/download/install.sh",
+    "installCommandTemplate": "curl -fsSL {installerUrl} \\\n  | sudo sh -s -- --api-url '{apiUrl}' \\\n    --enrollment-token '{enrollmentToken}' --gateway-id '{gatewayId}'"
   },
   "contact": {
     "salesEmail": "hello@example.com"

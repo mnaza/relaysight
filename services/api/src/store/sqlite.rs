@@ -262,7 +262,7 @@ impl Store for SqliteStore {
                      manufacturer = excluded.manufacturer, model = excluded.model,
                      firmware = excluded.firmware, codec = excluded.codec,
                      width = excluded.width, height = excluded.height,
-                     last_seen = excluded.last_seen",
+                     last_seen = excluded.last_seen, retired_at = NULL",
             )
             .bind(&camera.camera_id)
             .bind(&batch.gateway_id)
@@ -283,7 +283,7 @@ impl Store for SqliteStore {
     }
 
     async fn fleet_cameras(&self) -> Result<Vec<CameraRecord>, StoreError> {
-        let rows = sqlx::query("SELECT * FROM cameras ORDER BY name, id")
+        let rows = sqlx::query("SELECT * FROM cameras WHERE retired_at IS NULL ORDER BY name, id")
             .fetch_all(&self.pool)
             .await?;
         rows.iter().map(camera_from_row).collect()
@@ -296,9 +296,10 @@ impl Store for SqliteStore {
         let site_rows = sqlx::query("SELECT id, org_id, name, city FROM sites ORDER BY id")
             .fetch_all(&self.pool)
             .await?;
-        let camera_rows = sqlx::query("SELECT * FROM cameras ORDER BY name, id")
-            .fetch_all(&self.pool)
-            .await?;
+        let camera_rows =
+            sqlx::query("SELECT * FROM cameras WHERE retired_at IS NULL ORDER BY name, id")
+                .fetch_all(&self.pool)
+                .await?;
 
         let mut cameras_by_site: std::collections::HashMap<String, Vec<CameraRecord>> =
             std::collections::HashMap::new();
@@ -576,6 +577,33 @@ impl Store for SqliteStore {
         Ok(())
     }
 
+    async fn retire_gateway_cameras(
+        &self,
+        gateway_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<String>, StoreError> {
+        // RETURNING, so the caller knows exactly which cameras it just retired
+        // and can close their incidents without asking again.
+        let rows = sqlx::query(
+            "UPDATE cameras SET retired_at = ?2
+             WHERE gateway_id = ?1 AND retired_at IS NULL
+             RETURNING id",
+        )
+        .bind(gateway_id)
+        .bind(ts(&now))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(|row| Ok(row.try_get("id")?)).collect()
+    }
+
+    async fn gateway_exists(&self, gateway_id: &str) -> Result<bool, StoreError> {
+        let found: Option<i64> = sqlx::query_scalar("SELECT 1 FROM gateways WHERE id = ?1")
+            .bind(gateway_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(found.is_some())
+    }
+
     async fn gateway_revoked(&self, gateway_id: &str) -> Result<bool, StoreError> {
         let revoked: Option<Option<String>> =
             sqlx::query_scalar("SELECT revoked_at FROM gateways WHERE id = ?1")
@@ -823,6 +851,108 @@ mod tests {
                 last_error: None,
             }],
         }
+    }
+
+    #[tokio::test]
+    async fn retiring_a_gateways_cameras_takes_them_out_of_the_roster() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let now = Utc::now();
+        for (gateway, camera) in [("gw-1", "cam-1"), ("gw-1", "cam-2"), ("gw-2", "cam-3")] {
+            store
+                .upsert_fleet_identity(&batch_with_camera(gateway, camera, camera), now)
+                .await
+                .unwrap();
+        }
+
+        let mut retired = store.retire_gateway_cameras("gw-1", now).await.unwrap();
+        retired.sort();
+        assert_eq!(retired, vec!["cam-1".to_string(), "cam-2".to_string()]);
+
+        let left: Vec<_> = store
+            .fleet_cameras()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|camera| camera.id)
+            .collect();
+        assert_eq!(
+            left,
+            vec!["cam-3".to_string()],
+            "only the other gateway's camera stays"
+        );
+        let in_fleet: usize = store
+            .fleet_identity()
+            .await
+            .unwrap()
+            .iter()
+            .flat_map(|org| &org.sites)
+            .map(|site| site.cameras.len())
+            .sum();
+        assert_eq!(in_fleet, 1, "the roster the dashboard reads drops them too");
+
+        assert!(
+            store
+                .retire_gateway_cameras("gw-1", now)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a second retire has nothing left to stamp"
+        );
+    }
+
+    #[tokio::test]
+    async fn retiring_a_camera_keeps_its_recordings_reachable() {
+        // The roster hides it; the archive does not. A recording whose camera
+        // cannot be found would be a recording nobody can play.
+        let store = SqliteStore::in_memory().await.unwrap();
+        let now = Utc::now();
+        store
+            .upsert_fleet_identity(&batch_with_camera("gw-1", "cam-1", "Entrance"), now)
+            .await
+            .unwrap();
+        store
+            .save_recording(&manifest("rec-1", "cam-1", None))
+            .await
+            .unwrap();
+        store.retire_gateway_cameras("gw-1", now).await.unwrap();
+
+        assert_eq!(
+            store.recording("rec-1").await.unwrap().camera_id,
+            "cam-1",
+            "playback looks the recording up by id"
+        );
+        assert_eq!(
+            store.camera_recordings("cam-1").await.unwrap().len(),
+            1,
+            "and the timeline still has it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_retired_camera_comes_back_when_a_gateway_reports_it() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let first = Utc::now();
+        store
+            .upsert_fleet_identity(&batch_with_camera("gw-old", "cam-1", "Entrance"), first)
+            .await
+            .unwrap();
+        store.retire_gateway_cameras("gw-old", first).await.unwrap();
+        assert!(store.fleet_cameras().await.unwrap().is_empty());
+
+        // The replacement gateway at the same site reports the same camera.
+        let later = first + Duration::minutes(5);
+        store
+            .upsert_fleet_identity(&batch_with_camera("gw-new", "cam-1", "Entrance"), later)
+            .await
+            .unwrap();
+        let cameras = store.fleet_cameras().await.unwrap();
+        assert_eq!(cameras.len(), 1, "it is back in the roster");
+        assert_eq!(cameras[0].gateway_id, "gw-new", "under the new gateway");
+        assert_eq!(
+            cameras[0].first_seen.timestamp_micros(),
+            first.timestamp_micros(),
+            "with the history it had"
+        );
     }
 
     #[tokio::test]

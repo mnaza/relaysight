@@ -2339,8 +2339,7 @@ dependencies = [
 [[package]]
 name = "retina"
 version = "0.4.20"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0e0eb740f743e678e071628ff6bf84ed5ed03df879997cc3d43b5afef64aff93"
+source = "git+https://github.com/mnaza/retina?rev=83b25a88a62f83cd6605ab36486434ff9e34733a#83b25a88a62f83cd6605ab36486434ff9e34733a"
 dependencies = [
  "base64 0.22.1",
  "bitstream-io",
@@ -3741,6 +3740,7 @@ dependencies = [
  "rand 0.8.8",
  "reqwest",
  "retina",
+ "ring",
  "rtc",
  "rustls",
  "serde",

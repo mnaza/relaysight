@@ -624,6 +624,20 @@ export async function startDashboard({ brand, locale, dict }) {
         });
         card.appendChild(revoke);
       }
+      if (revoked) {
+        // The only way to clear a revoked gateway's cameras out of the roster.
+        // Nothing is lost: a gateway reporting them again brings them back.
+        const retire = document.createElement('button');
+        retire.className = 'button small gw-retire';
+        retire.textContent = t(dict, 'app.gateways.retireCameras');
+        retire.addEventListener('click', async () => {
+          if (!confirm(t(dict, 'app.gateways.retireConfirm'))) return;
+          const response = await fetch(`api/v1/gateways/${encodeURIComponent(gateway.gateway_id)}/cameras/retire`, { method: 'POST' }).catch(() => null);
+          if (!response || !response.ok) alert(t(dict, 'app.gateways.retireFailed'));
+          refresh();
+        });
+        card.appendChild(retire);
+      }
       grid.appendChild(card);
     }
   }
@@ -724,20 +738,20 @@ export async function startDashboard({ brand, locale, dict }) {
   function buildInstallCommand({ enrollmentToken, gatewayId }) {
     const values = {
       apiUrl: apiBaseUrl(), enrollmentToken, gatewayId,
+      installerUrl: brand.gateway?.installerUrl
+        || 'https://github.com/mnaza/relaysight/releases/latest/download/install.sh',
       cameraLimit: String(edition.camera_limit == null ? 0 : edition.camera_limit),
       image: brand.gateway?.image || 'vms-gateway:latest',
     };
+    // The signed installer, which sets up the service and its updates. Camera
+    // passwords go in afterwards with relaysight-gateway-credentials, from stdin —
+    // never on a command line an installer copies around.
     const template = brand.gateway?.installCommandTemplate || [
-      'docker run --rm --network host \\',
-      "  -e API_URL='{apiUrl}' \\",
-      "  -e ENROLLMENT_TOKEN='{enrollmentToken}' \\",
-      "  -e GATEWAY_ID='{gatewayId}' \\",
-      "  -e CAMERA_LIMIT='{cameraLimit}' \\",
-      "  -e CAMERA_USERNAME='admin' \\",
-      "  -e CAMERA_PASSWORD='YOUR_CAMERA_PASSWORD' \\",
-      '  {image}',
+      'curl -fsSL {installerUrl} \\',
+      "  | sudo sh -s -- --api-url '{apiUrl}' \\",
+      "    --enrollment-token '{enrollmentToken}' --gateway-id '{gatewayId}'",
     ].join('\n');
-    return template.replace(/\{(apiUrl|enrollmentToken|gatewayId|cameraLimit|image)\}/g, (_, key) => values[key]);
+    return template.replace(/\{(installerUrl|apiUrl|enrollmentToken|gatewayId|cameraLimit|image)\}/g, (_, key) => values[key]);
   }
 
   async function refreshEnrollmentStatus() {

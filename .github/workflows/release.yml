@@ -1,0 +1,113 @@
+name: release
+
+# A v* tag builds the gateway for both architectures, signs the release, and
+# publishes it with install.sh and a container image. Only in the public
+# repository: a mirror has neither the signing secret nor any reason to release.
+#
+# Before the first tag: generate the release key (scripts/release-key.sh),
+# commit its public half to edge/gateway/src/update.rs (RELEASE_PUBKEY) and
+# deploy/gateway/install.sh (PUBKEY_PEM), and store the private half as the
+# RELEASE_SIGNING_KEY secret. The publish job refuses to run until both
+# public halves are in. See docs/INSTALL-GATEWAY.md.
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  build:
+    if: github.repository == 'mnaza/relaysight'
+    strategy:
+      matrix:
+        include:
+          - { arch: x86_64, runner: ubuntu-24.04 }
+          - { arch: aarch64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    # Bookworm's glibc (2.36): the binary runs on Debian 12, Ubuntu 24.04 and newer.
+    container: rust:1-bookworm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          export GATEWAY_VERSION="${GITHUB_REF_NAME#v}"
+          cargo build --release -p vms-gateway
+          test "$(target/release/vms-gateway --version)" = "vms-gateway $GATEWAY_VERSION"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vms-gateway-${{ matrix.arch }}
+          path: target/release/vms-gateway
+
+  publish:
+    if: github.repository == 'mnaza/relaysight'
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: built
+      - name: Refuse to publish what no gateway could verify
+        run: |
+          if grep -q '^const RELEASE_PUBKEY: &str = "";' edge/gateway/src/update.rs; then
+            echo "edge/gateway/src/update.rs carries no release key" >&2; exit 1
+          fi
+          if grep -q "^PUBKEY_PEM=''" deploy/gateway/install.sh; then
+            echo "deploy/gateway/install.sh carries no release key" >&2; exit 1
+          fi
+          # One key, two spellings: install.sh would accept what the gateway refuses,
+          # or the reverse, and neither error would say why.
+          raw="$(sed -n 's/^const RELEASE_PUBKEY: &str = "\(.*\)";/\1/p' edge/gateway/src/update.rs)"
+          pem="$(sed -n "/^PUBKEY_PEM='/,/'\$/p" deploy/gateway/install.sh | sed "s/^PUBKEY_PEM='//; s/'\$//")"
+          from_pem="$(printf '%s\n' "$pem" | openssl pkey -pubin -outform DER | tail -c 32 | base64 -w0)"
+          if [ "$raw" != "$from_pem" ]; then
+            echo "update.rs and install.sh carry different release keys" >&2; exit 1
+          fi
+      - name: Sign
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        run: |
+          umask 077
+          key="$RUNNER_TEMP/release.key"
+          printf '%s\n' "$RELEASE_SIGNING_KEY" >"$key"
+          scripts/make-release.sh "${GITHUB_REF_NAME#v}" dist "$key" \
+            "https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}" \
+            x86_64=built/vms-gateway-x86_64/vms-gateway \
+            aarch64=built/vms-gateway-aarch64/vms-gateway
+          rm -f "$key"
+          cp deploy/gateway/install.sh dist/
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "Gateway ${GITHUB_REF_NAME}" \
+            --notes "Install or update a gateway: docs/INSTALL-GATEWAY.md."
+
+  image:
+    if: github.repository == 'mnaza/relaysight'
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >>"$GITHUB_OUTPUT"
+      # amd64 only: an arm64 image would build under emulation for the better part
+      # of an hour, and arm64 boxes are better served by the native binary.
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: edge/gateway/Dockerfile
+          build-args: GATEWAY_VERSION=${{ steps.version.outputs.version }}
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/relaysight-gateway:${{ steps.version.outputs.version }}
+            ghcr.io/${{ github.repository_owner }}/relaysight-gateway:latest

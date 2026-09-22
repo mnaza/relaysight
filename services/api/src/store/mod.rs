@@ -204,6 +204,20 @@ pub trait Store: Send + Sync {
     /// False for unknown ids.
     async fn gateway_revoked(&self, gateway_id: &str) -> Result<bool, StoreError>;
 
+    /// Whether the roster has this gateway at all. `gateway_revoked` answers
+    /// false for an id it has never seen, which is the right answer there and
+    /// the wrong one for anything that must tell a typo from a live gateway.
+    async fn gateway_exists(&self, gateway_id: &str) -> Result<bool, StoreError>;
+
+    /// Take a gateway's cameras out of the roster, returning the ids stamped.
+    /// Already-retired cameras are left alone, so a second call returns none.
+    /// A camera comes back on its own when a gateway reports it again.
+    async fn retire_gateway_cameras(
+        &self,
+        gateway_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<String>, StoreError>;
+
     /// The store's half of the gateways screen: every known gateway with
     /// joined names and flags. `online` and `heartbeat` are the handler's to
     /// fill — the store never claims liveness.

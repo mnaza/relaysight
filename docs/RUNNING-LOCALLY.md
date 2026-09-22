@@ -27,6 +27,25 @@ export CAMERA_USERNAME=admin CAMERA_PASSWORD='...'
 make edge
 ```
 
+**Cameras with their own passwords.** `CAMERA_USERNAME` and `CAMERA_PASSWORD`
+are the fallback every camera without an entry of its own uses. Where a camera
+has its own, put it in the gateway's credential store instead:
+
+```bash
+printf '%s\n' 'the-camera-password' |
+  vms-gateway credentials set 192.168.1.50 admin
+vms-gateway credentials list      # hosts and usernames, never a password
+vms-gateway credentials remove 192.168.1.50
+```
+
+The password is read from stdin, so it never lands in `ps` or a shell history.
+Entries live in `GATEWAY_STATE_DIR/camera-credentials.enc`, encrypted with the
+same key as the gateway's identity and written 0600; a file that will not
+decrypt stops the gateway rather than letting every camera quietly fall back to
+the shared pair. Keyed by address as written in `ONVIF_HOSTS` — the same camera
+answers ONVIF on one port and RTSP on another, and one entry covers both. An
+IPv6 camera keeps its brackets, `[2001:db8::1]`, in both places.
+
 **Raw RTSP**, when only the stream port is reachable. This skips ONVIF entirely,
 so there is no profile selection, no substream for live view and no snapshots:
 
@@ -40,17 +59,11 @@ make edge
 The second is what a camera behind a single forwarded RTSP port needs, and it is
 what was used to verify this document.
 
-⚠️ **A Dahua needs the retina patch.** Some firmware writes the SSRC as decimal
-in `RTP-Info` where retina expects hex, and the session dies at PLAY with
-`Unparseable ssrc`. Until scottlamb/retina#137 lands, add to `Cargo.toml`:
-
-```toml
-[patch.crates-io]
-retina = { path = "../retina-fork" }
-```
-
-and run the gateway with `cargo run -p vms-gateway` rather than from the image,
-since the image is built without it.
+Some Dahua firmware writes the SSRC as decimal in `RTP-Info` where retina
+expects hex, and stock retina ends the session at PLAY with `Unparseable ssrc`.
+The gateway builds against a fork that accepts it — `edge/gateway/Cargo.toml`
+pins it by commit until scottlamb/retina#137 lands — so the image and a
+`cargo run` both handle that camera, with nothing to patch locally.
 
 ## Logging in
 
@@ -116,11 +129,19 @@ access, the same as a first-time enroll.
 A revoke is deliberate and lands in the audit log, so it is not an outage: the
 revoke closes any open incident on that gateway's cameras, and the incident
 pass stops tracking them for as long as the gateway stays revoked. The cameras
-stay in the fleet roster, shown offline; retiring them for good is a future
-decommission flow. Re-enrolling the gateway brings its cameras back under
-watch. One wrinkle there: a camera that is still dark after the re-enroll gets
-an incident dated from its last report before the revoke, so the duration
-includes the time it was revoked.
+stay in the fleet roster, shown offline. Re-enrolling the gateway brings its
+cameras back under watch. One wrinkle there: a camera that is still dark after
+the re-enroll gets an incident dated from its last report before the revoke, so
+the duration includes the time it was revoked.
+
+When the gateway is not coming back, *Retire cameras* on its card — or
+`POST /api/v1/gateways/<id>/cameras/retire` — takes its cameras out of the
+roster and answers `{"retired": <count>}`. It refuses with a 409 unless the
+gateway is revoked, so a working site cannot be emptied by a misclick. Nothing
+is deleted: the cameras are stamped `retired_at`, their recordings still play
+back, and a gateway reporting one of them again brings it back with the history
+it had. Run twice, the second answers `{"retired": 0}`. The row it leaves is
+`cameras.retired`.
 
 A gateway that has only ever reported with the shared bootstrap `GATEWAY_TOKEN`
 (never enrolled) has no roster row to revoke — the revoke endpoint answers 404
@@ -137,7 +158,7 @@ gateway isn't locked out of these two specifically.
 `GET /api/v1/audit` lists security events: logins (`login.ok`, `login.failed`),
 password changes and resets (`password.changed`, `password.change.failed`,
 `password.reset`), enrollments (`enrollment.created`, `gateway.enrolled`), and
-revocations (`gateway.revoked`). Entries are kept forever by default; set
+revocations (`gateway.revoked`, `cameras.retired`). Entries are kept forever by default; set
 `AUDIT_RETENTION_DAYS` to a positive number of days to prune older ones.
 
 The two failure rows carry how many wrong passwords have come in a row — both
@@ -198,6 +219,13 @@ in Docker on high ports with a throwaway certificate authority, points the
 gateway's UDP TURN URL at a closed port, and runs a live session that can only
 reach the browser through the TLS bridge. It needs Docker, openssl, `ss`, and
 ports 13478, 13479 and 15349 free.
+
+`make check-installer` boots Debian with systemd in a privileged container and
+runs the real `deploy/gateway/install.sh` against a local release channel signed
+with a throwaway key. It covers install and enrolment, an update, a rollback, a
+wrong-key refusal, the credentials wrapper and a re-run. It needs Docker,
+python3, openssl, and ports 18090 and 18091 free. What it proves and what it
+does not is in `docs/INSTALL-GATEWAY.md`.
 
 ## If the ports are taken
 

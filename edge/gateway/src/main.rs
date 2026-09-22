@@ -1,5 +1,6 @@
 mod archive;
 mod backoff;
+mod camera_credentials;
 #[cfg(test)]
 mod fake_browser;
 #[cfg(test)]
@@ -10,9 +11,11 @@ mod icepath;
 mod identity;
 mod live;
 mod onvif;
+mod release;
 mod rtsp;
 mod snapshot;
 mod turn_bridge;
+mod update;
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -58,6 +61,11 @@ struct Config {
     command_poll_interval: Duration,
     camera_username: Option<String>,
     camera_password: Option<String>,
+    /// Per-camera credentials, keyed by address. The pair above is what a
+    /// camera without its own entry still uses.
+    camera_credentials: Arc<crate::camera_credentials::CameraCredentials>,
+    /// Where the heartbeat marker goes. `None` for a gateway with no state to keep.
+    state_dir: Option<std::path::PathBuf>,
     explicit_rtsp_url: Option<String>,
     explicit_camera_name: String,
     /// Addresses to talk ONVIF to directly, skipping multicast discovery.
@@ -65,6 +73,25 @@ struct Config {
 }
 
 impl Config {
+    /// What to present to the camera at this address: its own credentials when
+    /// it has been given some, otherwise the pair every camera shared before
+    /// this existed. Both halves are optional, as before: a camera on an open
+    /// network needs neither.
+    fn camera_login(&self, address: &str) -> (Option<String>, Option<String>) {
+        match self.camera_credentials.get(address) {
+            Some(found) => (Some(found.username.clone()), Some(found.password.clone())),
+            None => (self.camera_username.clone(), self.camera_password.clone()),
+        }
+    }
+
+    /// The same, shaped for ONVIF, which wants both or neither.
+    fn onvif_login(&self, address: &str) -> Option<onvif::Credentials> {
+        match self.camera_login(address) {
+            (Some(username), Some(password)) => Some(onvif::Credentials { username, password }),
+            _ => None,
+        }
+    }
+
     fn from_env() -> Self {
         Self {
             api_url: env::var("API_URL").unwrap_or_else(|_| "http://localhost:8080".into()),
@@ -87,6 +114,8 @@ impl Config {
             command_poll_interval: duration_env("COMMAND_POLL_INTERVAL_SECONDS", 1),
             camera_username: env::var("CAMERA_USERNAME").ok().filter(|s| !s.is_empty()),
             camera_password: env::var("CAMERA_PASSWORD").ok().filter(|s| !s.is_empty()),
+            camera_credentials: Arc::new(crate::camera_credentials::CameraCredentials::empty()),
+            state_dir: None,
             explicit_rtsp_url: env::var("CAMERA_RTSP_URL").ok().filter(|s| !s.is_empty()),
             explicit_camera_name: env::var("CAMERA_NAME")
                 .unwrap_or_else(|_| "Manual RTSP camera".into()),
@@ -99,6 +128,70 @@ impl Config {
                 .collect(),
         }
     }
+}
+
+/// `vms-gateway update`, run by the update timer as root: take a newer signed release, and
+/// give it back if the gateway does not prove itself on it.
+async fn run_update() -> anyhow::Result<()> {
+    let channel =
+        env::var("GATEWAY_UPDATE_URL").unwrap_or_else(|_| update::DEFAULT_CHANNEL.to_owned());
+    let state_dir = env::var("GATEWAY_STATE_DIR").unwrap_or_else(|_| "data/gateway".into());
+    let unit = env::var("GATEWAY_SERVICE_UNIT").unwrap_or_else(|_| "relaysight-gateway".into());
+    let wait = duration_env("GATEWAY_UPDATE_WAIT_SECONDS", 90);
+    let current = VERSION;
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()?;
+    let fetched = update::fetch(
+        &client,
+        &channel,
+        &update::release_public_key(),
+        current,
+        std::env::consts::ARCH,
+    )
+    .await?;
+    let Some((version, binary)) = fetched else {
+        println!("vms-gateway {current} is up to date");
+        return Ok(());
+    };
+
+    let path = std::env::current_exe()?;
+    let mut service = update::Systemd {
+        unit,
+        marker: std::path::Path::new(&state_dir).join(update::HEARTBEAT_MARKER),
+        wait,
+    };
+    // The swap waits on the service in a plain loop; keep it off the async workers.
+    let outcome = tokio::task::spawn_blocking(move || {
+        update::swap_and_confirm(&path, &binary, &mut service, current, &version)
+    })
+    .await??;
+    match outcome {
+        update::Outcome::Updated { from, to } => {
+            println!("updated vms-gateway {from} -> {to}");
+            Ok(())
+        }
+        update::Outcome::RolledBack { from, to } => {
+            anyhow::bail!("vms-gateway {to} did not come up within {wait:?}; rolled back to {from}")
+        }
+    }
+}
+
+/// This build's version: the release tag's, when CI sets `GATEWAY_VERSION` at build time,
+/// otherwise the crate's. Heartbeats report it and updates compare against it.
+const VERSION: &str = match option_env!("GATEWAY_VERSION") {
+    // An empty one is a build that meant to leave it unset.
+    Some(version) if !version.is_empty() => version,
+    _ => env!("CARGO_PKG_VERSION"),
+};
+
+/// One line from stdin, so the password is never an argument in `ps` or a
+/// line in a shell history.
+fn read_password() -> anyhow::Result<String> {
+    let mut password = String::new();
+    std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut password)?;
+    Ok(password)
 }
 
 #[derive(Clone, Debug)]
@@ -123,6 +216,31 @@ fn duration_env(name: &str, default_secs: u64) -> Duration {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // One subcommand, checked before anything starts: `credentials` is run by
+    // hand on the box, not by the service.
+    let args: Vec<String> = env::args().skip(1).collect();
+    if args
+        .first()
+        .is_some_and(|first| first == "--version" || first == "version")
+    {
+        println!("vms-gateway {}", VERSION);
+        return Ok(());
+    }
+    if args.first().is_some_and(|first| first == "update") {
+        return run_update().await;
+    }
+    if args.first().is_some_and(|first| first == "credentials") {
+        let state_dir = env::var("GATEWAY_STATE_DIR").unwrap_or_else(|_| "data/gateway".into());
+        let state_key = env::var("GATEWAY_STATE_KEY").ok().filter(|k| !k.is_empty());
+        return camera_credentials::run(
+            std::path::Path::new(&state_dir),
+            state_key.as_deref(),
+            &args[1..],
+            read_password,
+            &mut std::io::stdout(),
+        );
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -146,13 +264,23 @@ async fn main() -> anyhow::Result<()> {
     let hostname = env::var("HOSTNAME").unwrap_or_else(|_| "edge-node".into());
 
     let state_dir = env::var("GATEWAY_STATE_DIR").unwrap_or_else(|_| "data/gateway".into());
-    let store = identity::IdentityStore::open(
+    let state_key = env::var("GATEWAY_STATE_KEY").ok().filter(|k| !k.is_empty());
+    let store =
+        identity::IdentityStore::open(std::path::Path::new(&state_dir), state_key.as_deref())?;
+    // A credential file that will not open stops the gateway rather than
+    // letting every camera quietly fall back to the shared password.
+    let credentials = camera_credentials::CameraCredentials::load(
         std::path::Path::new(&state_dir),
-        env::var("GATEWAY_STATE_KEY")
-            .ok()
-            .filter(|k| !k.is_empty())
-            .as_deref(),
+        state_key.as_deref(),
     )?;
+    if !credentials.hosts().is_empty() {
+        info!(
+            cameras = credentials.hosts().len(),
+            "per-camera credentials loaded"
+        );
+    }
+    config.camera_credentials = Arc::new(credentials);
+    config.state_dir = Some(std::path::PathBuf::from(&state_dir));
     let reenroll = env::var("GATEWAY_REENROLL").is_ok_and(|v| v == "true");
     establish_identity(&mut config, &client, &hostname, &store, reenroll).await?;
     info!(gateway_id = %config.gateway_id, site_id = %config.site_id, camera_limit = config.camera_limit, "gateway started");
@@ -241,7 +369,7 @@ async fn enroll_if_requested(
         enrollment_token,
         gateway_id: config.gateway_id.clone(),
         hostname: hostname.to_owned(),
-        version: env!("CARGO_PKG_VERSION").into(),
+        version: VERSION.into(),
     };
     let response = client.post(endpoint).json(&request).send().await?;
     if !response.status().is_success() {
@@ -278,14 +406,6 @@ async fn probe_loop(
     loop {
         let mut telemetry = Vec::new();
         let mut fresh_sources = HashMap::new();
-        let credentials = match (&config.camera_username, &config.camera_password) {
-            (Some(username), Some(password)) => Some(onvif::Credentials {
-                username: username.clone(),
-                password: password.clone(),
-            }),
-            _ => None,
-        };
-
         // Discovery is multicast, so it only reaches the local segment. Set
         // ONVIF_DISCOVERY_SECONDS=0 on a routed network to stop paying for a
         // probe that cannot succeed, and name the cameras in ONVIF_HOSTS instead.
@@ -335,16 +455,24 @@ async fn probe_loop(
         {
             {
                 for device in devices {
+                    // Whose camera this is decides which password it gets.
+                    let address = device
+                        .xaddrs
+                        .first()
+                        .and_then(|x| onvif::xaddr_authority(x))
+                        .unwrap_or_default();
+                    let credentials = config.onvif_login(&address);
                     match onvif::resolve_camera(&client, &device, credentials.as_ref()).await {
                         Ok(candidate) => {
+                            let (username, password) = config.camera_login(&candidate.rtsp_uri);
                             fresh_sources.insert(
                                 candidate.camera_id.clone(),
                                 CameraSource {
                                     rtsp_uri: candidate.rtsp_uri.clone(),
                                     live_rtsp_uri: candidate.live_rtsp_uri.clone(),
                                     snapshot_uri: candidate.snapshot_uri.clone(),
-                                    username: config.camera_username.clone(),
-                                    password: config.camera_password.clone(),
+                                    username,
+                                    password,
                                 },
                             );
                             telemetry.push(
@@ -392,6 +520,7 @@ async fn probe_loop(
         if let Some(url) = &config.explicit_rtsp_url {
             let id = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, url.as_bytes()).to_string();
             if !telemetry.iter().any(|camera| camera.camera_id == id) {
+                let login = config.camera_login(url);
                 fresh_sources.insert(
                     id.clone(),
                     CameraSource {
@@ -400,8 +529,8 @@ async fn probe_loop(
                         // no profile list to pick a substream from.
                         live_rtsp_uri: url.clone(),
                         snapshot_uri: None,
-                        username: config.camera_username.clone(),
-                        password: config.camera_password.clone(),
+                        username: login.0,
+                        password: login.1,
                     },
                 );
                 telemetry.push(probe_explicit(&config, id, url, &reconnects, &backoff).await);
@@ -434,7 +563,7 @@ async fn probe_loop(
             cameras: telemetry.clone(),
         };
         *shared.write().await = telemetry;
-        post_json(&client, &config, "/api/v1/cameras/telemetry", &batch).await;
+        let _ = post_json(&client, &config, "/api/v1/cameras/telemetry", &batch).await;
         tokio::time::sleep(config.probe_interval).await;
     }
 }
@@ -519,10 +648,11 @@ async fn probe_with_backoff(
         return (Err(anyhow!(reason)), true);
     }
 
+    let (username, password) = config.camera_login(url);
     let result = rtsp::probe(
         url,
-        config.camera_username.as_deref(),
-        config.camera_password.as_deref(),
+        username.as_deref(),
+        password.as_deref(),
         config.rtsp_probe_window,
     )
     .await;
@@ -652,7 +782,7 @@ async fn heartbeat_loop(
             gateway_id: config.gateway_id.clone(),
             site_id: config.site_id.clone(),
             hostname: hostname.clone(),
-            version: env!("CARGO_PKG_VERSION").into(),
+            version: VERSION.into(),
             uptime_seconds: started.elapsed().as_secs(),
             cpu_percent: 0.0,
             memory_percent: 0.0,
@@ -672,17 +802,23 @@ async fn heartbeat_loop(
             sent_at: Utc::now(),
         };
         drop(cameras);
-        post_json(&client, &config, "/api/v1/gateways/heartbeat", &heartbeat).await;
+        // An accepted heartbeat is what an update waits for before it keeps a new binary.
+        if post_json(&client, &config, "/api/v1/gateways/heartbeat", &heartbeat).await
+            && let Some(state_dir) = &config.state_dir
+        {
+            update::record_heartbeat(state_dir);
+        }
         tokio::time::sleep(config.heartbeat_interval).await;
     }
 }
 
+/// True when the API accepted it.
 async fn post_json<T: serde::Serialize>(
     client: &reqwest::Client,
     config: &Config,
     path: &str,
     payload: &T,
-) {
+) -> bool {
     let endpoint = format!("{}{}", config.api_url.trim_end_matches('/'), path);
     match client
         .post(endpoint)
@@ -691,9 +827,15 @@ async fn post_json<T: serde::Serialize>(
         .send()
         .await
     {
-        Ok(response) if response.status().is_success() => {}
-        Ok(response) => warn!(status = %response.status(), path, "API request rejected"),
-        Err(error) => warn!(%error, path, "API request failed; will retry"),
+        Ok(response) if response.status().is_success() => true,
+        Ok(response) => {
+            warn!(status = %response.status(), path, "API request rejected");
+            false
+        }
+        Err(error) => {
+            warn!(%error, path, "API request failed; will retry");
+            false
+        }
     }
 }
 
@@ -1192,6 +1334,83 @@ mod tests {
         }
     }
 
+    /// The updater's proof that a new binary works: a heartbeat the API accepted, written
+    /// down where the updater can see it. A heartbeat that failed proves nothing.
+    #[tokio::test]
+    async fn an_accepted_heartbeat_is_recorded_and_a_failed_one_is_not() {
+        let plane = fake_control_plane::FakeControlPlane::start(vec![], 0).await;
+        let state = tempfile::tempdir().unwrap();
+        let mut accepted = config(&plane.url);
+        accepted.state_dir = Some(state.path().to_path_buf());
+        accepted.heartbeat_interval = Duration::from_millis(50);
+        let marker = state.path().join(update::HEARTBEAT_MARKER);
+        let task = tokio::spawn(heartbeat_loop(
+            accepted,
+            reqwest::Client::new(),
+            Arc::new(RwLock::new(Vec::new())),
+            "test-host".into(),
+            Instant::now(),
+        ));
+        let recorded = tokio::time::timeout(Duration::from_secs(3), async {
+            while !marker.exists() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        task.abort();
+        assert!(recorded.is_ok(), "an accepted heartbeat left no marker");
+
+        let silent = tempfile::tempdir().unwrap();
+        let closed = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let mut failing = config(&format!("http://{closed}"));
+        failing.state_dir = Some(silent.path().to_path_buf());
+        failing.heartbeat_interval = Duration::from_millis(50);
+        let task = tokio::spawn(heartbeat_loop(
+            failing,
+            reqwest::Client::new(),
+            Arc::new(RwLock::new(Vec::new())),
+            "test-host".into(),
+            Instant::now(),
+        ));
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        task.abort();
+        assert!(
+            !silent.path().join(update::HEARTBEAT_MARKER).exists(),
+            "a heartbeat nobody accepted must not count as proof"
+        );
+    }
+
+    #[test]
+    fn a_camera_with_its_own_credentials_does_not_get_the_shared_pair() {
+        let state = tempfile::tempdir().unwrap();
+        let key = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let mut store =
+            crate::camera_credentials::CameraCredentials::load(state.path(), Some(key)).unwrap();
+        store.set("192.168.1.50", "own", "own-secret").unwrap();
+        let mut config = config("http://127.0.0.1:1");
+        config.camera_username = Some("shared".into());
+        config.camera_password = Some("shared-secret".into());
+        config.camera_credentials = Arc::new(store);
+
+        assert_eq!(
+            config.camera_login("rtsp://192.168.1.50:554/stream"),
+            (Some("own".into()), Some("own-secret".into())),
+            "the camera's own credentials, found from the stream it serves"
+        );
+        assert_eq!(
+            config.camera_login("http://192.168.1.99/onvif/device_service"),
+            (Some("shared".into()), Some("shared-secret".into())),
+            "a camera nobody configured still gets the pair from the environment"
+        );
+        assert!(
+            config.onvif_login("rtsp://192.168.1.50/stream").is_some(),
+            "ONVIF takes the same credentials"
+        );
+    }
+
     fn config(api_url: &str) -> Config {
         Config {
             api_url: api_url.to_owned(),
@@ -1211,6 +1430,8 @@ mod tests {
             command_poll_interval: Duration::from_millis(20),
             camera_username: None,
             camera_password: None,
+            camera_credentials: Arc::new(crate::camera_credentials::CameraCredentials::empty()),
+            state_dir: None,
             explicit_rtsp_url: None,
             explicit_camera_name: "Camera".into(),
             onvif_hosts: Vec::new(),

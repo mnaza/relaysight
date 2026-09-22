@@ -29,13 +29,25 @@ No entitlement service configured means Community. The API
 reports `camera_limit: null`, and enrollment is unlimited by
 camera count.
 
-A real gateway on the camera LAN:
+On a site box, the gateway installs as a systemd service
+from a signed release and keeps itself current:
+`docs/INSTALL-GATEWAY.md`. From a checkout, a real gateway
+on the camera LAN:
 
 ```bash
 export CAMERA_USERNAME=admin
 export CAMERA_PASSWORD='camera-password'
 export ENROLLMENT_TOKEN='TOKEN_FROM_DASHBOARD'
 make edge
+```
+
+That pair is the fallback. A camera with its own
+password gets its own entry, read from stdin and kept
+encrypted on the gateway:
+
+```bash
+printf '%s\n' 'the-camera-password' |
+  vms-gateway credentials set 192.168.1.50 admin
 ```
 
 Full local demo, API and web and plugins and MinIO and
@@ -147,8 +159,8 @@ It is not needed to run this. Nothing here links to it unless
 ## Docs
 
 `docs/ARCHITECTURE.md`, `docs/PLUGIN-SDK.md`,
-`docs/EDITIONS.md`, `docs/DEMO.md`, `docs/ARCHIVE.md`,
-`docs/LIVE.md`, `docs/AI.md`.
+`docs/EDITIONS.md`, `docs/DEMO.md`, `docs/INSTALL-GATEWAY.md`,
+`docs/ARCHIVE.md`, `docs/LIVE.md`, `docs/AI.md`.
 
 `docs/TURN-COSTS.md` is the one to read if you are pricing
 relay bandwidth. The finding is that a flat-rate box makes

@@ -105,3 +105,33 @@ test('a revoke the API refuses says so instead of failing silently', async () =>
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.deepEqual(alerts, [dict['app.gateways.revokeFailed']], 'the installer believed a failed revoke worked');
 });
+
+test('only a revoked gateway offers to retire its cameras', async () => {
+  await startDashboard({ brand, locale: 'en', dict });
+  const cards = [...document.querySelectorAll('#gateways-grid article')];
+  const live = cards.find(card => card.textContent.includes('edge-live'));
+  const dead = cards.find(card => card.textContent.includes('edge-dead'));
+  assert.equal(live.querySelector('.gw-retire'), null, 'a working gateway keeps its cameras');
+  assert.ok(dead.querySelector('.gw-retire'), 'a revoked gateway has no other way to tidy up');
+});
+
+test('retiring cameras confirms and posts to the retire endpoint', async () => {
+  await startDashboard({ brand, locale: 'en', dict });
+  const cards = [...document.querySelectorAll('#gateways-grid article')];
+  const dead = cards.find(card => card.textContent.includes('edge-dead'));
+  dead.querySelector('.gw-retire').dispatchEvent(new Event('click', { bubbles: true }));
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.deepEqual(posted, ['api/v1/gateways/gw-dead/cameras/retire']);
+});
+
+test('a retire the API refuses says so instead of failing silently', async () => {
+  stubFetch({ postStatus: 409 });
+  const alerts = [];
+  globalThis.alert = message => alerts.push(message);
+  await startDashboard({ brand, locale: 'en', dict });
+  const cards = [...document.querySelectorAll('#gateways-grid article')];
+  const dead = cards.find(card => card.textContent.includes('edge-dead'));
+  dead.querySelector('.gw-retire').dispatchEvent(new Event('click', { bubbles: true }));
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.deepEqual(alerts, [dict['app.gateways.retireFailed']], 'the installer believed a failed retire worked');
+});

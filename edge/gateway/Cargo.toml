@@ -21,7 +21,12 @@ futures = "0.3"
 quick-xml = "0.38"
 rand = "0.8"
 reqwest.workspace = true
-retina = "0.4.20"
+# Release signatures (Ed25519) and hashes. Already in the tree through rustls.
+ring = "0.17"
+# scottlamb/retina#137, not yet released: some Dahua firmware writes the same
+# SSRC as hex in Transport and decimal in RTP-Info, and stock retina refuses
+# the stream. Back to crates.io once a release carries the fix.
+retina = { git = "https://github.com/mnaza/retina", rev = "83b25a88a62f83cd6605ab36486434ff9e34733a" }
 sha1 = "0.10"
 serde.workspace = true
 serde_json.workspace = true

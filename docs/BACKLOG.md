@@ -67,16 +67,16 @@
 - [x] Persistent model for organizations, sites, gateways and cameras — done as SQLite behind a `Store` trait (spec: `docs/superpowers/specs/2026-09-06-persistent-fleet-store-design.md`); Postgres becomes a second `Store` implementation when hosted scale calls for it
 - [x] Production auth for installer dashboard
 - [x] Encrypted persistent gateway token / identity
-- [ ] Per-camera credential store encrypted at rest on edge
+- [x] Per-camera credential store encrypted at rest on edge — `vms-gateway credentials`, keyed by address, with `CAMERA_USERNAME`/`CAMERA_PASSWORD` as the fallback (spec: `docs/superpowers/specs/2026-09-21-per-camera-credentials-design.md`)
 - [ ] Hikvision/Dahua compatibility fixtures and device test matrix
-- [ ] Gateway installer package / update channel (systemd + Docker)
+- [x] Gateway installer package / update channel — `install.sh` onto a hardened systemd service, signed releases, daily self-update with rollback, image on ghcr (`docs/INSTALL-GATEWAY.md`, `make check-installer`); the first real release waits on the release key
 - [x] Gateway revocation and audit log
-- [ ] Camera decommission flow — retire a revoked gateway's cameras from the roster
+- [x] Camera decommission flow — retire a revoked gateway's cameras from the roster, as a `retired_at` tombstone a reporting gateway can undo (spec: `docs/superpowers/specs/2026-09-21-camera-decommission-design.md`)
 - [x] Both editions demonstrable on one machine — `make demo-community`, `make demo-commercial [PLAN=pro]`, `make check-editions`, against a stand-in entitlement service in `deploy/demo-entitlements/` (`docs/DEMO.md`)
 - [x] Relay serves TURN over TLS on 443 (`make check-relay`)
 - [x] Gateway relays over TURN TCP/TLS — through a local bridge in the gateway (`make check-gateway-relay` covers TLS; plain TCP has only met a test server); remove it once webrtc-rs supports `turns:` (webrtc-rs#848)
-- [ ] Relay healthcheck notices an expired or wrong-name certificate, not only a missing TLS listener
-- [ ] install-cert.sh notices a relay whose TLS listener never came up and says to restart it instead of reporting a reload
+- [x] Relay healthcheck notices an expired or wrong-name certificate, not only a missing TLS listener (`make check-relay` steps 9 and 10)
+- [x] install-cert.sh notices a relay whose TLS listener never came up and says to restart it instead of reporting a reload (step 12)
 
 ## Plugin productionization
 

@@ -309,7 +309,7 @@ async fn forward_rtsp_h264(
             url,
             SessionOptions::default()
                 .creds(creds)
-                .user_agent(format!("vms-gateway/{}", env!("CARGO_PKG_VERSION"))),
+                .user_agent(format!("vms-gateway/{}", crate::VERSION)),
         ),
     )
     .await

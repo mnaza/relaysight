@@ -40,9 +40,13 @@
       "properties": {
         "image": { "type": "string" },
         "apiBaseUrl": { "type": "string" },
+        "installerUrl": {
+          "type": "string",
+          "description": "Where install.sh is published; {installerUrl} in the template."
+        },
         "installCommandTemplate": {
           "type": "string",
-          "description": "May use {apiUrl}, {enrollmentToken}, {gatewayId}, {cameraLimit}, {image}."
+          "description": "May use {installerUrl}, {apiUrl}, {enrollmentToken}, {gatewayId}, {cameraLimit}, {image}."
         }
       },
       "additionalProperties": true

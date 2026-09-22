@@ -57,7 +57,7 @@ pub async fn record_h264_cmaf(
     let (url, creds) = crate::rtsp::split_credentials(raw_url, username, password)?;
     let options = SessionOptions::default()
         .creds(creds)
-        .user_agent(format!("vms-gateway/{}", env!("CARGO_PKG_VERSION")));
+        .user_agent(format!("vms-gateway/{}", crate::VERSION));
 
     let mut session = timeout(Duration::from_secs(8), Session::describe(url, options))
         .await

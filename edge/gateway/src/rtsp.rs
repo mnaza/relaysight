@@ -117,7 +117,7 @@ pub async fn probe(
 
     let options = SessionOptions::default()
         .creds(creds)
-        .user_agent(format!("vms-gateway/{}", env!("CARGO_PKG_VERSION")));
+        .user_agent(format!("vms-gateway/{}", crate::VERSION));
 
     let mut session = timeout(Duration::from_secs(8), Session::describe(url, options))
         .await

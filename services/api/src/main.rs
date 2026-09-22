@@ -235,6 +235,10 @@ fn build_router(state: AppState) -> Router {
         .route("/api/v1/cameras", get(cameras))
         .route("/api/v1/gateways", get(gateways))
         .route("/api/v1/gateways/{gateway_id}/revoke", post(revoke_gateway))
+        .route(
+            "/api/v1/gateways/{gateway_id}/cameras/retire",
+            post(retire_gateway_cameras),
+        )
         .route("/api/v1/commands/{command_id}", get(command_view))
         .route("/api/v1/rtc/config", get(rtc_config))
         .route(
@@ -554,6 +558,65 @@ async fn revoke_gateway(
     state.gateways.write().await.remove(&gateway_id);
     state.camera_batches.write().await.remove(&gateway_id);
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Take a revoked gateway's cameras out of the roster. They come back on
+/// their own if a gateway ever reports them again, which is what makes this
+/// safe to offer: it tidies the fleet without deciding anything permanent.
+async fn retire_gateway_cameras(
+    State(state): State<AppState>,
+    Path(gateway_id): Path<String>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    // A mistyped id is not a conflict, it is a miss — the same 404 a revoke
+    // gives.
+    if !state
+        .store
+        .gateway_exists(&gateway_id)
+        .await
+        .map_err(store_status)?
+    {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    // Only after a revoke. On a working gateway this would empty a live site's
+    // roster until the next telemetry batch refilled it.
+    if !state
+        .store
+        .gateway_revoked(&gateway_id)
+        .await
+        .map_err(store_status)?
+    {
+        return Err(StatusCode::CONFLICT);
+    }
+    let now = Utc::now();
+    // Close the incidents first. A retired camera is out of the roster the
+    // incident pass walks, so an incident left open here would stay open
+    // forever; failing before anything is stamped leaves the camera visible
+    // and the retry harmless.
+    let cameras = state.store.fleet_cameras().await.map_err(store_status)?;
+    for camera in cameras
+        .iter()
+        .filter(|camera| camera.gateway_id == gateway_id)
+    {
+        state
+            .store
+            .close_incident(&camera.id, now)
+            .await
+            .map_err(store_status)?;
+    }
+    let retired = state
+        .store
+        .retire_gateway_cameras(&gateway_id, now)
+        .await
+        .map_err(store_status)?;
+    audit(
+        &state,
+        "admin",
+        "cameras.retired",
+        &gateway_id,
+        Some(&format!("{} cameras", retired.len())),
+    )
+    .await;
+    Ok(Json(serde_json::json!({ "retired": retired.len() })))
 }
 
 async fn gateways(State(state): State<AppState>) -> Result<Json<Vec<GatewayView>>, StatusCode> {
@@ -2243,6 +2306,138 @@ mod tests {
         enrolled["gateway_token"].as_str().unwrap().to_owned()
     }
 
+    /// Enrol gw-1 and give it two cameras.
+    async fn gateway_with_two_cameras(state: &AppState, cookie: &str) -> String {
+        let token = enrolled_gateway_token(state, cookie).await;
+        let mut batch = telemetry_batch("gw-1");
+        batch["cameras"] = serde_json::json!([camera("cam-1", "gw-1"), camera("cam-2", "gw-1")]);
+        let (status, _) = send(
+            state,
+            post("/api/v1/cameras/telemetry", Some(&token), batch),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        token
+    }
+
+    async fn roster_size(state: &AppState, cookie: &str) -> usize {
+        let (_, body) = send(state, with_cookie(get("/api/v1/cameras"), cookie)).await;
+        body.as_array().expect("a list").len()
+    }
+
+    #[tokio::test]
+    async fn a_working_gateway_does_not_lose_its_cameras() {
+        let state = test_state().await;
+        seed_admin(&state).await;
+        let cookie = login_cookie(&state).await;
+        gateway_with_two_cameras(&state, &cookie).await;
+
+        // Retiring is for a gateway that has been revoked. On a live one it is
+        // a mistake, and a mistake that would empty a working site's roster.
+        let (status, _) = send(
+            &state,
+            with_cookie(
+                post(
+                    "/api/v1/gateways/gw-1/cameras/retire",
+                    None,
+                    serde_json::json!({}),
+                ),
+                &cookie,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(roster_size(&state, &cookie).await, 2, "nothing was retired");
+    }
+
+    #[tokio::test]
+    async fn retiring_the_cameras_of_a_gateway_that_does_not_exist_is_a_404() {
+        // A typo is a miss, not a conflict — the same answer a revoke gives.
+        let state = test_state().await;
+        seed_admin(&state).await;
+        let cookie = login_cookie(&state).await;
+        let (status, _) = send(
+            &state,
+            with_cookie(
+                post(
+                    "/api/v1/gateways/gw-typo/cameras/retire",
+                    None,
+                    serde_json::json!({}),
+                ),
+                &cookie,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn retiring_a_revoked_gateways_cameras_empties_the_roster() {
+        let state = test_state().await;
+        seed_admin(&state).await;
+        let cookie = login_cookie(&state).await;
+        gateway_with_two_cameras(&state, &cookie).await;
+        let (status, _) = send(
+            &state,
+            with_cookie(
+                post("/api/v1/gateways/gw-1/revoke", None, serde_json::json!({})),
+                &cookie,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (status, body) = send(
+            &state,
+            with_cookie(
+                post(
+                    "/api/v1/gateways/gw-1/cameras/retire",
+                    None,
+                    serde_json::json!({}),
+                ),
+                &cookie,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["retired"], 2);
+        assert_eq!(roster_size(&state, &cookie).await, 0);
+
+        let (_, fleet) = send(&state, with_cookie(get("/api/v1/fleet"), &cookie)).await;
+        let in_fleet: usize = fleet["customers"]
+            .as_array()
+            .expect("customers")
+            .iter()
+            .flat_map(|customer| customer["sites"].as_array().expect("sites"))
+            .map(|site| site["cameras"].as_array().expect("cameras").len())
+            .sum();
+        assert_eq!(in_fleet, 0, "the dashboard stops showing them too");
+
+        assert!(
+            audit_actions(&state, &cookie)
+                .await
+                .iter()
+                .any(|a| a == "cameras.retired"),
+            "the retire leaves a row"
+        );
+
+        // Nothing left to retire the second time.
+        let (status, body) = send(
+            &state,
+            with_cookie(
+                post(
+                    "/api/v1/gateways/gw-1/cameras/retire",
+                    None,
+                    serde_json::json!({}),
+                ),
+                &cookie,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["retired"], 0);
+    }
+
     #[tokio::test]
     async fn a_revoked_gateway_is_refused_every_credential_until_it_reenrolls() {
         let state = test_state().await;
@@ -2450,6 +2645,7 @@ mod tests {
         ("GET", "/api/v1/cameras"),
         ("GET", "/api/v1/gateways"),
         ("POST", "/api/v1/gateways/gw-1/revoke"),
+        ("POST", "/api/v1/gateways/gw-1/cameras/retire"),
         ("POST", "/api/v1/enrollments"),
         ("GET", "/api/v1/commands/cmd-1"),
         ("GET", "/api/v1/rtc/config"),

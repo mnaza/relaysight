@@ -43,6 +43,58 @@ impl std::fmt::Debug for GatewayIdentity {
     }
 }
 
+/// The key protecting everything the gateway keeps in its state directory:
+/// `GATEWAY_STATE_KEY` when given, else a file created 0600 on first use. The
+/// directory itself is created 0700.
+pub(crate) fn state_key(dir: &Path, env_key: Option<&str>) -> anyhow::Result<[u8; 32]> {
+    fs::create_dir_all(dir)?;
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+    match env_key {
+        Some(hex) => key_from_hex(hex),
+        None => load_or_create_key(&dir.join(KEY_FILE)),
+    }
+}
+
+/// Nonce, then ciphertext. One construction for every secret on this box.
+pub(crate) fn seal(key: &[u8; 32], plain: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let mut nonce = [0u8; NONCE_LEN];
+    OsRng.fill_bytes(&mut nonce);
+    let ciphertext = XChaCha20Poly1305::new(key.into())
+        .encrypt(XNonce::from_slice(&nonce), plain)
+        .map_err(|_| anyhow::anyhow!("encryption failed"))?;
+    let mut blob = Vec::with_capacity(NONCE_LEN + ciphertext.len());
+    blob.extend_from_slice(&nonce);
+    blob.extend_from_slice(&ciphertext);
+    Ok(blob)
+}
+
+/// `what` names the file in the error, because the one thing an operator needs
+/// from a failure here is which file to look at.
+pub(crate) fn open_sealed(key: &[u8; 32], blob: &[u8], what: &str) -> anyhow::Result<Vec<u8>> {
+    if blob.len() <= NONCE_LEN {
+        anyhow::bail!("{what} is truncated");
+    }
+    let (nonce, ciphertext) = blob.split_at(NONCE_LEN);
+    XChaCha20Poly1305::new(key.into())
+        .decrypt(XNonce::from_slice(nonce), ciphertext)
+        .map_err(|_| anyhow::anyhow!("{what} does not decrypt with this key"))
+}
+
+/// Write, then rename: a reader never sees a half-written secret, and the file
+/// is never readable by anyone else even for an instant.
+pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    // `<file>.tmp`, not a replaced extension: identity.enc.tmp is the name a
+    // crash under an older build would have left, and two files in this
+    // directory must never collide on it.
+    let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(".tmp");
+    let tmp_path = path.with_file_name(tmp_name);
+    fs::write(&tmp_path, bytes)?;
+    fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600))?;
+    fs::rename(&tmp_path, path)?;
+    Ok(())
+}
+
 pub struct IdentityStore {
     dir: PathBuf,
     key: [u8; 32],
@@ -53,15 +105,9 @@ impl IdentityStore {
     /// `env_key` (64 hex chars) when given, else from the key file,
     /// created with mode 0600 on first use.
     pub fn open(dir: &Path, env_key: Option<&str>) -> anyhow::Result<Self> {
-        fs::create_dir_all(dir)?;
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
-        let key = match env_key {
-            Some(hex) => key_from_hex(hex)?,
-            None => load_or_create_key(&dir.join(KEY_FILE))?,
-        };
         Ok(Self {
             dir: dir.to_path_buf(),
-            key,
+            key: state_key(dir, env_key)?,
         })
     }
 
@@ -74,19 +120,11 @@ impl IdentityStore {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(err) => return Err(err.into()),
         };
-        if blob.len() <= NONCE_LEN {
-            anyhow::bail!("identity state at {} is truncated", path.display());
-        }
-        let (nonce, ciphertext) = blob.split_at(NONCE_LEN);
-        let cipher = XChaCha20Poly1305::new((&self.key).into());
-        let plain = cipher
-            .decrypt(XNonce::from_slice(nonce), ciphertext)
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "identity state at {} does not decrypt with this key",
-                    path.display()
-                )
-            })?;
+        let plain = open_sealed(
+            &self.key,
+            &blob,
+            &format!("identity state at {}", path.display()),
+        )?;
         let identity: GatewayIdentity = serde_json::from_slice(&plain)?;
         if identity.version != CURRENT_VERSION {
             anyhow::bail!(
@@ -99,24 +137,8 @@ impl IdentityStore {
     }
 
     pub fn save(&self, identity: &GatewayIdentity) -> anyhow::Result<()> {
-        let mut nonce = [0u8; NONCE_LEN];
-        OsRng.fill_bytes(&mut nonce);
-        let cipher = XChaCha20Poly1305::new((&self.key).into());
-        let ciphertext = cipher
-            .encrypt(
-                XNonce::from_slice(&nonce),
-                serde_json::to_vec(identity)?.as_slice(),
-            )
-            .map_err(|_| anyhow::anyhow!("identity encryption failed"))?;
-        let mut blob = Vec::with_capacity(NONCE_LEN + ciphertext.len());
-        blob.extend_from_slice(&nonce);
-        blob.extend_from_slice(&ciphertext);
-        let path = self.dir.join(IDENTITY_FILE);
-        let tmp_path = self.dir.join(format!("{IDENTITY_FILE}.tmp"));
-        fs::write(&tmp_path, blob)?;
-        fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600))?;
-        fs::rename(&tmp_path, &path)?;
-        Ok(())
+        let blob = seal(&self.key, &serde_json::to_vec(identity)?)?;
+        write_private(&self.dir.join(IDENTITY_FILE), &blob)
     }
 
     /// Removing nothing is fine — the reenroll path wipes unconditionally.
