@@ -364,6 +364,50 @@ pub struct IncidentView {
     pub detail: Option<String>,
 }
 
+/// How a video source reaches the gateway.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceKind {
+    /// The gateway pulls it: an NVR, an encoder, another VMS.
+    Rtsp,
+    /// Pushed to the gateway, identified by a stream key.
+    Rtmp,
+    /// The same, over SRT.
+    Srt,
+}
+
+impl SourceKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SourceKind::Rtsp => "rtsp",
+            SourceKind::Rtmp => "rtmp",
+            SourceKind::Srt => "srt",
+        }
+    }
+}
+
+/// Video the gateway carries that is not a camera it discovered. Never holds a
+/// credential: a source's password lives on the gateway, as a camera's does.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VideoSource {
+    pub id: String,
+    pub gateway_id: String,
+    pub name: String,
+    pub kind: SourceKind,
+    /// A URL for `rtsp`, a stream key for what is pushed.
+    pub address: String,
+    pub added_at: DateTime<Utc>,
+}
+
+/// What the dashboard sends to add one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VideoSourceRequest {
+    pub gateway_id: String,
+    pub name: String,
+    pub kind: SourceKind,
+    pub address: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GatewayView {
     pub gateway_id: String,

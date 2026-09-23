@@ -1,11 +1,6 @@
 use std::{num::NonZeroU32, time::Duration};
 
 use anyhow::{Context, anyhow};
-use futures::StreamExt;
-use retina::{
-    client::{PlayOptions, Session, SessionOptions, SetupOptions},
-    codec::{CodecItem, FrameFormat, ParametersRef},
-};
 use shiguredo_mp4::{
     TrackKind, Uint,
     boxes::{Avc1Box, AvccBox, SampleEntry, VisualSampleEntryFields},
@@ -54,47 +49,23 @@ pub async fn record_h264_cmaf(
     total_duration: Duration,
     target_segment_duration: Duration,
 ) -> anyhow::Result<CmafRecording> {
-    let (url, creds) = crate::rtsp::split_credentials(raw_url, username, password)?;
-    let options = SessionOptions::default()
-        .creds(creds)
-        .user_agent(format!("vms-gateway/{}", crate::VERSION));
+    let mut source =
+        crate::frames::RtspSource::open(raw_url, username, password, crate::frames::Framing::Avcc)
+            .await?;
+    record_from(&mut source, total_duration, target_segment_duration).await
+}
 
-    let mut session = timeout(Duration::from_secs(8), Session::describe(url, options))
-        .await
-        .context("RTSP DESCRIBE timeout")??;
-    let video_stream = session
-        .streams()
-        .iter()
-        .position(|stream| stream.media().eq_ignore_ascii_case("video"))
-        .ok_or_else(|| anyhow!("RTSP session has no video stream"))?;
-    let encoding = session.streams()[video_stream]
-        .encoding_name()
-        .to_ascii_uppercase();
-    if encoding != "H264" {
-        return Err(anyhow!(
-            "CMAF recorder currently supports H264, camera returned {encoding}"
-        ));
-    }
-
-    timeout(
-        Duration::from_secs(8),
-        session.setup(
-            video_stream,
-            SetupOptions::default().frame_format(FrameFormat::MP4),
-        ),
-    )
-    .await
-    .context("RTSP SETUP timeout")??;
-
-    let playing = timeout(Duration::from_secs(8), session.play(PlayOptions::default()))
-        .await
-        .context("RTSP PLAY timeout")??;
-    let mut demuxed = playing.demuxed()?;
-
+/// The recorder itself, over anything that yields H.264: an RTSP camera today,
+/// a pushed stream once ingest exists.
+pub(crate) async fn record_from(
+    source: &mut dyn crate::frames::FrameSource,
+    total_duration: Duration,
+    target_segment_duration: Duration,
+) -> anyhow::Result<CmafRecording> {
     let receive_deadline = total_duration + Duration::from_secs(12);
     let receive_started = tokio::time::Instant::now();
     let mut first_timestamp = None;
-    let mut clock_rate = None;
+    let mut clock_rate: Option<u32> = None;
     let mut frames: Vec<EncodedFrame> = Vec::new();
     let mut codec = None;
     let mut dimensions = None;
@@ -102,31 +73,23 @@ pub async fn record_h264_cmaf(
     let mut fallback_duration = None;
 
     while receive_started.elapsed() < receive_deadline {
-        let item = timeout(Duration::from_secs(4), demuxed.next())
+        let frame = timeout(Duration::from_secs(4), source.next_frame())
             .await
-            .context("RTSP frame timeout")?;
-        let Some(item) = item else { break };
-        let item = item.context("receive RTSP media")?;
-        let CodecItem::VideoFrame(frame) = item else {
-            continue;
-        };
-        if frame.stream_id() != video_stream {
-            continue;
-        }
+            .context("frame timeout")??;
+        let Some(frame) = frame else { break };
 
         // A recording must start at a random access point so it can be decoded independently.
-        if first_timestamp.is_none() && !frame.is_random_access_point() {
+        if first_timestamp.is_none() && !frame.keyframe {
             continue;
         }
 
-        if first_timestamp.is_none() || frame.has_new_parameters() {
-            let params = match demuxed.streams()[video_stream].parameters() {
-                Some(ParametersRef::Video(params)) => params,
-                _ => return Err(anyhow!("video parameters unavailable after H264 frame")),
-            };
-            let new_codec = params.rfc6381_codec().to_owned();
-            let new_dimensions = params.pixel_dimensions();
-            let new_avcc = parse_avcc(params.extra_data())?;
+        if first_timestamp.is_none() || frame.new_parameters {
+            let params = source
+                .parameters()
+                .ok_or_else(|| anyhow!("video parameters unavailable after H264 frame"))?;
+            let new_codec = params.rfc6381_codec.clone();
+            let new_dimensions = params.pixel_dimensions;
+            let new_avcc = parse_avcc(&params.extra_data)?;
             if first_timestamp.is_some()
                 && (codec.as_ref() != Some(&new_codec) || dimensions != Some(new_dimensions))
             {
@@ -137,32 +100,31 @@ pub async fn record_h264_cmaf(
             codec = Some(new_codec);
             dimensions = Some(new_dimensions);
             avcc = Some(new_avcc);
-            fallback_duration = params.frame_rate().and_then(|(num, den)| {
+            fallback_duration = params.frame_rate.and_then(|(num, den)| {
                 if den == 0 {
                     None
                 } else {
-                    let rate = frame.timestamp().clock_rate().get() as f64;
+                    let rate = frame.clock_rate as f64;
                     Some(((rate * num as f64 / den as f64).round() as u32).max(1))
                 }
             });
         }
 
-        let ts = frame.timestamp();
         if first_timestamp.is_none() {
-            first_timestamp = Some(ts.timestamp());
-            clock_rate = Some(ts.clock_rate());
+            first_timestamp = Some(frame.timestamp);
+            clock_rate = Some(frame.clock_rate);
         }
-        if Some(ts.clock_rate()) != clock_rate {
-            return Err(anyhow!("RTSP video clock rate changed during recording"));
+        if Some(frame.clock_rate) != clock_rate {
+            return Err(anyhow!("video clock rate changed during recording"));
         }
         let start = first_timestamp.expect("set above");
-        let elapsed_ticks = ts.timestamp().saturating_sub(start).max(0) as u64;
-        let elapsed = Duration::from_secs_f64(elapsed_ticks as f64 / ts.clock_rate().get() as f64);
+        let elapsed_ticks = frame.timestamp.saturating_sub(start).max(0) as u64;
+        let elapsed = Duration::from_secs_f64(elapsed_ticks as f64 / frame.clock_rate as f64);
 
-        let keyframe = frame.is_random_access_point();
+        let keyframe = frame.keyframe;
         frames.push(EncodedFrame {
-            timestamp: ts.timestamp(),
-            data: frame.into_data(),
+            timestamp: frame.timestamp,
+            data: frame.data.to_vec(),
             keyframe,
         });
 
@@ -179,7 +141,9 @@ pub async fn record_h264_cmaf(
     if frames.len() < 2 {
         return Err(anyhow!("not enough H264 frames to build fMP4 recording"));
     }
-    let clock_rate = clock_rate.ok_or_else(|| anyhow!("missing RTP clock rate"))?;
+    let clock_rate = clock_rate
+        .and_then(NonZeroU32::new)
+        .ok_or_else(|| anyhow!("missing RTP clock rate"))?;
     let codec = codec.ok_or_else(|| anyhow!("missing H264 codec parameters"))?;
     let (width, height) = dimensions.ok_or_else(|| anyhow!("missing video dimensions"))?;
     let avcc = avcc.ok_or_else(|| anyhow!("missing AVCDecoderConfigurationRecord"))?;
@@ -363,8 +327,57 @@ fn read_avcc_nal(data: &[u8], cursor: &mut usize) -> anyhow::Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{EncodedFrame, parse_avcc, split_on_keyframes, ticks_to_ms};
+    use super::{EncodedFrame, parse_avcc, record_from, split_on_keyframes, ticks_to_ms};
+    use crate::frames::{Frame, VideoParameters, testing::ScriptedSource};
     use std::num::NonZeroU32;
+    use std::time::Duration;
+
+    /// A minimal AVCDecoderConfigurationRecord: baseline, one SPS, one PPS,
+    /// 4-byte lengths. (High profile would need a chroma_format the avcC box
+    /// insists on, which is a camera-side matter, not the source's.)
+    const AVCC: [u8; 19] = [
+        1, 0x42, 0xe0, 0x1e, 0xff, 0xe1, 0, 4, 0x67, 0x42, 0xe0, 0x1e, 1, 0, 4, 0x68, 0xee, 0x3c,
+        0x80,
+    ];
+
+    #[tokio::test]
+    async fn records_from_a_source_that_is_not_a_camera() {
+        // The recorder no longer knows what RTSP is. Anything that yields H.264
+        // access units — a pushed stream, a test script — records the same way.
+        let frames = (0..6).map(|i| Frame {
+            data: bytes::Bytes::from(vec![0, 0, 0, 1, 0x65, i as u8]),
+            timestamp: i * 3_000,
+            clock_rate: 90_000,
+            keyframe: i % 3 == 0,
+            new_parameters: i == 0,
+        });
+        let mut source = ScriptedSource {
+            frames: frames.collect(),
+            parameters: Some(VideoParameters {
+                rfc6381_codec: "avc1.42e01e".into(),
+                pixel_dimensions: (1280, 720),
+                extra_data: AVCC.to_vec(),
+                frame_rate: Some((1, 30)),
+            }),
+        };
+        let recording = record_from(
+            &mut source,
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+        )
+        .await
+        .expect("a scripted source records");
+        assert_eq!(recording.codec, "avc1.42e01e");
+        assert_eq!((recording.width, recording.height), (1280, 720));
+        assert!(!recording.init.is_empty(), "an init segment is written");
+        assert_eq!(
+            recording.segments.len(),
+            2,
+            "one segment per keyframe group at this target"
+        );
+        assert_eq!(recording.segments[0].start_offset_ms, 0);
+        assert!(recording.segments.iter().all(|s| !s.bytes.is_empty()));
+    }
 
     #[test]
     fn parses_avcc_sps_pps() {

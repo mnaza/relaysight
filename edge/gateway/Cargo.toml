@@ -38,6 +38,14 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 vms-domain = { path = "../../crates/domain" }
 vms-plugin-sdk = { path = "../../crates/plugin-sdk" }
+rml_rtmp = "0.8"
+srt-tokio = { version = "0.4", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+
+[features]
+default = []
+# Pushed SRT ingest. Off by default: it works against an in-process caller and
+# has never met a real encoder. See docs/superpowers/specs/2026-09-22-video-sources-design.md.
+srt = ["dep:srt-tokio"]

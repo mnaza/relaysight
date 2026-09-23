@@ -10,7 +10,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use sha2::{Digest, Sha256};
 use vms_domain::{
     AuditView, CameraTelemetryBatch, EnrollmentRequest, GatewayEnrollmentRequest, GatewayView,
-    IncidentView, RecordingManifest,
+    IncidentView, RecordingManifest, VideoSource,
 };
 
 #[derive(Debug, Clone)]
@@ -222,6 +222,19 @@ pub trait Store: Send + Sync {
     /// joined names and flags. `online` and `heartbeat` are the handler's to
     /// fill — the store never claims liveness.
     async fn gateway_views(&self) -> Result<Vec<GatewayView>, StoreError>;
+
+    /// Add a source. Its gateway must exist.
+    async fn add_video_source(&self, source: &VideoSource) -> Result<(), StoreError>;
+
+    /// Every source, for the dashboard.
+    async fn video_sources(&self) -> Result<Vec<VideoSource>, StoreError>;
+
+    /// One gateway's sources, in the order they were added — what its poll answers.
+    async fn gateway_video_sources(&self, gateway_id: &str)
+    -> Result<Vec<VideoSource>, StoreError>;
+
+    /// `NotFound` when there is nothing to remove.
+    async fn delete_video_source(&self, id: &str) -> Result<(), StoreError>;
 
     /// One audit row. Callers treat failure as loggable, never fatal.
     async fn record_audit(

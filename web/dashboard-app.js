@@ -57,12 +57,17 @@ export async function startDashboard({ brand, locale, dict }) {
     catch { return []; }
   }
 
+  async function loadSources() {
+    try { return await tryJson('api/v1/sources'); }
+    catch { return []; }
+  }
+
   async function loadIncidents() {
     try { return await tryJson('api/v1/incidents'); }
     catch { return []; }
   }
 
-  let [fleet, telemetry, edition, plugins, gateways, incidents] = await Promise.all([loadFleet(), loadTelemetry(), loadEdition(), loadPlugins(), loadGateways(), loadIncidents()]);
+  let [fleet, telemetry, edition, plugins, gateways, incidents, videoSources] = await Promise.all([loadFleet(), loadTelemetry(), loadEdition(), loadPlugins(), loadGateways(), loadIncidents(), loadSources()]);
   let telemetryById = new Map(telemetry.map(camera => [camera.camera_id, camera]));
   const isLive = fleet.source === 'live';
   const sourceTag = document.querySelector('#fleet-source');
@@ -527,11 +532,11 @@ export async function startDashboard({ brand, locale, dict }) {
     if (document.querySelector('.modal-backdrop.open')) return;
     let next;
     try {
-      next = await Promise.all([loadFleet(), loadTelemetry(), loadGateways(), loadIncidents()]);
+      next = await Promise.all([loadFleet(), loadTelemetry(), loadGateways(), loadIncidents(), loadSources()]);
     } catch {
       return;
     }
-    [fleet, telemetry, gateways, incidents] = next;
+    [fleet, telemetry, gateways, incidents, videoSources] = next;
     telemetryById = new Map(telemetry.map(camera => [camera.camera_id, camera]));
     rows = fleet.customers.flatMap(customer => customer.sites.map(site => ({ customer, site })));
     allCameras = rows.flatMap(row => row.site.cameras);
@@ -539,6 +544,7 @@ export async function startDashboard({ brand, locale, dict }) {
     paintIncidents();
     render(currentFilter);
     renderGateways();
+    renderSources();
     markUpdated();
   }
 
@@ -654,6 +660,94 @@ export async function startDashboard({ brand, locale, dict }) {
   }
 
   renderGateways();
+
+  // Video a gateway carries that it did not discover. The address is all the
+  // dashboard ever holds: a password belongs on the gateway, not in the cloud.
+  // Default ports, because the control plane does not know what the gateway
+  // was told to listen on: RTMP_LISTEN and SRT_LISTEN live on the box.
+  function publishUrl(source) {
+    const gateway = gateways.find(candidate => candidate.gateway_id === source.gateway_id);
+    const host = gateway?.hostname || source.gateway_id;
+    if (source.kind === 'rtmp') return `rtmp://${host}:1935/live/${source.address}`;
+    if (source.kind === 'srt') return `srt://${host}:9000?streamid=${source.address}`;
+    return null;
+  }
+
+  function renderSources() {
+    const list = document.querySelector('#sources-list');
+    const empty = document.querySelector('#sources-empty');
+    if (!list) return;
+    list.replaceChildren();
+    empty.hidden = videoSources.length > 0;
+
+    const gatewaySelect = document.querySelector('#source-form [name="gatewayId"]');
+    const chosen = gatewaySelect.value;
+    gatewaySelect.replaceChildren(...gateways.map(gateway => {
+      const option = document.createElement('option');
+      option.value = gateway.gateway_id;
+      option.textContent = gateway.hostname || gateway.gateway_id;
+      return option;
+    }));
+    if (chosen) gatewaySelect.value = chosen;
+
+    for (const source of videoSources) {
+      const card = document.createElement('article');
+      card.className = 'plugin-card';
+      card.innerHTML = `
+        <div class="panel-head">
+          <div><strong class="source-name"></strong><div class="metric-sub source-address"></div></div>
+          <span class="health-pill source-kind"></span>
+        </div>
+        <div class="metric-sub source-gateway"></div>`;
+      card.querySelector('.source-name').textContent = source.name;
+      card.querySelector('.source-address').textContent = source.address;
+      card.querySelector('.source-kind').textContent = source.kind.toUpperCase();
+      card.querySelector('.source-gateway').textContent = source.gateway_id;
+      // A pushed source is a key, not an address: whoever sets up the encoder
+      // needs the URL to publish to, built from the gateway that carries it.
+      const publishTo = publishUrl(source);
+      if (publishTo) {
+        const line = document.createElement('div');
+        line.className = 'metric-sub source-publish';
+        line.textContent = `${t(dict, 'app.sources.publishTo')} ${publishTo}`;
+        card.appendChild(line);
+      }
+      const remove = document.createElement('button');
+      remove.className = 'button small source-remove';
+      remove.textContent = t(dict, 'app.sources.remove');
+      remove.addEventListener('click', async () => {
+        if (!confirm(t(dict, 'app.sources.confirmRemove'))) return;
+        const response = await fetch(`api/v1/sources/${encodeURIComponent(source.id)}/delete`, { method: 'POST' }).catch(() => null);
+        if (!response || !response.ok) alert(t(dict, 'app.sources.removeFailed'));
+        refresh();
+      });
+      card.appendChild(remove);
+      list.appendChild(card);
+    }
+  }
+
+  renderSources();
+
+  document.querySelector('#source-form')?.addEventListener('submit', async event => {
+    event.preventDefault();
+    const form = event.target;
+    const data = new FormData(form);
+    const payload = {
+      gateway_id: String(data.get('gatewayId') || ''),
+      name: String(data.get('name') || '').trim(),
+      kind: String(data.get('kind') || 'rtsp'),
+      address: String(data.get('address') || '').trim(),
+    };
+    const response = await fetch('api/v1/sources', {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload),
+    }).catch(() => null);
+    if (!response || !response.ok) {
+      alert(t(dict, 'app.sources.addFailed'));
+      return;
+    }
+    form.reset();
+    refresh();
+  });
 
   function renderPlugins() {
     const grid = document.querySelector('#plugins-grid');

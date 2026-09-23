@@ -7,13 +7,24 @@ mod fake_browser;
 mod fake_camera;
 #[cfg(test)]
 mod fake_control_plane;
+#[cfg(test)]
+mod fake_publisher;
+mod frames;
+// Only the pushed-SRT path needs these, but its tests are worth running in
+// every build.
+#[cfg_attr(not(feature = "srt"), allow(dead_code))]
+mod h264;
 mod icepath;
 mod identity;
+mod ingest;
 mod live;
 mod onvif;
 mod release;
+mod rtmp;
 mod rtsp;
 mod snapshot;
+#[cfg(feature = "srt")]
+mod srt;
 mod turn_bridge;
 mod update;
 
@@ -70,6 +81,9 @@ struct Config {
     explicit_camera_name: String,
     /// Addresses to talk ONVIF to directly, skipping multicast discovery.
     onvif_hosts: Vec<String>,
+    /// Streams pushed to this gateway. Empty and idle unless RTMP_LISTEN is set,
+    /// and shared here because every loop that needs it already has a Config.
+    ingest: crate::ingest::Ingest,
 }
 
 impl Config {
@@ -119,6 +133,7 @@ impl Config {
             explicit_rtsp_url: env::var("CAMERA_RTSP_URL").ok().filter(|s| !s.is_empty()),
             explicit_camera_name: env::var("CAMERA_NAME")
                 .unwrap_or_else(|_| "Manual RTSP camera".into()),
+            ingest: crate::ingest::Ingest::new(),
             onvif_hosts: env::var("ONVIF_HOSTS")
                 .unwrap_or_default()
                 .split(',')
@@ -197,6 +212,10 @@ fn read_password() -> anyhow::Result<String> {
 #[derive(Clone, Debug)]
 struct CameraSource {
     rtsp_uri: String,
+    /// Set when this source is pushed to the gateway: the stream key it
+    /// publishes on. Live view and recording then read the ingest instead of
+    /// dialling anything.
+    push_key: Option<String>,
     /// Stream used for live view — the camera's substream where it has one, so a
     /// TURN-relayed session carries a fraction of the bytes. See docs/TURN-COSTS.md.
     live_rtsp_uri: String,
@@ -284,6 +303,32 @@ async fn main() -> anyhow::Result<()> {
     let reenroll = env::var("GATEWAY_REENROLL").is_ok_and(|v| v == "true");
     establish_identity(&mut config, &client, &hostname, &store, reenroll).await?;
     info!(gateway_id = %config.gateway_id, site_id = %config.site_id, camera_limit = config.camera_limit, "gateway started");
+
+    // Push ingest, when a site has an encoder that pushes rather than a camera
+    // to pull. Off unless RTMP_LISTEN says where to listen.
+    if let Some(address) = rtmp::listen_address() {
+        match tokio::net::TcpListener::bind(address).await {
+            Ok(listener) => {
+                info!(%address, "listening for pushed RTMP streams");
+                let ingest = config.ingest.clone();
+                tokio::spawn(rtmp::serve(listener, ingest));
+            }
+            Err(error) => {
+                warn!(%address, %error, "could not listen for RTMP; push ingest is off")
+            }
+        }
+    }
+
+    #[cfg(feature = "srt")]
+    if let Some(address) = srt::listen_address() {
+        let ingest = config.ingest.clone();
+        tokio::spawn(async move {
+            if let Err(error) = srt::serve(address, ingest).await {
+                warn!(%address, %error, "SRT ingest stopped");
+            }
+        });
+        info!(%address, "listening for pushed SRT streams");
+    }
 
     let probe_task = tokio::spawn(probe_loop(
         config.clone(),
@@ -403,9 +448,26 @@ async fn probe_loop(
     backoff: Arc<RwLock<Backoff>>,
     sources: Arc<RwLock<HashMap<String, CameraSource>>>,
 ) -> anyhow::Result<()> {
+    // What the dashboard has given this gateway. Kept between passes, so an API
+    // that cannot be reached does not take every source off the roster.
+    let mut video_sources: Vec<vms_domain::VideoSource> = Vec::new();
+    // What each pushed stream had counted at the end of the last pass, so the
+    // rates reported are for this interval rather than the whole session.
+    let mut pushed_marks: HashMap<String, (u64, u64, Instant)> = HashMap::new();
     loop {
         let mut telemetry = Vec::new();
         let mut fresh_sources = HashMap::new();
+        if let Some(fresh) = fetch_sources(&client, &config).await {
+            video_sources = fresh;
+        }
+        // Only keys the dashboard listed may publish. Doing this every pass is
+        // how a removed source stops the next publisher using its key.
+        config.ingest.allow(
+            video_sources
+                .iter()
+                .filter(|source| is_pushed(source.kind))
+                .map(|source| source.address.clone()),
+        );
         // Discovery is multicast, so it only reaches the local segment. Set
         // ONVIF_DISCOVERY_SECONDS=0 on a routed network to stop paying for a
         // probe that cannot succeed, and name the cameras in ONVIF_HOSTS instead.
@@ -469,6 +531,7 @@ async fn probe_loop(
                                 candidate.camera_id.clone(),
                                 CameraSource {
                                     rtsp_uri: candidate.rtsp_uri.clone(),
+                                    push_key: None,
                                     live_rtsp_uri: candidate.live_rtsp_uri.clone(),
                                     snapshot_uri: candidate.snapshot_uri.clone(),
                                     username,
@@ -525,6 +588,7 @@ async fn probe_loop(
                     id.clone(),
                     CameraSource {
                         rtsp_uri: url.clone(),
+                        push_key: None,
                         // An explicitly configured URL names one stream; there is
                         // no profile list to pick a substream from.
                         live_rtsp_uri: url.clone(),
@@ -533,8 +597,113 @@ async fn probe_loop(
                         password: login.1,
                     },
                 );
-                telemetry.push(probe_explicit(&config, id, url, &reconnects, &backoff).await);
+                telemetry.push(
+                    probe_explicit(
+                        &config,
+                        id,
+                        config.explicit_camera_name.clone(),
+                        url,
+                        &reconnects,
+                        &backoff,
+                    )
+                    .await,
+                );
             }
+        }
+
+        // Sources added from the dashboard, pulled like any other camera. A source
+        // at an address discovery already found is not a second camera.
+        let discovered: std::collections::HashSet<String> = telemetry
+            .iter()
+            .map(|camera| camera.camera_id.clone())
+            .collect();
+        for (source, id) in sources_to_probe(&video_sources, &discovered) {
+            let login = config.camera_login(&source.address);
+            fresh_sources.insert(
+                id.clone(),
+                CameraSource {
+                    rtsp_uri: source.address.clone(),
+                    push_key: None,
+                    live_rtsp_uri: source.address.clone(),
+                    snapshot_uri: None,
+                    username: login.0,
+                    password: login.1,
+                },
+            );
+            telemetry.push(
+                probe_explicit(
+                    &config,
+                    id,
+                    source.name.clone(),
+                    &source.address,
+                    &reconnects,
+                    &backoff,
+                )
+                .await,
+            );
+        }
+
+        // Streams pushed to this gateway. Nothing is dialled: either a publisher
+        // is on the key or it is not, and the ingest is the only witness.
+        for source in video_sources.iter().filter(|source| is_pushed(source.kind)) {
+            let camera_id = source_camera_id(&source.address);
+            if discovered.contains(&camera_id) {
+                continue;
+            }
+            let endpoint = match source.kind {
+                vms_domain::SourceKind::Srt => {
+                    format!("srt://{}?streamid={}", config.gateway_id, source.address)
+                }
+                _ => format!("rtmp://{}/live/{}", config.gateway_id, source.address),
+            };
+            fresh_sources.insert(
+                camera_id.clone(),
+                CameraSource {
+                    rtsp_uri: endpoint.clone(),
+                    push_key: Some(source.address.clone()),
+                    live_rtsp_uri: endpoint.clone(),
+                    snapshot_uri: None,
+                    username: None,
+                    password: None,
+                },
+            );
+            let result = pushed_metrics(
+                &config,
+                &source.address,
+                &mut pushed_marks,
+                config.probe_interval,
+            );
+            let (width, height) = match config
+                .ingest
+                .stats(&source.address, config.probe_interval * 2)
+            {
+                Some(stats) => (
+                    stats.dimensions.map(|(width, _)| width),
+                    stats.dimensions.map(|(_, height)| height),
+                ),
+                None => (None, None),
+            };
+            telemetry.push(
+                telemetry_from_probe(
+                    &config,
+                    camera_id,
+                    source.name.clone(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    width,
+                    height,
+                    &endpoint,
+                    result,
+                    // Nothing was dialled, so a silent key is not a reconnect
+                    // and does not deserve a warning every interval.
+                    true,
+                    &reconnects,
+                )
+                .await,
+            );
         }
 
         telemetry.sort_by(|a, b| {
@@ -601,28 +770,115 @@ async fn probe_candidate(
     .await
 }
 
+/// The sources this gateway has been given, or `None` when the API could not be
+/// reached or answered with something else. The caller keeps what it had: a list
+/// is state, and an outage is not an instruction to drop every source.
+async fn fetch_sources(
+    client: &reqwest::Client,
+    config: &Config,
+) -> Option<Vec<vms_domain::VideoSource>> {
+    let endpoint = format!(
+        "{}/api/v1/gateways/{}/sources",
+        config.api_url.trim_end_matches('/'),
+        config.gateway_id
+    );
+    match client.get(endpoint).bearer_auth(&config.token).send().await {
+        Ok(response) if response.status().is_success() => match response.json().await {
+            Ok(sources) => Some(sources),
+            Err(error) => {
+                warn!(%error, "the source list did not parse");
+                None
+            }
+        },
+        Ok(response) => {
+            warn!(status = %response.status(), "the source list was refused");
+            None
+        }
+        Err(error) => {
+            debug!(%error, "the source list could not be fetched; keeping the last one");
+            None
+        }
+    }
+}
+
+/// A source's camera id. Derived from the address, so the same address keeps its
+/// identity — and its recordings and incidents — across restarts and re-adds.
+fn source_camera_id(address: &str) -> String {
+    uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, address.as_bytes()).to_string()
+}
+
+/// The polled sources worth probing this pass: the pulled ones, minus anything
+/// discovery already found at the same address. Pushed streams (RTMP, SRT) are
+/// carried by the ingest that receives them, which does not exist yet.
+fn sources_to_probe<'a>(
+    sources: &'a [vms_domain::VideoSource],
+    known: &std::collections::HashSet<String>,
+) -> Vec<(&'a vms_domain::VideoSource, String)> {
+    sources
+        .iter()
+        .filter(|source| source.kind == vms_domain::SourceKind::Rtsp)
+        .map(|source| (source, source_camera_id(&source.address)))
+        .filter(|(_, id)| !known.contains(id))
+        .collect()
+}
+
+/// Pushed to the gateway rather than pulled from an address.
+fn is_pushed(kind: vms_domain::SourceKind) -> bool {
+    matches!(
+        kind,
+        vms_domain::SourceKind::Rtmp | vms_domain::SourceKind::Srt
+    )
+}
+
+/// What a pushed stream did since the last pass, as a probe would have
+/// reported it. An error is what an operator needs to see: nobody is
+/// publishing on this key.
+fn pushed_metrics(
+    config: &Config,
+    key: &str,
+    marks: &mut HashMap<String, (u64, u64, Instant)>,
+    window: Duration,
+) -> anyhow::Result<rtsp::RtspMetrics> {
+    let Some(stats) = config.ingest.stats(key, window * 2) else {
+        marks.remove(key);
+        return Err(anyhow!("nothing has ever published to stream key {key}"));
+    };
+    let now = Instant::now();
+    let (frames, bytes, elapsed) =
+        match marks.insert(key.to_string(), (stats.frames, stats.bytes, now)) {
+            Some((previous_frames, previous_bytes, at)) => (
+                stats.frames.saturating_sub(previous_frames),
+                stats.bytes.saturating_sub(previous_bytes),
+                now.saturating_duration_since(at).as_secs_f64().max(0.001),
+            ),
+            // First sight of this stream: report the session so far rather than
+            // nothing at all.
+            None => (stats.frames, stats.bytes, window.as_secs_f64().max(0.001)),
+        };
+    if !stats.publishing {
+        return Err(anyhow!("no publisher on stream key {key}"));
+    }
+    Ok(rtsp::RtspMetrics {
+        codec: stats.codec.map(|_| "H264".to_string()),
+        fps: Some((frames as f64 / elapsed) as f32),
+        bitrate_kbps: Some(((bytes as f64 * 8.0 / elapsed) / 1000.0).round() as u32),
+        packet_loss: 0,
+        frames,
+        bytes,
+    })
+}
+
 async fn probe_explicit(
     config: &Config,
     camera_id: String,
+    name: String,
     url: &str,
     reconnects: &Arc<RwLock<HashMap<String, u32>>>,
     backoff: &Arc<RwLock<Backoff>>,
 ) -> CameraTelemetry {
     let (result, held_off) = probe_with_backoff(config, &camera_id, url, backoff).await;
     telemetry_from_probe(
-        config,
-        camera_id,
-        config.explicit_camera_name.clone(),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        url,
-        result,
-        held_off,
+        config, camera_id, name, None, None, None, None, None, None, None, url, result, held_off,
         reconnects,
     )
     .await
@@ -889,14 +1145,28 @@ async fn execute_command(
             let source = camera_source(sources, camera_id).await?;
             let started_at = Utc::now();
             info!(command_id = %command.id, camera_id, duration_seconds, "recording H264 CMAF");
-            let cmaf = archive::record_h264_cmaf(
-                &source.rtsp_uri,
-                source.username.as_deref(),
-                source.password.as_deref(),
-                Duration::from_secs(u64::from(*duration_seconds)),
-                Duration::from_secs(u64::from(*segment_seconds)),
-            )
-            .await?;
+            let total = Duration::from_secs(u64::from(*duration_seconds));
+            let segment = Duration::from_secs(u64::from(*segment_seconds));
+            let cmaf = match &source.push_key {
+                // A pushed stream is already arriving; there is nothing to dial.
+                Some(key) => {
+                    let mut pushed = config
+                        .ingest
+                        .subscribe(key)
+                        .ok_or_else(|| anyhow!("nothing is publishing to stream key {key}"))?;
+                    archive::record_from(&mut pushed, total, segment).await?
+                }
+                None => {
+                    archive::record_h264_cmaf(
+                        &source.rtsp_uri,
+                        source.username.as_deref(),
+                        source.password.as_deref(),
+                        total,
+                        segment,
+                    )
+                    .await?
+                }
+            };
             let recording_id = uuid::Uuid::new_v4().to_string();
             let namespace = format!(
                 "recordings/{}/{}/{}",
@@ -977,10 +1247,21 @@ async fn execute_command(
         } => {
             let source = camera_source(sources, camera_id).await?;
             info!(command_id = %command.id, camera_id, "starting outbound-signaled WebRTC live session");
+            let media = match &source.push_key {
+                Some(key) => live::LiveMedia::Pushed(Box::new(
+                    config
+                        .ingest
+                        .subscribe(key)
+                        .ok_or_else(|| anyhow!("nothing is publishing to stream key {key}"))?,
+                )),
+                None => live::LiveMedia::Rtsp {
+                    url: source.live_rtsp_uri,
+                    username: source.username,
+                    password: source.password,
+                },
+            };
             let answer = live::start_h264(
-                source.live_rtsp_uri,
-                source.username,
-                source.password,
+                media,
                 offer_sdp.clone(),
                 offer_type.clone(),
                 ice_servers.clone(),
@@ -1383,6 +1664,260 @@ mod tests {
         );
     }
 
+    fn video_source(kind: vms_domain::SourceKind, address: &str) -> vms_domain::VideoSource {
+        vms_domain::VideoSource {
+            id: format!("src-{address}"),
+            gateway_id: "gw-1".into(),
+            name: format!("Source at {address}"),
+            kind,
+            address: address.into(),
+            added_at: Utc::now(),
+        }
+    }
+
+    /// The whole path: the dashboard's source is polled, probed and reported like any
+    /// camera, and the command loop can find it to serve live video from.
+    #[tokio::test]
+    async fn a_source_the_dashboard_added_becomes_a_camera() {
+        let camera = fake_camera::FakeCamera::start(false).await.unwrap();
+        let plane = fake_control_plane::FakeControlPlane::start(vec![], 0).await;
+        *plane.sources.write().await = vec![serde_json::json!({
+            "id": "src-1", "gateway_id": "gw-1", "name": "Yard NVR",
+            "kind": "rtsp", "address": camera.url, "added_at": Utc::now(),
+        })];
+
+        let mut config = config(&plane.url);
+        config.discovery_wait = Duration::ZERO; // no multicast in a test
+        config.probe_interval = Duration::from_millis(100);
+        let telemetry = Arc::new(RwLock::new(Vec::new()));
+        let camera_sources = Arc::new(RwLock::new(HashMap::new()));
+        let task = tokio::spawn(probe_loop(
+            config,
+            reqwest::Client::new(),
+            Arc::clone(&telemetry),
+            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(RwLock::new(Backoff::new(
+                Duration::from_millis(50),
+                Duration::from_secs(1),
+            ))),
+            Arc::clone(&camera_sources),
+        ));
+
+        let reported = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(camera) = telemetry.read().await.first() {
+                    return camera.clone();
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        task.abort();
+        let reported = reported.expect("the source never reached telemetry");
+
+        assert_eq!(reported.camera_id, source_camera_id(&camera.url));
+        assert_eq!(
+            reported.name, "Yard NVR",
+            "the dashboard's name is what is shown"
+        );
+        assert_eq!(
+            reported.status,
+            HealthStatus::Healthy,
+            "the fake camera answered: {:?}",
+            reported.last_error
+        );
+        let dialled = camera_sources.read().await;
+        assert_eq!(
+            dialled.get(&reported.camera_id).map(|s| s.rtsp_uri.clone()),
+            Some(camera.url.clone()),
+            "live and recording dial the address the source gave"
+        );
+    }
+
+    /// A pushed stream is a camera to everything downstream: it appears in
+    /// telemetry with what it is sending, and nothing was dialled to find out.
+    #[tokio::test]
+    async fn a_pushed_source_reports_what_is_arriving() {
+        let plane = fake_control_plane::FakeControlPlane::start(vec![], 0).await;
+        *plane.sources.write().await = vec![serde_json::json!({
+            "id": "src-push", "gateway_id": "gw-1", "name": "Loading bay encoder",
+            "kind": "rtmp", "address": "loading-bay", "added_at": Utc::now(),
+        })];
+
+        let mut config = config(&plane.url);
+        config.discovery_wait = Duration::ZERO;
+        config.probe_interval = Duration::from_millis(100);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(rtmp::serve(listener, config.ingest.clone()));
+
+        let telemetry = Arc::new(RwLock::new(Vec::new()));
+        let camera_sources = Arc::new(RwLock::new(HashMap::new()));
+        let task = tokio::spawn(probe_loop(
+            config,
+            reqwest::Client::new(),
+            Arc::clone(&telemetry),
+            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(RwLock::new(Backoff::new(
+                Duration::from_millis(50),
+                Duration::from_secs(1),
+            ))),
+            Arc::clone(&camera_sources),
+        ));
+
+        // Until something publishes, the key is a source that is offline, and
+        // the reason says so.
+        let silent = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(camera) = telemetry.read().await.first() {
+                    return camera.clone();
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the pushed source never reached telemetry");
+        assert_eq!(silent.status, HealthStatus::Offline);
+        assert!(
+            silent
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("loading-bay")),
+            "{:?}",
+            silent.last_error
+        );
+
+        // The gateway had to have been given the key: a publisher on it is
+        // accepted, and then the same camera is healthy.
+        let mut publisher = fake_publisher::FakePublisher::publish_to(address, "loading-bay")
+            .await
+            .expect("the polled source is what allows this publisher");
+        publisher.send_metadata(1920, 1080, 25.0).await.unwrap();
+        publisher
+            .send_video(
+                bytes::Bytes::from_static(&[
+                    0x17, 0x00, 0, 0, 0, 1, 0x42, 0xe0, 0x1e, 0xff, 0xe1, 0, 4, 0x67, 0x42, 0xe0,
+                    0x1e, 1, 0, 4, 0x68, 0xee, 0x3c, 0x80,
+                ]),
+                0,
+            )
+            .await
+            .unwrap();
+        let publishing = tokio::spawn(async move {
+            for index in 0..60_u32 {
+                let mut tag = vec![if index % 25 == 0 { 0x17 } else { 0x27 }, 0x01, 0, 0, 0];
+                tag.extend_from_slice(&[0, 0, 0, 2, 0x65, index as u8]);
+                if publisher
+                    .send_video(bytes::Bytes::from(tag), index * 40)
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(40)).await;
+            }
+        });
+
+        let live = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(camera) = telemetry
+                    .read()
+                    .await
+                    .first()
+                    .filter(|camera| camera.status == HealthStatus::Healthy)
+                {
+                    return camera.clone();
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("a publisher on the key never made the source healthy");
+        task.abort();
+        publishing.abort();
+
+        assert_eq!(live.name, "Loading bay encoder");
+        assert_eq!(live.codec.as_deref(), Some("H264"));
+        assert_eq!(live.width, Some(1920));
+        assert!(live.fps.is_some_and(|fps| fps > 0.0), "{:?}", live.fps);
+        let carried = camera_sources.read().await;
+        assert_eq!(
+            carried
+                .get(&live.camera_id)
+                .and_then(|source| source.push_key.clone()),
+            Some("loading-bay".to_string()),
+            "live and recording read the ingest rather than dialling"
+        );
+    }
+
+    /// The list is state, not an event: a gateway that cannot reach the API keeps
+    /// carrying what it was last told, rather than dropping every source.
+    #[tokio::test]
+    async fn the_source_list_survives_an_api_that_is_not_answering() {
+        let plane = fake_control_plane::FakeControlPlane::start(vec![], 0).await;
+        *plane.sources.write().await = vec![serde_json::json!({
+            "id": "src-1", "gateway_id": "gw-1", "name": "Yard NVR",
+            "kind": "rtsp", "address": "rtsp://10.0.0.7/stream1",
+            "added_at": Utc::now(),
+        })];
+        let client = reqwest::Client::new();
+
+        let fetched = fetch_sources(&client, &config(&plane.url))
+            .await
+            .expect("the list the API served");
+        assert_eq!(fetched.len(), 1);
+        assert_eq!(fetched[0].address, "rtsp://10.0.0.7/stream1");
+
+        let closed = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        assert!(
+            fetch_sources(&client, &config(&format!("http://{closed}")))
+                .await
+                .is_none(),
+            "an API that cannot be reached says nothing, and nothing is what the caller keeps"
+        );
+    }
+
+    /// A source keeps its identity across restarts and re-adds, because the id comes
+    /// from the address — the same rule the explicit URL has always used. Its
+    /// recordings and incidents hang off that id.
+    #[test]
+    fn a_source_is_identified_by_its_address() {
+        let one = source_camera_id("rtsp://10.0.0.7/stream1");
+        assert_eq!(one, source_camera_id("rtsp://10.0.0.7/stream1"));
+        assert_ne!(one, source_camera_id("rtsp://10.0.0.7/stream2"));
+    }
+
+    #[test]
+    fn only_pulled_sources_are_probed_and_never_one_discovery_already_found() {
+        let sources = vec![
+            video_source(vms_domain::SourceKind::Rtsp, "rtsp://10.0.0.7/stream1"),
+            video_source(vms_domain::SourceKind::Rtsp, "rtsp://10.0.0.8/stream1"),
+            // Nothing pushes to this gateway yet; RTMP and SRT ingest come later.
+            video_source(vms_domain::SourceKind::Rtmp, "yard-entrance"),
+            video_source(vms_domain::SourceKind::Srt, "gate"),
+        ];
+        // ONVIF already found the first one, at the same address.
+        let known: std::collections::HashSet<String> =
+            [source_camera_id("rtsp://10.0.0.7/stream1")]
+                .into_iter()
+                .collect();
+
+        let probing = sources_to_probe(&sources, &known);
+        let addresses: Vec<&str> = probing
+            .iter()
+            .map(|(source, _)| source.address.as_str())
+            .collect();
+        assert_eq!(
+            addresses,
+            vec!["rtsp://10.0.0.8/stream1"],
+            "a camera discovery found is not a second camera, and nothing pushed is probed"
+        );
+        assert_eq!(probing[0].1, source_camera_id("rtsp://10.0.0.8/stream1"));
+    }
+
     #[test]
     fn a_camera_with_its_own_credentials_does_not_get_the_shared_pair() {
         let state = tempfile::tempdir().unwrap();
@@ -1435,6 +1970,7 @@ mod tests {
             explicit_rtsp_url: None,
             explicit_camera_name: "Camera".into(),
             onvif_hosts: Vec::new(),
+            ingest: crate::ingest::Ingest::new(),
         }
     }
 
@@ -1463,6 +1999,7 @@ mod tests {
             camera_id.to_owned(),
             CameraSource {
                 rtsp_uri: url.to_owned(),
+                push_key: None,
                 live_rtsp_uri: url.to_owned(),
                 snapshot_uri: None,
                 username: None,

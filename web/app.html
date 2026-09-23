@@ -89,6 +89,26 @@
           <div id="gateways-grid" class="plugins-grid"></div>
         </section>
 
+        <section id="sources" class="panel">
+          <div class="panel-head">
+            <div><strong data-i18n="app.sources.title"></strong><div class="metric-sub" data-i18n="app.sources.subtitle"></div></div>
+          </div>
+          <form id="source-form" class="field-row">
+            <label class="field"><span data-i18n="app.sources.name"></span><input name="name" required /></label>
+            <label class="field"><span data-i18n="app.sources.gateway"></span><select name="gatewayId" required></select></label>
+            <label class="field"><span data-i18n="app.sources.kind"></span><select name="kind">
+              <option value="rtsp">RTSP</option>
+              <option value="rtmp">RTMP</option>
+              <option value="srt">SRT</option>
+            </select></label>
+            <label class="field field-wide"><span data-i18n="app.sources.address"></span><input name="address" required placeholder="rtsp://10.0.0.7/stream1" /></label>
+            <button id="add-source" class="button small" type="submit" data-i18n="app.sources.add"></button>
+          </form>
+          <div class="metric-sub" data-i18n="app.sources.passwordNote"></div>
+          <div id="sources-list" class="plugins-grid"></div>
+          <div id="sources-empty" class="metric-sub" hidden data-i18n="app.sources.empty"></div>
+        </section>
+
         <section id="plugins" class="panel">
           <div class="panel-head">
             <div><strong data-i18n="app.plugins.title"></strong><div class="metric-sub" data-i18n="app.plugins.subtitle"></div></div>

@@ -42,7 +42,7 @@ use vms_domain::{
     GatewayCommandResult, GatewayCommandStatus, GatewayCommandView, GatewayEnrollmentRequest,
     GatewayEnrollmentResponse, GatewayHeartbeat, GatewayView, HealthStatus, IncidentView,
     LiveSessionRequest, PlaybackManifest, PlaybackSegment, RecordingRequest, RecordingTimeline,
-    RtcConfigResponse, SiteSummary,
+    RtcConfigResponse, SiteSummary, SourceKind, VideoSource, VideoSourceRequest,
 };
 use vms_plugin_runtime::PluginRegistry;
 use vms_plugin_sdk::{
@@ -211,6 +211,10 @@ fn build_router(state: AppState) -> Router {
             get(gateway_next_command),
         )
         .route(
+            "/api/v1/gateways/{gateway_id}/sources",
+            get(gateway_video_sources),
+        )
+        .route(
             "/api/v1/gateways/{gateway_id}/commands/{command_id}/complete",
             post(gateway_complete_command),
         );
@@ -232,6 +236,11 @@ fn build_router(state: AppState) -> Router {
         .route("/api/v1/incidents", get(incidents))
         .route("/api/v1/audit", get(audit_entries))
         .route("/api/v1/enrollments", post(create_enrollment))
+        .route("/api/v1/sources", post(add_video_source).get(video_sources))
+        .route(
+            "/api/v1/sources/{source_id}/delete",
+            post(delete_video_source),
+        )
         .route("/api/v1/cameras", get(cameras))
         .route("/api/v1/gateways", get(gateways))
         .route("/api/v1/gateways/{gateway_id}/revoke", post(revoke_gateway))
@@ -558,6 +567,128 @@ async fn revoke_gateway(
     state.gateways.write().await.remove(&gateway_id);
     state.camera_batches.write().await.remove(&gateway_id);
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// What a source's address has to look like, per kind. A URL that carries a
+/// credential is refused outright: that is the one place a password could reach
+/// the control plane, and it belongs on the gateway instead.
+fn validate_source(request: &VideoSourceRequest) -> Result<(), &'static str> {
+    if request.name.trim().is_empty() || request.name.chars().count() > 80 {
+        return Err("a source needs a name of at most 80 characters");
+    }
+    let address = request.address.trim();
+    match request.kind {
+        SourceKind::Rtsp => {
+            let rest = address
+                .strip_prefix("rtsp://")
+                .or_else(|| address.strip_prefix("rtsps://"))
+                .ok_or("an RTSP source's address has to start with rtsp:// or rtsps://")?;
+            let authority = rest.split(['/', '?']).next().unwrap_or_default();
+            if authority.is_empty() {
+                return Err("that address names no host");
+            }
+            if authority.contains('@') {
+                return Err(
+                    "leave the credentials out of the address: set them on the gateway with                      relaysight-gateway-credentials",
+                );
+            }
+        }
+        SourceKind::Rtmp | SourceKind::Srt => {
+            if address.is_empty() || address.chars().count() > 64 {
+                return Err("a pushed source needs a stream key of at most 64 characters");
+            }
+            if !address
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+            {
+                return Err("a stream key can hold letters, digits, dot, dash and underscore");
+            }
+        }
+    }
+    Ok(())
+}
+
+type ApiError = (StatusCode, String);
+
+async fn add_video_source(
+    State(state): State<AppState>,
+    Json(request): Json<VideoSourceRequest>,
+) -> Result<(StatusCode, Json<VideoSource>), ApiError> {
+    let refuse = |status: StatusCode| (status, String::new());
+    if let Err(why) = validate_source(&request) {
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, why.to_owned()));
+    }
+    if !state
+        .store
+        .gateway_exists(&request.gateway_id)
+        .await
+        .map_err(|err| refuse(store_status(err)))?
+    {
+        return Err(refuse(StatusCode::NOT_FOUND));
+    }
+    let source = VideoSource {
+        id: Uuid::new_v4().simple().to_string(),
+        gateway_id: request.gateway_id,
+        name: request.name.trim().to_owned(),
+        kind: request.kind,
+        address: request.address.trim().to_owned(),
+        added_at: Utc::now(),
+    };
+    state
+        .store
+        .add_video_source(&source)
+        .await
+        .map_err(|err| refuse(store_status(err)))?;
+    audit(
+        &state,
+        "admin",
+        "source.added",
+        &source.id,
+        Some(&format!("{} {}", source.kind.as_str(), source.address)),
+    )
+    .await;
+    Ok((StatusCode::CREATED, Json(source)))
+}
+
+async fn video_sources(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<VideoSource>>, StatusCode> {
+    state
+        .store
+        .video_sources()
+        .await
+        .map(Json)
+        .map_err(store_status)
+}
+
+async fn delete_video_source(
+    State(state): State<AppState>,
+    Path(source_id): Path<String>,
+) -> Result<StatusCode, StatusCode> {
+    state
+        .store
+        .delete_video_source(&source_id)
+        .await
+        .map_err(store_status)?;
+    audit(&state, "admin", "source.removed", &source_id, None).await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// What a gateway polls: its own sources, and nobody else's.
+async fn gateway_video_sources(
+    State(state): State<AppState>,
+    Path(gateway_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<VideoSource>>, StatusCode> {
+    if !authorized_gateway(&headers, &state, &gateway_id).await {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    state
+        .store
+        .gateway_video_sources(&gateway_id)
+        .await
+        .map(Json)
+        .map_err(store_status)
 }
 
 /// Take a revoked gateway's cameras out of the roster. They come back on
@@ -2325,6 +2456,174 @@ mod tests {
         body.as_array().expect("a list").len()
     }
 
+    async fn add_source(
+        state: &AppState,
+        cookie: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        send(
+            state,
+            with_cookie(post("/api/v1/sources", None, body), cookie),
+        )
+        .await
+    }
+
+    fn rtsp_source(gateway_id: &str, address: &str) -> serde_json::Value {
+        serde_json::json!({
+            "gateway_id": gateway_id, "name": "Yard NVR",
+            "kind": "rtsp", "address": address,
+        })
+    }
+
+    /// The whole life of a source: added from the dashboard, listed there, handed to
+    /// its own gateway and to no other, removed, and audited at both ends.
+    #[tokio::test]
+    async fn a_source_is_added_listed_polled_and_removed() {
+        let state = test_state().await;
+        seed_admin(&state).await;
+        let cookie = login_cookie(&state).await;
+        let token = gateway_with_two_cameras(&state, &cookie).await;
+
+        let (status, created) = add_source(
+            &state,
+            &cookie,
+            rtsp_source("gw-1", "rtsp://10.0.0.7/stream1"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{created:?}");
+        let id = created["id"].as_str().expect("an id").to_owned();
+
+        let (_, listed) = send(&state, with_cookie(get("/api/v1/sources"), &cookie)).await;
+        assert_eq!(listed.as_array().expect("a list").len(), 1);
+        assert_eq!(listed[0]["address"], "rtsp://10.0.0.7/stream1");
+
+        // The gateway's own poll, behind its bearer.
+        let (status, mine) = send(
+            &state,
+            Request::builder()
+                .uri("/api/v1/gateways/gw-1/sources")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(mine.as_array().expect("a list").len(), 1);
+        assert_eq!(mine[0]["id"], id);
+
+        let (status, _) = send(
+            &state,
+            with_cookie(
+                post(
+                    &format!("/api/v1/sources/{id}/delete"),
+                    None,
+                    serde_json::json!({}),
+                ),
+                &cookie,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (_, listed) = send(&state, with_cookie(get("/api/v1/sources"), &cookie)).await;
+        assert!(listed.as_array().expect("a list").is_empty());
+
+        let actions = audit_actions(&state, &cookie).await;
+        for expected in ["source.added", "source.removed"] {
+            assert!(
+                actions.iter().any(|a| a == expected),
+                "missing {expected} in {actions:?}"
+            );
+        }
+    }
+
+    /// A password in the URL would be a password in the control plane. It is refused,
+    /// and the gateway's own credential store is where it belongs.
+    #[tokio::test]
+    async fn an_address_carrying_a_password_is_refused() {
+        let state = test_state().await;
+        seed_admin(&state).await;
+        let cookie = login_cookie(&state).await;
+        gateway_with_two_cameras(&state, &cookie).await;
+
+        for address in [
+            "rtsp://admin:hunter2@10.0.0.7/stream1",
+            "rtsp://admin@10.0.0.7/stream1",
+        ] {
+            let (status, _) = add_source(&state, &cookie, rtsp_source("gw-1", address)).await;
+            assert_eq!(
+                status,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{address} was accepted"
+            );
+        }
+        let (_, listed) = send(&state, with_cookie(get("/api/v1/sources"), &cookie)).await;
+        assert!(
+            listed.as_array().expect("a list").is_empty(),
+            "nothing was stored"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_source_needs_a_gateway_that_exists_and_an_address_that_parses() {
+        let state = test_state().await;
+        seed_admin(&state).await;
+        let cookie = login_cookie(&state).await;
+        gateway_with_two_cameras(&state, &cookie).await;
+
+        let (status, _) =
+            add_source(&state, &cookie, rtsp_source("gw-nope", "rtsp://10.0.0.7/s")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "no such gateway");
+
+        for bad in ["http://10.0.0.7/stream", "rtsp://", "not a url", ""] {
+            let (status, _) = add_source(&state, &cookie, rtsp_source("gw-1", bad)).await;
+            assert_eq!(
+                status,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{bad:?} was accepted"
+            );
+        }
+        // A pushed stream is named by a key, not a URL, and the key is checked too.
+        let mut pushed = rtsp_source("gw-1", "yard entrance");
+        pushed["kind"] = serde_json::json!("rtmp");
+        let (status, _) = add_source(&state, &cookie, pushed.clone()).await;
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a key with a space"
+        );
+        pushed["address"] = serde_json::json!("yard-entrance");
+        let (status, _) = add_source(&state, &cookie, pushed).await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn a_gateway_cannot_poll_another_gateways_sources() {
+        let state = test_state().await;
+        seed_admin(&state).await;
+        let cookie = login_cookie(&state).await;
+        let token = gateway_with_two_cameras(&state, &cookie).await;
+        add_source(
+            &state,
+            &cookie,
+            rtsp_source("gw-1", "rtsp://10.0.0.7/stream1"),
+        )
+        .await;
+
+        let (status, _) = send(&state, get("/api/v1/gateways/gw-1/sources")).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "no bearer at all");
+
+        let (status, _) = send(
+            &state,
+            Request::builder()
+                .uri("/api/v1/gateways/gw-other/sources")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "another gateway's list");
+    }
+
     #[tokio::test]
     async fn a_working_gateway_does_not_lose_its_cameras() {
         let state = test_state().await;
@@ -2647,6 +2946,9 @@ mod tests {
         ("POST", "/api/v1/gateways/gw-1/revoke"),
         ("POST", "/api/v1/gateways/gw-1/cameras/retire"),
         ("POST", "/api/v1/enrollments"),
+        ("POST", "/api/v1/sources"),
+        ("GET", "/api/v1/sources"),
+        ("POST", "/api/v1/sources/src-1/delete"),
         ("GET", "/api/v1/commands/cmd-1"),
         ("GET", "/api/v1/rtc/config"),
         ("POST", "/api/v1/cameras/cam-1/live"),

@@ -10,7 +10,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use std::str::FromStr;
 use vms_domain::{
     AuditView, CameraTelemetryBatch, EnrollmentRequest, GatewayEnrollmentRequest, GatewayView,
-    IncidentView, RecordingManifest,
+    IncidentView, RecordingManifest, VideoSource,
 };
 
 fn manifest_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<RecordingManifest, StoreError> {
@@ -577,6 +577,52 @@ impl Store for SqliteStore {
         Ok(())
     }
 
+    async fn add_video_source(&self, source: &VideoSource) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO video_sources (id, gateway_id, name, kind, address, added_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )
+        .bind(&source.id)
+        .bind(&source.gateway_id)
+        .bind(&source.name)
+        .bind(source.kind.as_str())
+        .bind(&source.address)
+        .bind(ts(&source.added_at))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn video_sources(&self) -> Result<Vec<VideoSource>, StoreError> {
+        let rows = sqlx::query("SELECT * FROM video_sources ORDER BY added_at, id")
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter().map(source_from_row).collect()
+    }
+
+    async fn gateway_video_sources(
+        &self,
+        gateway_id: &str,
+    ) -> Result<Vec<VideoSource>, StoreError> {
+        let rows =
+            sqlx::query("SELECT * FROM video_sources WHERE gateway_id = ?1 ORDER BY added_at, id")
+                .bind(gateway_id)
+                .fetch_all(&self.pool)
+                .await?;
+        rows.iter().map(source_from_row).collect()
+    }
+
+    async fn delete_video_source(&self, id: &str) -> Result<(), StoreError> {
+        let removed = sqlx::query("DELETE FROM video_sources WHERE id = ?1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        if removed.rows_affected() == 0 {
+            return Err(StoreError::NotFound);
+        }
+        Ok(())
+    }
+
     async fn retire_gateway_cameras(
         &self,
         gateway_id: &str,
@@ -706,6 +752,28 @@ impl Store for SqliteStore {
     }
 }
 
+fn source_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<VideoSource, StoreError> {
+    let kind: String = row.try_get("kind")?;
+    let kind = match kind.as_str() {
+        "rtsp" => vms_domain::SourceKind::Rtsp,
+        "rtmp" => vms_domain::SourceKind::Rtmp,
+        "srt" => vms_domain::SourceKind::Srt,
+        other => {
+            return Err(StoreError::Internal(anyhow::anyhow!(
+                "stored source kind {other:?} is not one this build knows"
+            )));
+        }
+    };
+    Ok(VideoSource {
+        id: row.try_get("id")?,
+        gateway_id: row.try_get("gateway_id")?,
+        name: row.try_get("name")?,
+        kind,
+        address: row.try_get("address")?,
+        added_at: parse_ts(row.try_get("added_at")?)?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -713,7 +781,7 @@ mod tests {
     use chrono::{Duration, Utc};
     use vms_domain::{
         CameraTelemetry, CameraTelemetryBatch, EnrollmentRequest, GatewayEnrollmentRequest,
-        HealthStatus, RecordingManifest, RecordingObject,
+        HealthStatus, RecordingManifest, RecordingObject, VideoSource,
     };
 
     fn manifest(
@@ -851,6 +919,88 @@ mod tests {
                 last_error: None,
             }],
         }
+    }
+
+    fn source(id: &str, gateway_id: &str, address: &str) -> VideoSource {
+        VideoSource {
+            id: id.into(),
+            gateway_id: gateway_id.into(),
+            name: format!("Source {id}"),
+            kind: vms_domain::SourceKind::Rtsp,
+            address: address.into(),
+            added_at: Utc::now(),
+        }
+    }
+
+    /// A gateway is told its own sources and nobody else's: the poll is how a
+    /// gateway learns what to carry, and one site's addresses are not another's.
+    #[tokio::test]
+    async fn sources_are_listed_whole_and_per_gateway() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let now = Utc::now();
+        for gateway in ["gw-1", "gw-2"] {
+            store
+                .upsert_fleet_identity(
+                    &batch_with_camera(gateway, &format!("cam-{gateway}"), "c"),
+                    now,
+                )
+                .await
+                .unwrap();
+        }
+        store
+            .add_video_source(&source("src-1", "gw-1", "rtsp://10.0.0.1/stream"))
+            .await
+            .unwrap();
+        store
+            .add_video_source(&source("src-2", "gw-1", "rtsp://10.0.0.2/stream"))
+            .await
+            .unwrap();
+        store
+            .add_video_source(&source("src-3", "gw-2", "rtsp://10.0.0.3/stream"))
+            .await
+            .unwrap();
+
+        let all = store.video_sources().await.unwrap();
+        assert_eq!(all.len(), 3, "the dashboard sees every source");
+        let mine: Vec<String> = store
+            .gateway_video_sources("gw-1")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|source| source.id)
+            .collect();
+        assert_eq!(mine, vec!["src-1".to_string(), "src-2".to_string()]);
+
+        store.delete_video_source("src-1").await.unwrap();
+        assert_eq!(store.gateway_video_sources("gw-1").await.unwrap().len(), 1);
+        assert!(
+            matches!(
+                store.delete_video_source("src-1").await,
+                Err(StoreError::NotFound)
+            ),
+            "removing what is not there is a miss, not a silent success"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_source_survives_a_restart_with_its_kind() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let url = format!("sqlite:{}", file.path().display());
+        {
+            let store = SqliteStore::connect(&url).await.unwrap();
+            store
+                .upsert_fleet_identity(&batch_with_camera("gw-1", "cam-1", "c"), Utc::now())
+                .await
+                .unwrap();
+            let mut pushed = source("src-push", "gw-1", "yard-entrance");
+            pushed.kind = vms_domain::SourceKind::Rtmp;
+            store.add_video_source(&pushed).await.unwrap();
+        }
+        let reopened = SqliteStore::connect(&url).await.unwrap();
+        let sources = reopened.video_sources().await.unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].kind, vms_domain::SourceKind::Rtmp);
+        assert_eq!(sources[0].address, "yard-entrance");
     }
 
     #[tokio::test]

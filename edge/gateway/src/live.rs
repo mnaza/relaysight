@@ -2,11 +2,6 @@ use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, anyhow};
 use bytes::Bytes;
-use futures::StreamExt;
-use retina::{
-    client::{PlayOptions, Session, SessionOptions, SetupOptions},
-    codec::{CodecItem, FrameFormat},
-};
 use rtc::{
     interceptor::Registry,
     media::Sample,
@@ -75,19 +70,49 @@ impl PeerConnectionEventHandler for Handler {
     }
 }
 
+/// Where a live session's frames come from: a camera this gateway dials when
+/// the browser connects, or a stream already being pushed to it.
+pub enum LiveMedia {
+    Rtsp {
+        url: String,
+        username: Option<String>,
+        password: Option<String>,
+    },
+    Pushed(Box<dyn crate::frames::FrameSource>),
+}
+
+impl LiveMedia {
+    async fn open(self) -> anyhow::Result<Box<dyn crate::frames::FrameSource>> {
+        match self {
+            // Dialled late on purpose: a camera should not be streaming while
+            // the browser is still gathering candidates.
+            LiveMedia::Rtsp {
+                url,
+                username,
+                password,
+            } => Ok(Box::new(
+                crate::frames::RtspSource::open(
+                    &url,
+                    username.as_deref(),
+                    password.as_deref(),
+                    crate::frames::Framing::AnnexB,
+                )
+                .await?,
+            )),
+            LiveMedia::Pushed(source) => Ok(source),
+        }
+    }
+}
+
 pub async fn start_h264(
-    rtsp_uri: String,
-    username: Option<String>,
-    password: Option<String>,
+    media: LiveMedia,
     offer_sdp: String,
     offer_type: String,
     ice_servers: Vec<RtcIceServerConfig>,
     session_seconds: u32,
 ) -> anyhow::Result<LiveSessionAnswer> {
     start_h264_with(
-        rtsp_uri,
-        username,
-        password,
+        media,
         offer_sdp,
         offer_type,
         ice_servers,
@@ -102,9 +127,7 @@ pub async fn start_h264(
 /// counters of any TURN bridges the session uses. Production passes `None`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn start_h264_with(
-    rtsp_uri: String,
-    username: Option<String>,
-    password: Option<String>,
+    media: LiveMedia,
     offer_sdp: String,
     offer_type: String,
     ice_servers: Vec<RtcIceServerConfig>,
@@ -240,10 +263,9 @@ pub(crate) async fn start_h264_with(
                 relay_transport = %relay_transport,
                 "WebRTC peer connected; starting RTSP forwarding"
             );
-            forward_rtsp_h264(
-                rtsp_uri,
-                username,
-                password,
+            let mut source = media.open().await?;
+            pump_from(
+                source.as_mut(),
                 track,
                 sender,
                 done.clone(),
@@ -291,52 +313,18 @@ async fn negotiated_payload_type(sender: &Arc<dyn RtpSender>) -> anyhow::Result<
         .ok_or_else(|| anyhow!("WebRTC sender has no negotiated H264 codec"))
 }
 
-async fn forward_rtsp_h264(
-    raw_url: String,
-    username: Option<String>,
-    password: Option<String>,
+/// Frames onto a WebRTC track, from whatever produced them.
+///
+/// A sample's duration is only known once the next frame arrives, so one frame
+/// is always held back; the last one is dropped when the session ends, which is
+/// what the browser would have discarded anyway.
+pub(crate) async fn pump_from(
+    source: &mut dyn crate::frames::FrameSource,
     track: Arc<TrackLocalStaticSample>,
     sender: Arc<dyn RtpSender>,
     done: Arc<Notify>,
     max_duration: Duration,
 ) -> anyhow::Result<()> {
-    let (url, creds) =
-        crate::rtsp::split_credentials(&raw_url, username.as_deref(), password.as_deref())?;
-
-    let mut session = tokio::time::timeout(
-        Duration::from_secs(8),
-        Session::describe(
-            url,
-            SessionOptions::default()
-                .creds(creds)
-                .user_agent(format!("vms-gateway/{}", crate::VERSION)),
-        ),
-    )
-    .await
-    .context("RTSP DESCRIBE timeout")??;
-    let video_stream = session
-        .streams()
-        .iter()
-        .position(|stream| stream.media().eq_ignore_ascii_case("video"))
-        .ok_or_else(|| anyhow!("RTSP live source has no video stream"))?;
-    let encoding = session.streams()[video_stream].encoding_name();
-    if !encoding.eq_ignore_ascii_case("h264") {
-        anyhow::bail!("zero-transcode live currently requires H264, camera returned {encoding}");
-    }
-    tokio::time::timeout(
-        Duration::from_secs(8),
-        session.setup(
-            video_stream,
-            SetupOptions::default().frame_format(FrameFormat::SIMPLE),
-        ),
-    )
-    .await
-    .context("RTSP SETUP timeout")??;
-    let playing =
-        tokio::time::timeout(Duration::from_secs(8), session.play(PlayOptions::default()))
-            .await
-            .context("RTSP PLAY timeout")??;
-    let mut demuxed = playing.demuxed()?;
     let payload_type = negotiated_payload_type(&sender).await?;
     let track_ssrc = *track
         .ssrcs()
@@ -346,36 +334,30 @@ async fn forward_rtsp_h264(
     let deadline = tokio::time::sleep(max_duration);
     tokio::pin!(deadline);
     let mut started = false;
-    let mut pending: Option<(Bytes, retina::Timestamp)> = None;
+    let mut pending: Option<(Bytes, i64, u32)> = None;
 
     loop {
         tokio::select! {
             _ = done.notified() => break,
             _ = &mut deadline => break,
-            item = demuxed.next() => match item {
-                Some(Ok(CodecItem::VideoFrame(frame))) if frame.stream_id() == video_stream => {
+            frame = source.next_frame() => match frame? {
+                None => break,
+                Some(frame) => {
                     if !started {
-                        if !frame.is_random_access_point() { continue; }
+                        if !frame.keyframe { continue; }
                         started = true;
                     }
-                    let timestamp = frame.timestamp();
-                    let next_data = Bytes::copy_from_slice(frame.data());
-                    if let Some((data, previous_timestamp)) = pending.replace((next_data, timestamp)) {
-                        let ticks = timestamp
-                            .timestamp()
-                            .saturating_sub(previous_timestamp.timestamp());
-                        let duration = crate::rtsp::frame_duration(
-                            ticks,
-                            previous_timestamp.clock_rate().get(),
-                        );
+                    let timestamp = frame.timestamp;
+                    if let Some((data, previous_timestamp, clock_rate)) =
+                        pending.replace((frame.data, timestamp, frame.clock_rate))
+                    {
+                        let ticks = timestamp.saturating_sub(previous_timestamp);
+                        let duration = crate::rtsp::frame_duration(ticks, clock_rate);
                         track.sample_writer(track_ssrc, payload_type).write_sample(&Sample {
                             data, duration, ..Default::default()
                         }).await?;
                     }
                 }
-                Some(Ok(_)) => {}
-                Some(Err(error)) => return Err(error).context("receive RTSP live media"),
-                None => break,
             }
         }
     }
@@ -385,6 +367,8 @@ async fn forward_rtsp_h264(
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
+
+    use super::LiveMedia;
 
     use crate::{fake_browser::FakeBrowser, fake_camera::FakeCamera};
 
@@ -398,9 +382,11 @@ mod tests {
         let browser = FakeBrowser::offer().await.unwrap();
 
         let answer = super::start_h264(
-            camera.url.clone(),
-            None,
-            None,
+            LiveMedia::Rtsp {
+                url: camera.url.clone(),
+                username: None,
+                password: None,
+            },
             browser.offer_sdp().to_owned(),
             "offer".into(),
             Vec::new(),
@@ -453,9 +439,11 @@ mod tests {
             let camera = FakeCamera::start_with(false, mode).await.unwrap();
             let browser = FakeBrowser::offer().await.unwrap();
             let answer = super::start_h264(
-                camera.url.clone(),
-                None,
-                None,
+                LiveMedia::Rtsp {
+                    url: camera.url.clone(),
+                    username: None,
+                    password: None,
+                },
                 browser.offer_sdp().to_owned(),
                 "offer".into(),
                 Vec::new(),
@@ -484,9 +472,11 @@ mod tests {
         let camera = FakeCamera::start(false).await.unwrap();
         let browser = FakeBrowser::offer().await.unwrap();
         let error = super::start_h264(
-            camera.url.clone(),
-            None,
-            None,
+            LiveMedia::Rtsp {
+                url: camera.url.clone(),
+                username: None,
+                password: None,
+            },
             browser.offer_sdp().to_owned(),
             "answer".into(),
             Vec::new(),
@@ -506,9 +496,11 @@ mod tests {
         let camera = FakeCamera::start(true).await.unwrap();
         let browser = FakeBrowser::offer().await.unwrap();
         let answer = super::start_h264(
-            camera.url.clone(),
-            None,
-            None,
+            LiveMedia::Rtsp {
+                url: camera.url.clone(),
+                username: None,
+                password: None,
+            },
             browser.offer_sdp().to_owned(),
             "offer".into(),
             Vec::new(),
@@ -545,9 +537,11 @@ mod tests {
         }];
 
         let (answer, bridges) = super::start_h264_with(
-            camera.url.clone(),
-            None,
-            None,
+            LiveMedia::Rtsp {
+                url: camera.url.clone(),
+                username: None,
+                password: None,
+            },
             browser.offer_sdp().to_owned(),
             "offer".into(),
             ice_servers,

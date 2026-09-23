@@ -35,6 +35,8 @@ pub struct Seen {
 pub struct FakeControlPlane {
     pub url: String,
     pub seen: Arc<RwLock<Seen>>,
+    /// What `GET /api/v1/gateways/{id}/sources` answers.
+    pub sources: Arc<RwLock<Vec<serde_json::Value>>>,
 }
 
 impl FakeControlPlane {
@@ -48,11 +50,14 @@ impl FakeControlPlane {
         let recorder = Arc::clone(&seen);
         let queue = Arc::new(RwLock::new(commands.into_iter().collect::<Vec<_>>()));
         let claimed = Arc::new(RwLock::new(std::collections::HashSet::<String>::new()));
+        let sources = Arc::new(RwLock::new(Vec::<serde_json::Value>::new()));
+        let served_sources = Arc::clone(&sources);
         let self_url = url.clone();
 
         tokio::spawn(async move {
             let mut rejected = 0;
             let claimed = Arc::clone(&claimed);
+            let sources = served_sources;
             loop {
                 let Ok((mut socket, _)) = listener.accept().await else {
                     return;
@@ -71,7 +76,11 @@ impl FakeControlPlane {
                     recorder.write().await.tokens.push(token.trim().to_owned());
                 }
 
-                let response = if first.starts_with("GET") && first.contains("/commands/next") {
+                let response = if first.starts_with("GET") && first.contains("/sources") {
+                    json_response(
+                        &serde_json::Value::Array(sources.read().await.clone()).to_string(),
+                    )
+                } else if first.starts_with("GET") && first.contains("/commands/next") {
                     recorder.write().await.polls += 1;
                     if rejected < reject_first_polls {
                         rejected += 1;
@@ -152,7 +161,7 @@ impl FakeControlPlane {
             }
         });
 
-        Self { url, seen }
+        Self { url, seen, sources }
     }
 
     /// Wait until at least `count` completions have been recorded.
