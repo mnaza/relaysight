@@ -111,17 +111,19 @@ The distinction this project keeps everywhere:
 - **RTSP sources** run the same code path as a discovered camera, which has
   been proven against a Dahua NVR over the internet for more than twenty
   hours. See `docs/HARDWARE-NOTES.md`.
-- **RTMP ingest** has never met a real encoder. It is tested against the real
-  client half of `rml_rtmp` over a real socket — handshake, chunk stream, AMF
-  commands, FLV video tags — and a stream published that way comes out as an
-  fMP4 recording. What is untested is what OBS, ffmpeg and a hardware encoder
-  do differently from that.
-- **SRT ingest** is behind the `srt` feature for the same reason, one step
-  further back: it has met an SRT caller in the test process and a transport
-  stream ffmpeg produced, and no encoder at all. The transport-stream reader
-  is ours rather than a crate's, which is worth knowing when the first real
-  stream behaves oddly.
+- **RTMP ingest has met ffmpeg**, which is a real encoder: `make check-ingest`
+  publishes the committed fixture with `-c copy`, so the handshake, the chunk
+  stream, the FLV framing and the timing are ffmpeg's, and the frames come out
+  the other side with their parameter sets. It is also tested against the real
+  client half of `rml_rtmp`. What is still untested is OBS, and any hardware
+  encoder.
+- **SRT ingest has met ffmpeg too**, pushing live MPEG-TS over SRT in the same
+  check, on top of an srt-tokio caller in the test process. It stays behind
+  the `srt` feature until it has run somewhere that is not this machine. The
+  transport-stream reader is ours rather than a crate's, which is worth
+  knowing when the first unfamiliar stream behaves oddly.
 - **Audio** is carried by none of them.
 
-The first person to point any of these at real equipment should expect to
-find something. That has been true every time so far.
+The first person to point any of these at real equipment should still expect
+to find something. That has been true every time so far — though ffmpeg, at
+least, found nothing.

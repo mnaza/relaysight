@@ -321,6 +321,85 @@ mod tests {
         publishing.await.unwrap().unwrap();
     }
 
+    /// The tests above prove this gateway understands srt-tokio and a
+    /// transport stream ffmpeg wrote earlier. This proves it understands
+    /// ffmpeg pushing live, which is the thing an encoder does.
+    ///
+    /// Run with `make check-ingest`.
+    #[tokio::test]
+    #[ignore = "needs ffmpeg with SRT; run make check-ingest"]
+    async fn ffmpeg_can_push_srt_to_this_gateway() {
+        let ingest = Ingest::new();
+        ingest.allow(["yard".to_string()]);
+        let address = listening(&ingest).await;
+
+        let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/camera.h264");
+        let mut encoder = std::process::Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-re",
+                "-f",
+                "h264",
+                "-i",
+                fixture,
+                "-c",
+                "copy",
+                "-f",
+                "mpegts",
+                &format!("srt://{address}?streamid=yard&mode=caller"),
+            ])
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .expect("ffmpeg must be on PATH; run make check-ingest");
+
+        let mut source = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if let Some(source) = ingest.subscribe("yard") {
+                    return source;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("ffmpeg never got as far as pushing");
+
+        let mut frames = Vec::new();
+        while frames.len() < 25 {
+            let frame = tokio::time::timeout(Duration::from_secs(20), source.next_frame())
+                .await
+                .expect("ffmpeg stopped sending")
+                .expect("the stream failed");
+            match frame {
+                Some(frame) => frames.push(frame),
+                None => break,
+            }
+        }
+        // Kill it and reap it: a zombie ffmpeg per run would outlive the
+        // test binary.
+        let _ = encoder.kill();
+        let _ = encoder.wait();
+
+        assert!(frames.len() >= 2, "got {} frames", frames.len());
+        assert!(frames.iter().any(|frame| frame.keyframe), "no keyframe");
+        assert!(
+            frames.iter().all(|frame| frame.clock_rate == TS_CLOCK_RATE),
+            "MPEG-TS counts in 90 kHz"
+        );
+        let parameters = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if let Some(parameters) = source.parameters() {
+                    return parameters;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the stream never described itself");
+        assert_eq!(parameters.pixel_dimensions, (320, 240));
+    }
+
     #[tokio::test]
     async fn an_srt_stream_key_nobody_registered_is_refused() {
         let ingest = Ingest::new();

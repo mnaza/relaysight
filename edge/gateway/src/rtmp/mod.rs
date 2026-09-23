@@ -372,6 +372,95 @@ mod tests {
         assert!(stats.publishing);
     }
 
+    /// Everything above proves this gateway understands `rml_rtmp`. This
+    /// proves it understands ffmpeg, which is what an encoder actually is.
+    ///
+    /// Run with `make check-ingest`. It publishes the committed H.264 fixture
+    /// with `-c copy`, so the bytes are the fixture's and the framing,
+    /// timing and handshake are ffmpeg's.
+    #[tokio::test]
+    #[ignore = "needs ffmpeg on the machine; run make check-ingest"]
+    async fn ffmpeg_can_publish_to_this_gateway() {
+        let ingest = Ingest::new();
+        ingest.allow(["yard".to_string()]);
+        let address = listening(&ingest).await;
+
+        let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/camera.h264");
+        // std rather than tokio: spawning returns at once, and the only
+        // other thing this needs is to kill it, which does not block either.
+        let mut encoder = std::process::Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                // Real time, as a camera feeds an encoder.
+                "-re",
+                "-f",
+                "h264",
+                "-i",
+                fixture,
+                "-c",
+                "copy",
+                "-f",
+                "flv",
+                &format!("rtmp://{address}/live/yard"),
+            ])
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .expect("ffmpeg must be on PATH; run make check-ingest");
+
+        let mut source = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if let Some(source) = ingest.subscribe("yard") {
+                    return source;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("ffmpeg never got as far as publishing");
+
+        let mut frames = Vec::new();
+        while frames.len() < 25 {
+            let frame = tokio::time::timeout(Duration::from_secs(20), source.next_frame())
+                .await
+                .expect("ffmpeg stopped sending")
+                .expect("the stream failed");
+            match frame {
+                Some(frame) => frames.push(frame),
+                None => break,
+            }
+        }
+        // Kill it and reap it: a zombie ffmpeg per run would outlive the
+        // test binary.
+        let _ = encoder.kill();
+        let _ = encoder.wait();
+
+        assert!(frames.len() >= 2, "got {} frames", frames.len());
+        assert!(
+            frames.iter().any(|frame| frame.keyframe),
+            "no keyframe arrived, so nothing could be recorded"
+        );
+        assert!(
+            frames
+                .iter()
+                .all(|frame| frame.clock_rate == RTMP_CLOCK_RATE),
+            "RTMP timestamps are milliseconds"
+        );
+        assert!(
+            frames
+                .windows(2)
+                .all(|pair| pair[1].timestamp >= pair[0].timestamp),
+            "timestamps moved backwards"
+        );
+        let parameters = source
+            .parameters()
+            .expect("ffmpeg describes the stream in its sequence header");
+        assert_eq!(parameters.pixel_dimensions, (320, 240));
+        assert!(parameters.rfc6381_codec.starts_with("avc1."));
+        assert_eq!(parameters.extra_data[0], 1, "an AVCC record");
+    }
+
     #[tokio::test]
     async fn a_stream_key_nobody_registered_is_refused() {
         // The port may be reachable from the camera network. Only keys the

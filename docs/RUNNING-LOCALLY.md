@@ -227,6 +227,13 @@ wrong-key refusal, the credentials wrapper and a re-run. It needs Docker,
 python3, openssl, and ports 18090 and 18091 free. What it proves and what it
 does not is in `docs/INSTALL-GATEWAY.md`.
 
+`make check-ingest` has ffmpeg publish the committed H.264 fixture into the
+gateway's own listeners — RTMP, and SRT with the `srt` feature — copying the
+bytes rather than re-encoding, so the framing and the timing are ffmpeg's. It
+needs nothing but ffmpeg with both protocols compiled in. Every other ingest
+test uses a double this repository wrote, and doubles agree with the code that
+expects them.
+
 ## If the ports are taken
 
 `docker-compose.override.yml` is gitignored, so a machine with something else on

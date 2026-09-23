@@ -1,4 +1,4 @@
-.PHONY: web community plugins edge demo demo-community demo-commercial demo-fleet gateway-image check-web check-relay check-gateway-relay check-editions check-installer
+.PHONY: web community plugins edge demo demo-community demo-commercial demo-fleet gateway-image check-web check-relay check-gateway-relay check-editions check-installer check-ingest
 
 # Which plan the stand-in entitlement service hands out: hosted-free or pro.
 PLAN ?= hosted-free
@@ -59,3 +59,6 @@ check-editions:
 
 check-installer:
 	./scripts/check-installer.sh
+
+check-ingest:
+	./scripts/check-ingest.sh
