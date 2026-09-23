@@ -37,11 +37,12 @@ use tracing::{info, warn};
 use uuid::Uuid;
 use vms_domain::{
     AiAnalysisRequest as CameraAiAnalysisRequest, AuditView, CameraSummary, CameraTelemetry,
-    CameraTelemetryBatch, CommandAccepted, CustomerSummary, EditionEntitlement, EnrollmentCreated,
-    EnrollmentRequest, FleetSnapshot, FleetSource, GatewayCommand, GatewayCommandKind,
-    GatewayCommandResult, GatewayCommandStatus, GatewayCommandView, GatewayEnrollmentRequest,
-    GatewayEnrollmentResponse, GatewayHeartbeat, GatewayView, HealthStatus, IncidentView,
-    LiveSessionRequest, PlaybackManifest, PlaybackSegment, RecordingRequest, RecordingTimeline,
+    CameraTelemetryBatch, ClipRequest, CommandAccepted, CustomerSummary, EditionEntitlement,
+    EnrollmentCreated, EnrollmentRequest, FleetSnapshot, FleetSource, GatewayCommand,
+    GatewayCommandKind, GatewayCommandResult, GatewayCommandStatus, GatewayCommandView,
+    GatewayEnrollmentRequest, GatewayEnrollmentResponse, GatewayHeartbeat, GatewayView,
+    HealthStatus, IncidentView, KeepRule, LiveSessionRequest, PlaybackManifest, PlaybackSegment,
+    RecordingMode, RecordingPolicy, RecordingPolicyRequest, RecordingRequest, RecordingTimeline,
     RtcConfigResponse, SiteSummary, SourceKind, VideoSource, VideoSourceRequest,
 };
 use vms_plugin_runtime::PluginRegistry;
@@ -211,6 +212,14 @@ fn build_router(state: AppState) -> Router {
             get(gateway_next_command),
         )
         .route(
+            "/api/v1/gateways/{gateway_id}/recording-policies",
+            get(gateway_recording_policies),
+        )
+        .route(
+            "/api/v1/gateways/{gateway_id}/recordings",
+            post(gateway_recording),
+        )
+        .route(
             "/api/v1/gateways/{gateway_id}/sources",
             get(gateway_video_sources),
         )
@@ -261,6 +270,11 @@ fn build_router(state: AppState) -> Router {
         .route(
             "/api/v1/cameras/{camera_id}/recordings",
             post(create_recording).get(camera_timeline),
+        )
+        .route("/api/v1/cameras/{camera_id}/clips", post(create_clip))
+        .route(
+            "/api/v1/cameras/{camera_id}/recording-policy",
+            get(camera_recording_policy).post(set_camera_recording_policy),
         )
         .route(
             "/api/v1/recordings/{recording_id}/playback",
@@ -675,6 +689,160 @@ async fn delete_video_source(
 }
 
 /// What a gateway polls: its own sources, and nobody else's.
+/// What each of this gateway's cameras is recorded like. Polled beside the
+/// source list, and a list for the same reason: state survives a restart,
+/// and a removal arrives on its own.
+async fn gateway_recording_policies(
+    State(state): State<AppState>,
+    Path(gateway_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<RecordingPolicy>>, StatusCode> {
+    if !authorized_gateway(&headers, &state, &gateway_id).await {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    state
+        .store
+        .gateway_recording_policies(&gateway_id)
+        .await
+        .map(Json)
+        .map_err(store_status)
+}
+
+/// A recording nobody asked for: a gateway keeping a window its policy told
+/// it to keep. The media is already in storage; this is the index entry, and
+/// without it the clip exists and nobody can find it.
+async fn gateway_recording(
+    State(state): State<AppState>,
+    Path(gateway_id): Path<String>,
+    headers: HeaderMap,
+    Json(mut manifest): Json<vms_domain::RecordingManifest>,
+) -> StatusCode {
+    if !authorized_gateway(&headers, &state, &gateway_id).await {
+        return StatusCode::UNAUTHORIZED;
+    }
+    // A gateway may only file recordings under its own name, whatever the
+    // manifest says.
+    if manifest.gateway_id != gateway_id {
+        return StatusCode::FORBIDDEN;
+    }
+    let retention = match state.store.recording_policy(&manifest.camera_id).await {
+        Ok(Some(policy)) if policy.retention_days > 0 => i64::from(policy.retention_days),
+        _ => state.default_retention_days,
+    };
+    manifest.delete_after =
+        (retention > 0).then(|| manifest.ended_at + chrono::Duration::days(retention));
+    match state.store.save_recording(&manifest).await {
+        Ok(()) => StatusCode::NO_CONTENT,
+        Err(error) => store_status(error),
+    }
+}
+
+/// A camera with no policy is not recorded, which is what `off` means, so
+/// this answers for one that has never been given a policy rather than 404.
+async fn camera_recording_policy(
+    State(state): State<AppState>,
+    Path(camera_id): Path<String>,
+) -> Result<Json<RecordingPolicy>, StatusCode> {
+    let gateway_id = gateway_for_camera(&state, &camera_id).await?;
+    let stored = state
+        .store
+        .recording_policy(&camera_id)
+        .await
+        .map_err(store_status)?;
+    Ok(Json(stored.unwrap_or(RecordingPolicy {
+        camera_id,
+        gateway_id,
+        mode: RecordingMode::Off,
+        keep: Vec::new(),
+        retention_days: 0,
+        storage_plugin_id: state.default_storage_plugin.to_string(),
+        updated_at: Utc::now(),
+    })))
+}
+
+async fn set_camera_recording_policy(
+    State(state): State<AppState>,
+    Path(camera_id): Path<String>,
+    Json(request): Json<RecordingPolicyRequest>,
+) -> Result<Json<RecordingPolicy>, (StatusCode, String)> {
+    let gateway_id = gateway_for_camera(&state, &camera_id)
+        .await
+        .map_err(|status| (status, String::new()))?;
+    if let Err(why) = validate_keep_rules(&request.keep) {
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, why.to_owned()));
+    }
+    let policy = RecordingPolicy {
+        camera_id: camera_id.clone(),
+        gateway_id,
+        mode: request.mode,
+        keep: request.keep,
+        // Ten years is not a retention policy, it is a mistake.
+        retention_days: request.retention_days.min(3650),
+        storage_plugin_id: state.default_storage_plugin.to_string(),
+        updated_at: Utc::now(),
+    };
+    state
+        .store
+        .set_recording_policy(&policy)
+        .await
+        .map_err(|error| (store_status(error), String::new()))?;
+    audit(
+        &state,
+        "admin",
+        "recording.policy.set",
+        &camera_id,
+        Some(&format!(
+            "{} with {} keep rule{}",
+            policy.mode.as_str(),
+            policy.keep.len(),
+            if policy.keep.len() == 1 { "" } else { "s" }
+        )),
+    )
+    .await;
+    Ok(Json(policy))
+}
+
+/// A rule the gateway cannot act on is worse than no rule: it looks set.
+fn validate_keep_rules(rules: &[KeepRule]) -> Result<(), &'static str> {
+    for rule in rules {
+        match rule {
+            KeepRule::Schedule {
+                from_minute,
+                to_minute,
+                ..
+            } => {
+                if *from_minute >= 1440 || *to_minute >= 1440 {
+                    return Err("a schedule's times are minutes into the day, 0 to 1439");
+                }
+                if from_minute == to_minute {
+                    return Err("a schedule window of no length keeps nothing");
+                }
+            }
+            KeepRule::OnIncident {
+                pre_roll_seconds,
+                post_roll_seconds,
+            } => {
+                if *pre_roll_seconds == 0 && *post_roll_seconds == 0 {
+                    return Err("an incident rule with no roll either side keeps nothing");
+                }
+            }
+            KeepRule::OnAnalysis {
+                plugin_id,
+                every_seconds,
+                ..
+            } => {
+                if plugin_id.trim().is_empty() {
+                    return Err("an analysis rule needs the plugin that does the analysing");
+                }
+                if *every_seconds == 0 {
+                    return Err("an analysis rule needs an interval");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn gateway_video_sources(
     State(state): State<AppState>,
     Path(gateway_id): Path<String>,
@@ -1139,6 +1307,37 @@ async fn create_recording(
             camera_id,
             duration_seconds,
             segment_seconds,
+            storage_plugin_id,
+        },
+    };
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(enqueue_gateway_command(&state, command).await),
+    ))
+}
+
+/// Keep what already happened. The gateway answers out of its ring buffer,
+/// or says how far back the ring goes; nothing is dialled either way.
+async fn create_clip(
+    State(state): State<AppState>,
+    Path(camera_id): Path<String>,
+    Json(request): Json<ClipRequest>,
+) -> Result<(StatusCode, Json<CommandAccepted>), StatusCode> {
+    let seconds = request.seconds.clamp(5, 3600);
+    let storage_plugin_id = request
+        .storage_plugin_id
+        .unwrap_or_else(|| state.default_storage_plugin.to_string());
+    let gateway_id = gateway_for_camera(&state, &camera_id).await?;
+
+    let now = Utc::now();
+    let command = GatewayCommand {
+        id: Uuid::new_v4().to_string(),
+        gateway_id,
+        created_at: now,
+        expires_at: now + chrono::Duration::minutes(5),
+        kind: GatewayCommandKind::SaveClip {
+            camera_id,
+            seconds,
             storage_plugin_id,
         },
     };
@@ -1874,6 +2073,209 @@ mod tests {
         assert_eq!(
             fleet["customers"][0]["sites"][0]["cameras"][0]["status"],
             "offline"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_camera_nobody_has_configured_is_not_recorded() {
+        // No policy is a policy: off. Answering 404 would make the dashboard
+        // invent a default of its own, and two defaults disagree eventually.
+        let state = test_state().await;
+        seed_admin(&state).await;
+        with_camera(&state, "cam-1", "gw-1").await;
+        let cookie = login_cookie(&state).await;
+
+        let (status, policy) = send(
+            &state,
+            with_cookie(get("/api/v1/cameras/cam-1/recording-policy"), &cookie),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(policy["mode"], "off");
+        assert_eq!(policy["gateway_id"], "gw-1");
+        assert_eq!(policy["keep"].as_array().map(|k| k.len()), Some(0));
+    }
+
+    #[tokio::test]
+    async fn a_policy_reaches_the_gateway_that_carries_the_camera() {
+        let state = test_state().await;
+        seed_admin(&state).await;
+        with_camera(&state, "cam-1", "gw-1").await;
+        with_camera(&state, "cam-2", "gw-2").await;
+        let cookie = login_cookie(&state).await;
+
+        let (status, saved) = send(
+            &state,
+            with_cookie(
+                post(
+                    "/api/v1/cameras/cam-1/recording-policy",
+                    None,
+                    serde_json::json!({
+                        "mode": "continuous",
+                        "retention_days": 30,
+                        "keep": [{"type": "schedule", "days": 0, "from_minute": 480, "to_minute": 1080}],
+                    }),
+                ),
+                &cookie,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{saved}");
+        assert_eq!(saved["mode"], "continuous");
+
+        let (status, mine) = send(
+            &state,
+            Request::builder()
+                .uri("/api/v1/gateways/gw-1/recording-policies")
+                .header("authorization", format!("Bearer {SHARED_TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let mine = mine.as_array().expect("a list");
+        assert_eq!(mine.len(), 1);
+        assert_eq!(mine[0]["camera_id"], "cam-1");
+        assert_eq!(mine[0]["keep"][0]["from_minute"], 480);
+
+        // Another gateway sees nothing of it.
+        let (_, theirs) = send(
+            &state,
+            Request::builder()
+                .uri("/api/v1/gateways/gw-2/recording-policies")
+                .header("authorization", format!("Bearer {SHARED_TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(theirs.as_array().map(|list| list.len()), Some(0));
+    }
+
+    #[tokio::test]
+    async fn the_policy_poll_is_behind_the_gateway_token() {
+        let state = test_state().await;
+        let (status, _) = send(
+            &state,
+            Request::builder()
+                .uri("/api/v1/gateways/gw-1/recording-policies")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn a_rule_the_gateway_could_not_act_on_is_refused() {
+        // A rule that looks set but does nothing is worse than no rule.
+        let state = test_state().await;
+        seed_admin(&state).await;
+        with_camera(&state, "cam-1", "gw-1").await;
+        let cookie = login_cookie(&state).await;
+
+        for bad in [
+            serde_json::json!({"type": "schedule", "days": 0, "from_minute": 600, "to_minute": 600}),
+            serde_json::json!({"type": "schedule", "days": 0, "from_minute": 2000, "to_minute": 10}),
+            serde_json::json!({"type": "on_incident", "pre_roll_seconds": 0, "post_roll_seconds": 0}),
+            serde_json::json!({"type": "on_analysis", "plugin_id": "", "every_seconds": 10,
+                               "threshold": 0.5, "pre_roll_seconds": 5, "post_roll_seconds": 5}),
+        ] {
+            let (status, _) = send(
+                &state,
+                with_cookie(
+                    post(
+                        "/api/v1/cameras/cam-1/recording-policy",
+                        None,
+                        serde_json::json!({"mode": "continuous", "keep": [bad.clone()]}),
+                    ),
+                    &cookie,
+                ),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "should have refused {bad}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn asking_for_a_clip_queues_one_at_the_camera_s_own_gateway() {
+        // A clip is answered out of the gateway's ring buffer, so the request
+        // has to reach the gateway that carries the camera and nobody else.
+        let state = test_state().await;
+        seed_admin(&state).await;
+        with_camera(&state, "cam-1", "gw-1").await;
+        let cookie = login_cookie(&state).await;
+
+        let (status, accepted) = send(
+            &state,
+            with_cookie(
+                post(
+                    "/api/v1/cameras/cam-1/clips",
+                    None,
+                    serde_json::json!({"seconds": 120}),
+                ),
+                &cookie,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert!(accepted["command_id"].as_str().is_some());
+
+        let (_, next) = send(
+            &state,
+            Request::builder()
+                .uri("/api/v1/gateways/gw-1/commands/next")
+                .header("authorization", format!("Bearer {SHARED_TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(next["kind"]["type"], "save_clip");
+        assert_eq!(next["kind"]["camera_id"], "cam-1");
+        assert_eq!(next["kind"]["seconds"], 120);
+        assert!(
+            next["kind"]["storage_plugin_id"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty()),
+            "a clip has to know where to put itself"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_clip_of_an_unreasonable_length_is_clamped_rather_than_refused() {
+        let state = test_state().await;
+        seed_admin(&state).await;
+        with_camera(&state, "cam-1", "gw-1").await;
+        let cookie = login_cookie(&state).await;
+
+        let (status, _) = send(
+            &state,
+            with_cookie(
+                post(
+                    "/api/v1/cameras/cam-1/clips",
+                    None,
+                    serde_json::json!({"seconds": 999_999}),
+                ),
+                &cookie,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let (_, next) = send(
+            &state,
+            Request::builder()
+                .uri("/api/v1/gateways/gw-1/commands/next")
+                .header("authorization", format!("Bearer {SHARED_TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            next["kind"]["seconds"], 3600,
+            "an hour is the most it asks for"
         );
     }
 

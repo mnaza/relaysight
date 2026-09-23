@@ -116,7 +116,7 @@ button { cursor: pointer; }
 }
 .brand-form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin: 22px 0 8px; }
 .field { display: grid; gap: 7px; color: var(--muted); font-size: 12px; }
-.field input { width: 100%; min-height: 42px; border: 1px solid var(--border); border-radius: 10px; background: #07101d; color: var(--text); padding: 8px 10px; outline: none; }
+.field input, .field select { width: 100%; min-height: 42px; border: 1px solid var(--border); border-radius: 10px; background: #07101d; color: var(--text); padding: 8px 10px; outline: none; }
 .field input[type="color"] { padding: 4px; cursor: pointer; }
 .field-wide { grid-column: 1 / -1; }
 .modal-actions { display: flex; justify-content: flex-end; align-items: center; gap: 9px; margin-top: 24px; }
@@ -175,6 +175,9 @@ button { cursor: pointer; }
 .edition-community #plan-card { border-color:color-mix(in srgb,var(--accent) 35%,transparent); }
 /* Archive / fMP4 playback */
 .camera-actions { display:flex; gap:8px; margin-top:12px; }
+.policy-form { display:grid; grid-template-columns:repeat(auto-fit,minmax(120px,1fr)); gap:8px; align-items:end; margin-top:12px; padding-top:10px; border-top:1px solid rgba(255,255,255,.065); }
+.policy-days { grid-column:1 / -1; display:flex; flex-wrap:wrap; gap:10px; color:var(--muted); font-size:12px; }
+.policy-days label { display:flex; align-items:center; gap:4px; }
 .recording-status { min-height:18px; margin-top:7px; color:var(--muted); font-size:11px; }
 .timeline { margin-top:12px; border-top:1px solid rgba(255,255,255,.065); padding-top:10px; }
 .timeline-head { display:flex; justify-content:space-between; align-items:center; margin-bottom:7px; font-size:12px; }

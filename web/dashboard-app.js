@@ -216,6 +216,60 @@ export async function startDashboard({ brand, locale, dict }) {
     });
   }
 
+  // How far back "save the last minutes" reaches. The gateway hands over what
+  // its ring still holds, which may be less.
+  const CLIP_SECONDS = 300;
+
+  // How a camera is recorded. A window is optional: continuous with no window
+  // fills the ring for clipping and keeps nothing on its own.
+  function minutesOf(value) {
+    const [hours, minutes] = String(value || '').split(':');
+    if (hours === undefined || minutes === undefined || hours === '') return null;
+    return Number(hours) * 60 + Number(minutes);
+  }
+  function timeOf(minutes) {
+    return `${String(Math.floor(minutes / 60)).padStart(2, '0')}:${String(minutes % 60).padStart(2, '0')}`;
+  }
+
+  async function loadPolicy(cameraId, form, status) {
+    const policy = await tryJson(`api/v1/cameras/${encodeURIComponent(cameraId)}/recording-policy`, 3500);
+    if (!policy) return;
+    form.querySelector('[name="mode"]').value = policy.mode || 'off';
+    form.querySelector('[name="retention"]').value = policy.retention_days ?? 0;
+    const schedule = (policy.keep || []).find(rule => rule.type === 'schedule');
+    if (schedule) {
+      form.querySelector('[name="from"]').value = timeOf(schedule.from_minute);
+      form.querySelector('[name="to"]').value = timeOf(schedule.to_minute);
+      for (const day of form.querySelectorAll('[name="day"]')) {
+        day.checked = schedule.days === 0 || (schedule.days & (1 << Number(day.value))) !== 0;
+      }
+    }
+    status.textContent = '';
+  }
+
+  async function savePolicy(cameraId, form, status) {
+    const data = new FormData(form);
+    const from = minutesOf(data.get('from'));
+    const to = minutesOf(data.get('to'));
+    const days = [...form.querySelectorAll('[name="day"]:checked')]
+      .reduce((mask, day) => mask | (1 << Number(day.value)), 0);
+    const keep = from === null || to === null || from === to
+      ? []
+      : [{ type: 'schedule', days: days === 0b0111_1111 ? 0 : days, from_minute: from, to_minute: to }];
+    const payload = {
+      mode: String(data.get('mode') || 'off'),
+      retention_days: Number(data.get('retention') || 0),
+      keep,
+    };
+    status.textContent = t(dict, 'app.policy.saving');
+    const response = await fetch(`api/v1/cameras/${encodeURIComponent(cameraId)}/recording-policy`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload),
+    }).catch(() => null);
+    status.textContent = response && response.ok
+      ? t(dict, 'app.policy.saved')
+      : t(dict, 'app.policy.failed');
+  }
+
   async function startLive(cameraId) {
     closeActiveLive();
     const player = document.querySelector('#live-player');
@@ -431,13 +485,26 @@ export async function startDashboard({ brand, locale, dict }) {
         <div class="telemetry-metric"><span>${escapeHtml(t(dict,'app.telemetry.reconnects'))}</span><strong>${fmt(camera.reconnects)}</strong></div>
       </div>
       ${camera.last_error ? `<div class="telemetry-error">${escapeHtml(t(dict,'app.telemetry.error'))}: ${escapeHtml(camera.last_error)}</div>` : ''}
-      <div class="camera-actions"><button class="button small primary" data-live-camera>${escapeHtml(t(dict,'app.live.start'))}</button><button class="button small" data-analyze>${escapeHtml(t(dict,'app.ai.analyze'))}</button><button class="button small" data-record>${escapeHtml(t(dict,'app.archive.record10'))}</button></div>
+      <div class="camera-actions"><button class="button small primary" data-live-camera>${escapeHtml(t(dict,'app.live.start'))}</button><button class="button small" data-analyze>${escapeHtml(t(dict,'app.ai.analyze'))}</button><button class="button small" data-record>${escapeHtml(t(dict,'app.archive.record10'))}</button><button class="button small" data-save-clip>${escapeHtml(t(dict,'app.archive.saveLast'))}</button></div>
+      <form class="policy-form" data-policy-form>
+        <label class="field"><span>${escapeHtml(t(dict,'app.policy.mode'))}</span><select name="mode">
+          <option value="off">${escapeHtml(t(dict,'app.policy.off'))}</option>
+          <option value="continuous">${escapeHtml(t(dict,'app.policy.continuous'))}</option>
+        </select></label>
+        <label class="field"><span>${escapeHtml(t(dict,'app.policy.from'))}</span><input name="from" type="time" /></label>
+        <label class="field"><span>${escapeHtml(t(dict,'app.policy.to'))}</span><input name="to" type="time" /></label>
+        <label class="field"><span>${escapeHtml(t(dict,'app.policy.retention'))}</span><input name="retention" type="number" min="0" max="3650" value="0" /></label>
+        <div class="policy-days">${[0,1,2,3,4,5,6].map(day => `<label><input type="checkbox" name="day" value="${day}" />${escapeHtml(t(dict,`app.policy.day${day}`))}</label>`).join('')}</div>
+        <button class="button small" type="submit">${escapeHtml(t(dict,'app.policy.save'))}</button>
+        <span class="metric-sub" data-policy-status></span>
+      </form>
       <div class="recording-status" data-record-status></div>
       <div class="ai-result" data-ai-result hidden></div>
       <div class="timeline" data-timeline></div>`;
       const liveButton = item.querySelector('[data-live-camera]');
       const analyzeButton = item.querySelector('[data-analyze]');
       const recordButton = item.querySelector('[data-record]');
+      const clipButton = item.querySelector('[data-save-clip]');
       const recordStatus = item.querySelector('[data-record-status]');
       const aiResult = item.querySelector('[data-ai-result]');
       const timeline = item.querySelector('[data-timeline]');
@@ -448,11 +515,31 @@ export async function startDashboard({ brand, locale, dict }) {
       analyzeButton.addEventListener('click', async () => { aiResult.hidden = false; await analyzeCamera(cameraId, analyzeButton, recordStatus, aiResult); });
       if (!isLive) {
         recordButton.disabled = true;
+        clipButton.disabled = true;
         recordStatus.textContent = t(dict,'app.archive.liveRequired');
       } else if (!storagePluginId()) {
         recordButton.disabled = true;
+        clipButton.disabled = true;
         recordStatus.textContent = t(dict,'app.archive.storageMissing');
       } else {
+        // What already happened, out of the gateway's ring buffer. It answers
+        // with what it still holds, which may be less than asked for.
+        clipButton.addEventListener('click', async () => {
+          clipButton.disabled = true; recordStatus.textContent = t(dict,'app.archive.queued');
+          try {
+            const response = await fetch(`api/v1/cameras/${encodeURIComponent(cameraId)}/clips`, {
+              method:'POST', headers:{'Content-Type':'application/json'},
+              body:JSON.stringify({seconds:CLIP_SECONDS, storage_plugin_id:storagePluginId()}),
+            });
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            const accepted = await response.json();
+            await pollCommand(accepted.command_id, recordStatus);
+            recordStatus.textContent = t(dict,'app.archive.ready');
+            await loadCameraTimeline(cameraId, timeline);
+          } catch (error) {
+            recordStatus.textContent = `${t(dict,'app.archive.failed')}: ${error.message}`;
+          } finally { clipButton.disabled = false; }
+        });
         recordButton.addEventListener('click', async () => {
           recordButton.disabled = true; recordStatus.textContent = t(dict,'app.archive.queued');
           try {
@@ -470,6 +557,13 @@ export async function startDashboard({ brand, locale, dict }) {
           } finally { recordButton.disabled = false; }
         });
       }
+      const policyForm = item.querySelector('[data-policy-form]');
+      const policyStatus = item.querySelector('[data-policy-status]');
+      loadPolicy(cameraId, policyForm, policyStatus);
+      policyForm.addEventListener('submit', async event => {
+        event.preventDefault();
+        await savePolicy(cameraId, policyForm, policyStatus);
+      });
       list.appendChild(item);
       loadCameraTimeline(cameraId, timeline);
     }

@@ -23,6 +23,11 @@ pub struct Seen {
     pub polls: u32,
     /// Presigned upload requests, and the blob PUTs that followed them.
     pub uploads: u32,
+    /// Recordings filed by the gateway itself, with nobody having asked —
+    /// a schedule keeping a window.
+    pub filed_recordings: Vec<serde_json::Value>,
+    /// How many times a plugin was asked to look at a camera.
+    pub analyses: u32,
     pub blobs: u32,
     /// Bearer tokens seen specifically on /storage/uploads requests — the
     /// API refuses uploads without one, so a test can pin that they go out.
@@ -37,6 +42,8 @@ pub struct FakeControlPlane {
     pub seen: Arc<RwLock<Seen>>,
     /// What `GET /api/v1/gateways/{id}/sources` answers.
     pub sources: Arc<RwLock<Vec<serde_json::Value>>>,
+    /// What `GET /api/v1/gateways/{id}/recording-policies` answers.
+    pub policies: Arc<RwLock<Vec<serde_json::Value>>>,
 }
 
 impl FakeControlPlane {
@@ -52,12 +59,15 @@ impl FakeControlPlane {
         let claimed = Arc::new(RwLock::new(std::collections::HashSet::<String>::new()));
         let sources = Arc::new(RwLock::new(Vec::<serde_json::Value>::new()));
         let served_sources = Arc::clone(&sources);
+        let policies = Arc::new(RwLock::new(Vec::<serde_json::Value>::new()));
+        let served_policies = Arc::clone(&policies);
         let self_url = url.clone();
 
         tokio::spawn(async move {
             let mut rejected = 0;
             let claimed = Arc::clone(&claimed);
             let sources = served_sources;
+            let policies = served_policies;
             loop {
                 let Ok((mut socket, _)) = listener.accept().await else {
                     return;
@@ -76,7 +86,12 @@ impl FakeControlPlane {
                     recorder.write().await.tokens.push(token.trim().to_owned());
                 }
 
-                let response = if first.starts_with("GET") && first.contains("/sources") {
+                let response = if first.starts_with("GET") && first.contains("/recording-policies")
+                {
+                    json_response(
+                        &serde_json::Value::Array(policies.read().await.clone()).to_string(),
+                    )
+                } else if first.starts_with("GET") && first.contains("/sources") {
                     json_response(
                         &serde_json::Value::Array(sources.read().await.clone()).to_string(),
                     )
@@ -125,6 +140,30 @@ impl FakeControlPlane {
                             .to_string(),
                         )
                     }
+                } else if first.starts_with("POST") && first.contains("/ai/analyze") {
+                    recorder.write().await.analyses += 1;
+                    json_response(
+                        &serde_json::json!({
+                            "plugin_id": "ai-demo",
+                            "model": "fake-1",
+                            "detections": [
+                                {"label": "person", "confidence": 0.95, "bbox": null,
+                                 "attributes": {}},
+                                {"label": "cat", "confidence": 0.20, "bbox": null,
+                                 "attributes": {}},
+                            ],
+                            "metadata": {},
+                        })
+                        .to_string(),
+                    )
+                } else if first.starts_with("POST") && first.contains("/recordings") {
+                    if let Some(body) = request.split("\r\n\r\n").nth(1)
+                        && let Ok(manifest) = serde_json::from_str::<serde_json::Value>(body.trim())
+                    {
+                        recorder.write().await.filed_recordings.push(manifest);
+                    }
+                    "HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                        .to_owned()
                 } else if first.starts_with("POST") && first.contains("/storage/uploads") {
                     // Point the presigned PUT back at this server so the upload
                     // completes without a second fake. Without this the record
@@ -161,7 +200,12 @@ impl FakeControlPlane {
             }
         });
 
-        Self { url, seen, sources }
+        Self {
+            url,
+            seen,
+            sources,
+            policies,
+        }
     }
 
     /// Wait until at least `count` completions have been recorded.

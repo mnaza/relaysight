@@ -180,6 +180,43 @@ pub(crate) mod testing {
         pub parameters: Option<VideoParameters>,
     }
 
+    /// A source that never ends, for testing something that has to be stopped
+    /// rather than waited out.
+    pub struct EndlessSource {
+        parameters: VideoParameters,
+        index: i64,
+    }
+
+    impl EndlessSource {
+        pub fn new(parameters: VideoParameters) -> Self {
+            Self {
+                parameters,
+                index: 0,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl FrameSource for EndlessSource {
+        async fn next_frame(&mut self) -> anyhow::Result<Option<Frame>> {
+            // Paced, so a test that forgets to stop it does not spin a core.
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            let index = self.index;
+            self.index += 1;
+            Ok(Some(Frame {
+                data: Bytes::from(vec![0_u8; 256]),
+                timestamp: index * 3_600,
+                clock_rate: 90_000,
+                keyframe: index % 25 == 0,
+                new_parameters: index == 0,
+            }))
+        }
+
+        fn parameters(&self) -> Option<VideoParameters> {
+            Some(self.parameters.clone())
+        }
+    }
+
     #[async_trait::async_trait]
     impl FrameSource for ScriptedSource {
         async fn next_frame(&mut self) -> anyhow::Result<Option<Frame>> {

@@ -68,6 +68,7 @@
 - [x] Production auth for installer dashboard
 - [x] Encrypted persistent gateway token / identity
 - [x] Per-camera credential store encrypted at rest on edge — `vms-gateway credentials`, keyed by address, with `CAMERA_USERNAME`/`CAMERA_PASSWORD` as the fallback (spec: `docs/superpowers/specs/2026-09-21-per-camera-credentials-design.md`)
+- [x] Video sources that are not discovered cameras — an address the gateway pulls or a stream pushed to it over RTMP/SRT, added from the dashboard, with no password in the control plane (`docs/VIDEO-SOURCES.md`, spec: `docs/superpowers/specs/2026-09-22-video-sources-design.md`); no encoder has pushed to either listener yet, and SRT is behind `--features srt`
 - [ ] Hikvision/Dahua compatibility fixtures and device test matrix
 - [x] Gateway installer package / update channel — `install.sh` onto a hardened systemd service, signed releases, daily self-update with rollback, image on ghcr (`docs/INSTALL-GATEWAY.md`, `make check-installer`); the first real release waits on the release key
 - [x] Gateway revocation and audit log
@@ -110,5 +111,5 @@
 - [ ] Remote NVR access tunnel
 - [ ] 7/30-day health history
 - [x] On-demand cloud recording / archive pipeline through storage plugins
-- [ ] Continuous/event recording policies and rolling archive
+- [x] Continuous/event recording policies and rolling archive — a ring buffer on the gateway inside a byte budget, kept by schedule, by an operator saving the last minutes, by a source going quiet or by an AI plugin (`docs/RECORDING.md`, spec: `docs/superpowers/specs/2026-09-23-recording-policies-design.md`); no site has filled a disk with it yet
 - [ ] Mobile/PWA packaging if demanded by pilots

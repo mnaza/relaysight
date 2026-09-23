@@ -161,10 +161,16 @@ fn packetise(
 
 pub struct FakeCamera {
     pub url: String,
-    _task: tokio::task::JoinHandle<()>,
+    task: tokio::task::JoinHandle<()>,
 }
 
 impl FakeCamera {
+    /// Stop answering, as a camera losing power does. Sessions already running
+    /// are left alone; what stops is anyone new getting in.
+    pub fn unplug(&self) {
+        self.task.abort();
+    }
+
     /// Start on an ephemeral loopback port and serve one session.
     ///
     /// `require_credentials` makes every request answer 401 unless an
@@ -184,14 +190,20 @@ impl FakeCamera {
             .context("bind fake camera")?;
         let addr: SocketAddr = listener.local_addr()?;
         let url = format!("rtsp://{addr}/stream");
+        // A real camera answers as many sessions as it has bandwidth for —
+        // the probe, a live view and a recorder at once — so this does too.
+        // Serving one and then refusing made a gateway recording continuously
+        // look like a gateway that could not dial at all.
         let task = tokio::spawn(async move {
-            if let Ok((socket, _)) = listener.accept().await
-                && let Err(error) = serve(socket, require_credentials, parameter_sets).await
-            {
-                eprintln!("fake camera session ended: {error:#}");
+            while let Ok((socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    if let Err(error) = serve(socket, require_credentials, parameter_sets).await {
+                        eprintln!("fake camera session ended: {error:#}");
+                    }
+                });
             }
         });
-        Ok(Self { url, _task: task })
+        Ok(Self { url, task })
     }
 }
 

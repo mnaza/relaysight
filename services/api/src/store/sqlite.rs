@@ -10,7 +10,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use std::str::FromStr;
 use vms_domain::{
     AuditView, CameraTelemetryBatch, EnrollmentRequest, GatewayEnrollmentRequest, GatewayView,
-    IncidentView, RecordingManifest, VideoSource,
+    IncidentView, RecordingManifest, RecordingPolicy, VideoSource,
 };
 
 fn manifest_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<RecordingManifest, StoreError> {
@@ -612,6 +612,55 @@ impl Store for SqliteStore {
         rows.iter().map(source_from_row).collect()
     }
 
+    async fn set_recording_policy(&self, policy: &RecordingPolicy) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO recording_policies
+                 (camera_id, gateway_id, mode, keep, retention_days, storage_plugin_id, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(camera_id) DO UPDATE SET
+                 gateway_id = excluded.gateway_id, mode = excluded.mode, keep = excluded.keep,
+                 retention_days = excluded.retention_days,
+                 storage_plugin_id = excluded.storage_plugin_id,
+                 updated_at = excluded.updated_at",
+        )
+        .bind(&policy.camera_id)
+        .bind(&policy.gateway_id)
+        .bind(policy.mode.as_str())
+        .bind(serde_json::to_string(&policy.keep).map_err(|error| {
+            StoreError::Internal(anyhow::anyhow!("keep rules will not serialise: {error}"))
+        })?)
+        .bind(i64::from(policy.retention_days))
+        .bind(&policy.storage_plugin_id)
+        .bind(ts(&policy.updated_at))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn recording_policy(
+        &self,
+        camera_id: &str,
+    ) -> Result<Option<RecordingPolicy>, StoreError> {
+        let row = sqlx::query("SELECT * FROM recording_policies WHERE camera_id = ?1")
+            .bind(camera_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.as_ref().map(policy_from_row).transpose()
+    }
+
+    async fn gateway_recording_policies(
+        &self,
+        gateway_id: &str,
+    ) -> Result<Vec<RecordingPolicy>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT * FROM recording_policies WHERE gateway_id = ?1 ORDER BY camera_id",
+        )
+        .bind(gateway_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(policy_from_row).collect()
+    }
+
     async fn delete_video_source(&self, id: &str) -> Result<(), StoreError> {
         let removed = sqlx::query("DELETE FROM video_sources WHERE id = ?1")
             .bind(id)
@@ -750,6 +799,31 @@ impl Store for SqliteStore {
             .await?;
         Ok(())
     }
+}
+
+fn policy_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<RecordingPolicy, StoreError> {
+    let mode: String = row.try_get("mode")?;
+    let mode = match mode.as_str() {
+        "continuous" => vms_domain::RecordingMode::Continuous,
+        // An unknown mode means a newer control plane wrote it. Off is the
+        // reading that records nothing by surprise.
+        _ => vms_domain::RecordingMode::Off,
+    };
+    let keep: String = row.try_get("keep")?;
+    let keep = serde_json::from_str(&keep).map_err(|error| {
+        StoreError::Internal(anyhow::anyhow!(
+            "stored keep rules are not readable: {error}"
+        ))
+    })?;
+    Ok(RecordingPolicy {
+        camera_id: row.try_get("camera_id")?,
+        gateway_id: row.try_get("gateway_id")?,
+        mode,
+        keep,
+        retention_days: row.try_get::<i64, _>("retention_days")?.clamp(0, 3650) as u16,
+        storage_plugin_id: row.try_get("storage_plugin_id")?,
+        updated_at: parse_ts(row.try_get("updated_at")?)?,
+    })
 }
 
 fn source_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<VideoSource, StoreError> {

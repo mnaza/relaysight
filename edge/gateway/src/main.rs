@@ -1,3 +1,4 @@
+mod analysis;
 mod archive;
 mod backoff;
 mod camera_credentials;
@@ -16,12 +17,17 @@ mod frames;
 mod h264;
 mod icepath;
 mod identity;
+mod incident;
 mod ingest;
 mod live;
 mod onvif;
+mod recorder;
 mod release;
+mod ringbuffer;
 mod rtmp;
 mod rtsp;
+mod schedule;
+mod segmenter;
 mod snapshot;
 #[cfg(feature = "srt")]
 mod srt;
@@ -37,7 +43,7 @@ use std::{
 
 use anyhow::anyhow;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
@@ -84,6 +90,13 @@ struct Config {
     /// Streams pushed to this gateway. Empty and idle unless RTMP_LISTEN is set,
     /// and shared here because every loop that needs it already has a Config.
     ingest: crate::ingest::Ingest,
+    /// Where the ring buffer lives, when one is running. `None` follows the
+    /// state directory.
+    recording_dir: Option<std::path::PathBuf>,
+    /// How much disk the ring may use, per camera.
+    recording_budget_bytes: u64,
+    /// How the windows a schedule keeps are cut into clips.
+    cutting: crate::schedule::Cutting,
 }
 
 impl Config {
@@ -91,6 +104,16 @@ impl Config {
     /// it has been given some, otherwise the pair every camera shared before
     /// this existed. Both halves are optional, as before: a camera on an open
     /// network needs neither.
+    /// Where this gateway keeps recorded video it has not been asked for yet.
+    fn recording_dir(&self) -> std::path::PathBuf {
+        self.recording_dir.clone().unwrap_or_else(|| {
+            self.state_dir
+                .clone()
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                .join("ring")
+        })
+    }
+
     fn camera_login(&self, address: &str) -> (Option<String>, Option<String>) {
         match self.camera_credentials.get(address) {
             Some(found) => (Some(found.username.clone()), Some(found.password.clone())),
@@ -134,6 +157,14 @@ impl Config {
             explicit_camera_name: env::var("CAMERA_NAME")
                 .unwrap_or_else(|_| "Manual RTSP camera".into()),
             ingest: crate::ingest::Ingest::new(),
+            recording_dir: env::var("RECORDING_DIR").ok().map(std::path::PathBuf::from),
+            cutting: crate::schedule::Cutting::default(),
+            recording_budget_bytes: env::var("RECORDING_BUDGET_BYTES")
+                .ok()
+                .and_then(|raw| raw.parse().ok())
+                // Two gigabytes is a few hours of one camera at a sensible
+                // bitrate, and small enough not to fill a site box by itself.
+                .unwrap_or(2 * 1024 * 1024 * 1024),
             onvif_hosts: env::var("ONVIF_HOSTS")
                 .unwrap_or_default()
                 .split(',')
@@ -454,11 +485,19 @@ async fn probe_loop(
     // What each pushed stream had counted at the end of the last pass, so the
     // rates reported are for this interval rather than the whole session.
     let mut pushed_marks: HashMap<String, (u64, u64, Instant)> = HashMap::new();
+    // How each camera is to be recorded, and what is recording right now.
+    let mut policies: Vec<vms_domain::RecordingPolicy> = Vec::new();
+    let mut recorders = recorder::Recorders::new();
+    let mut incidents = incident::Incidents::new();
+    let mut pacing = analysis::Pacing::new();
     loop {
         let mut telemetry = Vec::new();
         let mut fresh_sources = HashMap::new();
         if let Some(fresh) = fetch_sources(&client, &config).await {
             video_sources = fresh;
+        }
+        if let Some(fresh) = fetch_recording_policies(&client, &config).await {
+            policies = fresh;
         }
         // Only keys the dashboard listed may publish. Doing this every pass is
         // how a removed source stops the next publisher using its key.
@@ -719,6 +758,44 @@ async fn probe_loop(
                 .iter()
                 .any(|camera| &camera.camera_id == camera_id)
         });
+        // Keep what is being recorded in step with what the policies ask for,
+        // before anything is reported: a camera that just came back should be
+        // recording again by the time the cloud hears it is healthy.
+        recorders.reconcile(&cameras_to_record(&policies, &fresh_sources), &config);
+        // A camera going quiet is something this gateway sees before the
+        // cloud does, and the video worth having is the video from before it.
+        let now = Utc::now();
+        for camera in &telemetry {
+            if let Some(policy) = policies
+                .iter()
+                .find(|policy| policy.camera_id == camera.camera_id)
+                .filter(|policy| policy.mode == vms_domain::RecordingMode::Continuous)
+            {
+                incidents.observe(&camera.camera_id, &camera.status, &policy.keep, now);
+            }
+        }
+        watch_with_plugins(
+            &config,
+            &client,
+            &policies,
+            &fresh_sources,
+            &mut pacing,
+            &mut incidents,
+            now,
+        )
+        .await;
+        let present: std::collections::HashSet<String> = telemetry
+            .iter()
+            .map(|camera| camera.camera_id.clone())
+            .collect();
+        incidents.forget_missing(&present);
+        pacing.forget_missing(&present);
+        for (camera_id, keep) in incidents.due(now) {
+            if let Some(policy) = policies.iter().find(|policy| policy.camera_id == camera_id) {
+                keep_window(&config, &client, policy, keep.from, keep.to, "incident").await;
+            }
+        }
+        keep_scheduled(&config, &client, &policies).await;
         *sources.write().await = fresh_sources;
 
         let batch = CameraTelemetryBatch {
@@ -799,6 +876,325 @@ async fn fetch_sources(
             None
         }
     }
+}
+
+/// How each camera is to be recorded. `None` on any failure, so the last list
+/// the gateway was given keeps standing: an API that cannot be reached must
+/// not quietly stop a site recording.
+async fn fetch_recording_policies(
+    client: &reqwest::Client,
+    config: &Config,
+) -> Option<Vec<vms_domain::RecordingPolicy>> {
+    let endpoint = format!(
+        "{}/api/v1/gateways/{}/recording-policies",
+        config.api_url.trim_end_matches('/'),
+        config.gateway_id
+    );
+    match client.get(endpoint).bearer_auth(&config.token).send().await {
+        Ok(response) if response.status().is_success() => match response.json().await {
+            Ok(policies) => Some(policies),
+            Err(error) => {
+                warn!(%error, "the recording policies did not parse");
+                None
+            }
+        },
+        Ok(response) => {
+            warn!(status = %response.status(), "the recording policies were refused");
+            None
+        }
+        Err(error) => {
+            debug!(%error, "the recording policies could not be fetched; keeping the last ones");
+            None
+        }
+    }
+}
+
+/// File a recording nobody asked for. The media is already in storage; this
+/// is what makes it findable.
+async fn report_recording(
+    config: &Config,
+    client: &reqwest::Client,
+    manifest: &RecordingManifest,
+) -> anyhow::Result<()> {
+    let endpoint = format!(
+        "{}/api/v1/gateways/{}/recordings",
+        config.api_url.trim_end_matches('/'),
+        config.gateway_id
+    );
+    let response = client
+        .post(endpoint)
+        .bearer_auth(&config.token)
+        .json(manifest)
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        anyhow::bail!(
+            "the control plane refused the recording: {}",
+            response.status()
+        );
+    }
+    Ok(())
+}
+
+/// Upload the stretches of ring that a schedule says to keep.
+///
+/// Each camera's progress is a watermark beside its ring, so a restart does
+/// not upload the same morning twice. A window that cannot be cut — the ring
+/// dropped it, or the upload failed — is logged and skipped rather than
+/// retried forever: the video is going away either way, and a gateway stuck
+/// on last Tuesday keeps nothing at all.
+async fn keep_scheduled(
+    config: &Config,
+    client: &reqwest::Client,
+    policies: &[vms_domain::RecordingPolicy],
+) {
+    for policy in policies {
+        if policy.mode != vms_domain::RecordingMode::Continuous || policy.keep.is_empty() {
+            continue;
+        }
+        let dir = config.recording_dir().join(&policy.camera_id);
+        let now = Utc::now();
+        let watermark = schedule::read_watermark(&dir).unwrap_or(now - schedule::MAX_CATCH_UP);
+        let windows = schedule::windows_to_keep(
+            &policy.keep,
+            watermark,
+            now,
+            &chrono::Local::now().timezone(),
+            config.cutting,
+        );
+
+        for (from, to) in windows {
+            keep_window(config, client, policy, from, to, "schedule").await;
+            // Either way the window is behind us: the ring will drop it, and a
+            // gateway retrying it forever keeps nothing new.
+            if let Err(error) = schedule::write_watermark(&dir, to) {
+                warn!(camera_id = %policy.camera_id, %error, "the schedule watermark did not save");
+            }
+        }
+    }
+}
+
+/// Ask a plugin what it sees, without keeping the picture.
+///
+/// The snapshot is not uploaded: a camera looked at every thirty seconds is
+/// two and a half thousand images a day, and the point of looking is the clip,
+/// not the picture.
+async fn look_at(
+    config: &Config,
+    client: &reqwest::Client,
+    source: &CameraSource,
+    camera_id: &str,
+    ai_plugin_id: &str,
+) -> anyhow::Result<Vec<AiDetectionResult>> {
+    let snapshot_uri = source.snapshot_uri.as_deref().ok_or_else(|| {
+        anyhow!("camera {camera_id} offers no snapshot, so nothing can look at it")
+    })?;
+    let snapshot = snapshot::fetch(
+        client,
+        snapshot_uri,
+        source.username.as_deref(),
+        source.password.as_deref(),
+    )
+    .await?;
+    let request = PluginAiAnalyzeRequest {
+        context: invocation_context(config, camera_id, "recording-policy"),
+        camera_id: camera_id.to_owned(),
+        captured_at: Utc::now(),
+        input: MediaInput::InlineBase64 {
+            content_type: snapshot.content_type,
+            data_base64: BASE64_STANDARD.encode(&snapshot.bytes),
+        },
+        tasks: vec!["detect".to_string()],
+        parameters: serde_json::json!({}),
+    };
+    let endpoint = format!(
+        "{}/api/v1/plugins/{}/ai/analyze",
+        config.api_url.trim_end_matches('/'),
+        ai_plugin_id
+    );
+    let analyzed: PluginAiAnalyzeResponse = client
+        .post(endpoint)
+        .bearer_auth(&config.token)
+        .json(&request)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    Ok(analyzed
+        .detections
+        .into_iter()
+        .map(|detection| AiDetectionResult {
+            label: detection.label,
+            confidence: detection.confidence,
+            bbox: detection.bbox.map(|bbox| AiBoundingBox {
+                x: bbox.x,
+                y: bbox.y,
+                width: bbox.width,
+                height: bbox.height,
+            }),
+            attributes: detection.attributes,
+        })
+        .collect())
+}
+
+/// Look at the cameras whose policy says to, and remember a window to keep
+/// wherever a plugin was sure enough about something.
+async fn watch_with_plugins(
+    config: &Config,
+    client: &reqwest::Client,
+    policies: &[vms_domain::RecordingPolicy],
+    sources: &HashMap<String, CameraSource>,
+    pacing: &mut analysis::Pacing,
+    incidents: &mut incident::Incidents,
+    now: DateTime<Utc>,
+) {
+    for policy in policies {
+        if policy.mode != vms_domain::RecordingMode::Continuous {
+            continue;
+        }
+        let Some(source) = sources.get(&policy.camera_id) else {
+            continue;
+        };
+        for rule in &policy.keep {
+            let vms_domain::KeepRule::OnAnalysis {
+                plugin_id,
+                every_seconds,
+                threshold,
+                pre_roll_seconds,
+                post_roll_seconds,
+            } = rule
+            else {
+                continue;
+            };
+            if !pacing.due(&policy.camera_id, *every_seconds, now) {
+                continue;
+            }
+            match look_at(config, client, source, &policy.camera_id, plugin_id).await {
+                Ok(detections) => {
+                    let Some(crossed) = analysis::crossed(&detections, *threshold) else {
+                        continue;
+                    };
+                    info!(
+                        camera_id = %policy.camera_id,
+                        label = %crossed.label,
+                        confidence = crossed.confidence,
+                        "a plugin saw something worth keeping"
+                    );
+                    incidents.remember(
+                        &policy.camera_id,
+                        incident::Keep {
+                            from: now - chrono::Duration::seconds(i64::from(*pre_roll_seconds)),
+                            to: now + chrono::Duration::seconds(i64::from(*post_roll_seconds)),
+                            ready_at: now
+                                + chrono::Duration::seconds(i64::from(*post_roll_seconds)),
+                        },
+                    );
+                }
+                Err(error) => warn!(
+                    camera_id = %policy.camera_id, %error,
+                    "nothing could look at this camera"
+                ),
+            }
+        }
+    }
+}
+
+/// Cut one stretch out of a camera's ring, upload it and file it. Failure is
+/// logged and nothing else: the ring is dropping that video either way.
+async fn keep_window(
+    config: &Config,
+    client: &reqwest::Client,
+    policy: &vms_domain::RecordingPolicy,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+    reason: &str,
+) {
+    let ring = match ringbuffer::Ring::open(
+        &config.recording_dir(),
+        &policy.camera_id,
+        config.recording_budget_bytes,
+    ) {
+        Ok(ring) => ring,
+        Err(error) => {
+            warn!(camera_id = %policy.camera_id, %error, "no ring to keep from");
+            return;
+        }
+    };
+    let clip = match ring.clip(from, to) {
+        Ok(clip) => clip,
+        Err(error) => {
+            warn!(
+                camera_id = %policy.camera_id, %error, reason,
+                from = %from.to_rfc3339(),
+                "the ring could not give up a window"
+            );
+            return;
+        }
+    };
+    let started_at = clip.start;
+    let recorded = Recorded {
+        started_at,
+        codec: clip.codec,
+        width: clip.width,
+        height: clip.height,
+        init: clip.init,
+        segments: clip
+            .segments
+            .into_iter()
+            .enumerate()
+            .map(|(sequence, segment)| RecordedSegment {
+                sequence: sequence as u32,
+                started_at: segment.start,
+                duration_ms: segment.duration_ms,
+                bytes: segment.bytes,
+            })
+            .collect(),
+    };
+    match store_recording(
+        config,
+        client,
+        &policy.storage_plugin_id,
+        &policy.camera_id,
+        &format!("{reason}-{}", from.timestamp()),
+        recorded,
+    )
+    .await
+    {
+        Ok(manifest) => {
+            info!(
+                camera_id = %policy.camera_id, reason,
+                from = %from.to_rfc3339(), to = %to.to_rfc3339(),
+                recording_id = %manifest.recording_id,
+                "kept a window"
+            );
+            if let Err(error) = report_recording(config, client, &manifest).await {
+                warn!(camera_id = %policy.camera_id, %error, "a kept clip was not reported");
+            }
+        }
+        Err(error) => warn!(
+            camera_id = %policy.camera_id, %error, reason,
+            from = %from.to_rfc3339(),
+            "a window was not kept"
+        ),
+    }
+}
+
+/// Which cameras a gateway should be recording continuously right now: the
+/// ones a policy says so about, and that it still has an address for.
+fn cameras_to_record(
+    policies: &[vms_domain::RecordingPolicy],
+    sources: &HashMap<String, CameraSource>,
+) -> Vec<(String, CameraSource)> {
+    policies
+        .iter()
+        .filter(|policy| policy.mode == vms_domain::RecordingMode::Continuous)
+        .filter_map(|policy| {
+            sources
+                .get(&policy.camera_id)
+                .map(|source| (policy.camera_id.clone(), source.clone()))
+        })
+        .collect()
 }
 
 /// A source's camera id. Derived from the address, so the same address keeps its
@@ -1167,74 +1563,87 @@ async fn execute_command(
                     .await?
                 }
             };
-            let recording_id = uuid::Uuid::new_v4().to_string();
-            let namespace = format!(
-                "recordings/{}/{}/{}",
-                config.customer_id, config.site_id, camera_id
-            );
-            let context = invocation_context(config, camera_id, &command.id);
-
-            let init_key = format!("{recording_id}/init.mp4");
-            let init = upload_recording_object(
+            let manifest = store_recording(
                 config,
                 client,
                 storage_plugin_id,
-                &context,
-                &namespace,
-                &init_key,
-                "video/mp4",
-                cmaf.init,
-            )
-            .await?;
-
-            let mut segments = Vec::with_capacity(cmaf.segments.len());
-            for segment in cmaf.segments {
-                let key = format!("{recording_id}/seg-{:05}.m4s", segment.sequence);
-                let size = segment.bytes.len() as u64;
-                let object = upload_recording_object(
-                    config,
-                    client,
-                    storage_plugin_id,
-                    &context,
-                    &namespace,
-                    &key,
-                    "video/iso.segment",
-                    segment.bytes,
-                )
-                .await?;
-                debug_assert_eq!(object.size_bytes, size);
-                let segment_started_at =
-                    started_at + chrono::Duration::milliseconds(segment.start_offset_ms as i64);
-                let segment_ended_at =
-                    segment_started_at + chrono::Duration::milliseconds(segment.duration_ms as i64);
-                segments.push(RecordingSegment {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    sequence: segment.sequence,
-                    started_at: segment_started_at,
-                    ended_at: segment_ended_at,
-                    duration_ms: segment.duration_ms,
-                    keyframe: true,
-                    object,
-                });
-            }
-            let ended_at = segments
-                .last()
-                .map(|segment| segment.ended_at)
-                .unwrap_or_else(|| started_at);
-            Ok(CommandPayload {
-                recording: Some(RecordingManifest {
-                    recording_id,
-                    camera_id: camera_id.clone(),
-                    gateway_id: config.gateway_id.clone(),
+                camera_id,
+                &command.id,
+                Recorded {
                     started_at,
-                    ended_at,
                     codec: cmaf.codec,
                     width: cmaf.width,
                     height: cmaf.height,
-                    init,
-                    segments,
-                    delete_after: None,
-                }),
+                    init: cmaf.init,
+                    segments: cmaf
+                        .segments
+                        .into_iter()
+                        .map(|segment| RecordedSegment {
+                            sequence: segment.sequence,
+                            started_at: started_at
+                                + chrono::Duration::milliseconds(segment.start_offset_ms as i64),
+                            duration_ms: segment.duration_ms,
+                            bytes: segment.bytes,
+                        })
+                        .collect(),
+                },
+            )
+            .await?;
+            Ok(CommandPayload {
+                recording: Some(manifest),
+                ..Default::default()
+            })
+        }
+        GatewayCommandKind::SaveClip {
+            camera_id,
+            seconds,
+            storage_plugin_id,
+        } => {
+            // Nothing is dialled: either the ring still holds those seconds or
+            // they are gone, and the error says which.
+            let ring = ringbuffer::Ring::open(
+                &config.recording_dir(),
+                camera_id,
+                config.recording_budget_bytes,
+            )?;
+            let to = Utc::now();
+            let from = to - chrono::Duration::seconds(i64::from(*seconds));
+            let clip = ring.clip(from, to)?;
+            info!(
+                command_id = %command.id, camera_id, seconds,
+                segments = clip.segments.len(),
+                from = %clip.start.to_rfc3339(), to = %clip.end.to_rfc3339(),
+                "keeping a clip out of the ring"
+            );
+            let started_at = clip.start;
+            let manifest = store_recording(
+                config,
+                client,
+                storage_plugin_id,
+                camera_id,
+                &command.id,
+                Recorded {
+                    started_at,
+                    codec: clip.codec,
+                    width: clip.width,
+                    height: clip.height,
+                    init: clip.init,
+                    segments: clip
+                        .segments
+                        .into_iter()
+                        .enumerate()
+                        .map(|(sequence, segment)| RecordedSegment {
+                            sequence: sequence as u32,
+                            started_at: segment.start,
+                            duration_ms: segment.duration_ms,
+                            bytes: segment.bytes,
+                        })
+                        .collect(),
+                },
+            )
+            .await?;
+            Ok(CommandPayload {
+                recording: Some(manifest),
                 ..Default::default()
             })
         }
@@ -1390,6 +1799,97 @@ fn invocation_context(config: &Config, camera_id: &str, trace_id: &str) -> Plugi
         trace_id: Some(trace_id.to_owned()),
         ..Default::default()
     }
+}
+
+/// A recording that exists as bytes and is not yet anywhere durable.
+struct Recorded {
+    started_at: DateTime<Utc>,
+    codec: String,
+    width: u32,
+    height: u32,
+    init: Vec<u8>,
+    segments: Vec<RecordedSegment>,
+}
+
+struct RecordedSegment {
+    sequence: u32,
+    started_at: DateTime<Utc>,
+    duration_ms: u64,
+    bytes: Vec<u8>,
+}
+
+/// Upload a recording and describe it, whether it was just captured or came
+/// out of the ring. The media goes straight to the storage plugin; the control
+/// plane only ever sees this manifest.
+async fn store_recording(
+    config: &Config,
+    client: &reqwest::Client,
+    storage_plugin_id: &str,
+    camera_id: &str,
+    command_id: &str,
+    recorded: Recorded,
+) -> anyhow::Result<RecordingManifest> {
+    let recording_id = uuid::Uuid::new_v4().to_string();
+    let namespace = format!(
+        "recordings/{}/{}/{}",
+        config.customer_id, config.site_id, camera_id
+    );
+    let context = invocation_context(config, camera_id, command_id);
+
+    let init = upload_recording_object(
+        config,
+        client,
+        storage_plugin_id,
+        &context,
+        &namespace,
+        &format!("{recording_id}/init.mp4"),
+        "video/mp4",
+        recorded.init,
+    )
+    .await?;
+
+    let mut segments = Vec::with_capacity(recorded.segments.len());
+    for segment in recorded.segments {
+        let key = format!("{recording_id}/seg-{:05}.m4s", segment.sequence);
+        let object = upload_recording_object(
+            config,
+            client,
+            storage_plugin_id,
+            &context,
+            &namespace,
+            &key,
+            "video/iso.segment",
+            segment.bytes,
+        )
+        .await?;
+        segments.push(RecordingSegment {
+            id: uuid::Uuid::new_v4().to_string(),
+            sequence: segment.sequence,
+            started_at: segment.started_at,
+            ended_at: segment.started_at
+                + chrono::Duration::milliseconds(segment.duration_ms as i64),
+            duration_ms: segment.duration_ms,
+            keyframe: true,
+            object,
+        });
+    }
+    let ended_at = segments
+        .last()
+        .map(|segment| segment.ended_at)
+        .unwrap_or(recorded.started_at);
+    Ok(RecordingManifest {
+        recording_id,
+        camera_id: camera_id.to_owned(),
+        gateway_id: config.gateway_id.clone(),
+        started_at: recorded.started_at,
+        ended_at,
+        codec: recorded.codec,
+        width: recorded.width,
+        height: recorded.height,
+        init,
+        segments,
+        delete_after: None,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1850,6 +2350,362 @@ mod tests {
         );
     }
 
+    /// A camera set to record continuously is recorded without anyone asking
+    /// again: the policy is polled, the ring fills, and a clip can be cut out
+    /// of it afterwards.
+    #[tokio::test]
+    async fn a_continuous_policy_starts_recording_on_its_own() {
+        let camera = fake_camera::FakeCamera::start(false).await.unwrap();
+        let plane = fake_control_plane::FakeControlPlane::start(vec![], 0).await;
+        *plane.sources.write().await = vec![serde_json::json!({
+            "id": "src-1", "gateway_id": "gw-1", "name": "Yard", "kind": "rtsp",
+            "address": camera.url, "added_at": Utc::now(),
+        })];
+        let camera_id = source_camera_id(&camera.url);
+        *plane.policies.write().await = vec![serde_json::json!({
+            "camera_id": camera_id, "gateway_id": "gw-1", "mode": "continuous",
+            "keep": [], "retention_days": 7, "updated_at": Utc::now(),
+        })];
+
+        let ring_dir = tempfile::tempdir().unwrap();
+        let mut config = config(&plane.url);
+        config.discovery_wait = Duration::ZERO;
+        config.probe_interval = Duration::from_millis(100);
+        config.recording_dir = Some(ring_dir.path().to_path_buf());
+        let task = tokio::spawn(probe_loop(
+            config,
+            reqwest::Client::new(),
+            Arc::new(RwLock::new(Vec::new())),
+            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(RwLock::new(Backoff::new(
+                Duration::from_millis(50),
+                Duration::from_secs(1),
+            ))),
+            Arc::new(RwLock::new(HashMap::new())),
+        ));
+
+        // Video on disk is the only proof that matters here.
+        let ring = ringbuffer::Ring::open(ring_dir.path(), &camera_id, 10 * 1024 * 1024).unwrap();
+        let recorded = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if let Ok(Some(span)) = ring.span() {
+                    return span;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await;
+        task.abort();
+        let (from, to) = recorded.expect("nothing was recorded without being asked twice");
+        assert!(to > from, "the ring holds a stretch of video");
+        assert!(
+            !ring.segments().unwrap().is_empty(),
+            "and the segments are on disk"
+        );
+    }
+
+    /// A schedule keeps video without anyone asking twice: the window passes,
+    /// the gateway cuts it out of its own ring and files it.
+    #[tokio::test]
+    async fn a_schedule_keeps_a_window_that_has_passed() {
+        let camera = fake_camera::FakeCamera::start(false).await.unwrap();
+        let plane = fake_control_plane::FakeControlPlane::start(vec![], 0).await;
+        *plane.sources.write().await = vec![serde_json::json!({
+            "id": "src-1", "gateway_id": "gw-1", "name": "Yard", "kind": "rtsp",
+            "address": camera.url, "added_at": Utc::now(),
+        })];
+        let camera_id = source_camera_id(&camera.url);
+        // A window that covers the whole day, so whatever the clock says when
+        // this runs, the last few minutes are inside it.
+        *plane.policies.write().await = vec![serde_json::json!({
+            "camera_id": camera_id, "gateway_id": "gw-1", "mode": "continuous",
+            "retention_days": 7, "storage_plugin_id": "storage-s3",
+            "updated_at": Utc::now(),
+            "keep": [{"type": "schedule", "days": 0, "from_minute": 0, "to_minute": 1439}],
+        })];
+
+        let ring_dir = tempfile::tempdir().unwrap();
+        let mut config = config(&plane.url);
+        config.discovery_wait = Duration::ZERO;
+        config.probe_interval = Duration::from_millis(100);
+        config.recording_dir = Some(ring_dir.path().to_path_buf());
+        // Clips of a few seconds, so this test is about the keeping rather
+        // than about waiting ten minutes for a window to fill.
+        config.cutting = schedule::Cutting {
+            max_clip: chrono::Duration::seconds(4),
+            lag: chrono::Duration::seconds(1),
+        };
+
+        let camera_ring = ring_dir.path().join(&camera_id);
+        std::fs::create_dir_all(&camera_ring).unwrap();
+        schedule::write_watermark(&camera_ring, Utc::now()).unwrap();
+
+        let task = tokio::spawn(probe_loop(
+            config,
+            reqwest::Client::new(),
+            Arc::new(RwLock::new(Vec::new())),
+            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(RwLock::new(Backoff::new(
+                Duration::from_millis(50),
+                Duration::from_secs(1),
+            ))),
+            Arc::new(RwLock::new(HashMap::new())),
+        ));
+
+        let filed = tokio::time::timeout(Duration::from_secs(40), async {
+            loop {
+                let seen = plane.seen.read().await;
+                if let Some(first) = seen.filed_recordings.first() {
+                    return first.clone();
+                }
+                drop(seen);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await;
+        task.abort();
+
+        let filed = filed.expect("the schedule kept nothing");
+        assert_eq!(filed["camera_id"], camera_id);
+        assert_eq!(filed["gateway_id"], "gw-1");
+        assert!(
+            filed["segments"].as_array().is_some_and(|s| !s.is_empty()),
+            "a kept window carries its segments: {filed}"
+        );
+        assert!(
+            plane.seen.read().await.blobs > 0,
+            "and the media went to storage, not through the control plane"
+        );
+        // The watermark moved, so the same window is not kept twice.
+        let watermark = schedule::read_watermark(&camera_ring).expect("a watermark");
+        assert!(
+            watermark > Utc::now() - chrono::Duration::minutes(1),
+            "the watermark did not move: {watermark}"
+        );
+    }
+
+    /// The minutes before a camera went dark are the ones an investigation
+    /// wants, and they only exist because the gateway was already recording.
+    #[tokio::test]
+    async fn a_camera_going_quiet_keeps_what_led_up_to_it() {
+        let camera = fake_camera::FakeCamera::start(false).await.unwrap();
+        let plane = fake_control_plane::FakeControlPlane::start(vec![], 0).await;
+        *plane.sources.write().await = vec![serde_json::json!({
+            "id": "src-1", "gateway_id": "gw-1", "name": "Yard", "kind": "rtsp",
+            "address": camera.url, "added_at": Utc::now(),
+        })];
+        let camera_id = source_camera_id(&camera.url);
+        *plane.policies.write().await = vec![serde_json::json!({
+            "camera_id": camera_id, "gateway_id": "gw-1", "mode": "continuous",
+            "retention_days": 7, "storage_plugin_id": "storage-s3",
+            "updated_at": Utc::now(),
+            "keep": [{"type": "on_incident", "pre_roll_seconds": 120, "post_roll_seconds": 0}],
+        })];
+
+        let ring_dir = tempfile::tempdir().unwrap();
+        let mut config = config(&plane.url);
+        config.discovery_wait = Duration::ZERO;
+        config.probe_interval = Duration::from_millis(100);
+        config.recording_dir = Some(ring_dir.path().to_path_buf());
+        let task = tokio::spawn(probe_loop(
+            config,
+            reqwest::Client::new(),
+            Arc::new(RwLock::new(Vec::new())),
+            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(RwLock::new(Backoff::new(
+                Duration::from_millis(50),
+                Duration::from_secs(1),
+            ))),
+            Arc::new(RwLock::new(HashMap::new())),
+        ));
+
+        // Let it record a few seconds, so there is something to keep.
+        let ring = ringbuffer::Ring::open(ring_dir.path(), &camera_id, 10 * 1024 * 1024).unwrap();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if ring.segments().is_ok_and(|segments| !segments.is_empty()) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("nothing was being recorded to keep");
+
+        // Now the camera loses power.
+        camera.unplug();
+
+        let filed = tokio::time::timeout(Duration::from_secs(40), async {
+            loop {
+                let seen = plane.seen.read().await;
+                if let Some(first) = seen.filed_recordings.first() {
+                    return first.clone();
+                }
+                drop(seen);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await;
+        task.abort();
+
+        let filed = filed.expect("the camera went dark and nothing was kept");
+        assert_eq!(filed["camera_id"], camera_id);
+        assert!(
+            filed["segments"].as_array().is_some_and(|s| !s.is_empty()),
+            "the clip carries the video from before the silence: {filed}"
+        );
+    }
+
+    /// A camera that offers a snapshot, for a plugin to look at.
+    async fn snapshot_server() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/snapshot.jpg", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buffer = [0_u8; 1024];
+                let _ = socket.read(&mut buffer).await;
+                let body = [0xff_u8, 0xd8, 0xff, 0xe0, 0, 0, 0, 0];
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: image/jpeg\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.write_all(&body).await;
+            }
+        });
+        url
+    }
+
+    /// A plugin sure enough about what it saw means the video around that
+    /// moment is worth keeping — and the snapshot itself is not worth
+    /// uploading, which is the difference between a clip and a bill.
+    #[tokio::test]
+    async fn a_plugin_that_sees_something_leaves_a_window_to_keep() {
+        let plane = fake_control_plane::FakeControlPlane::start(vec![], 0).await;
+        let snapshot = snapshot_server().await;
+        let config = config(&plane.url);
+
+        let mut sources = HashMap::new();
+        sources.insert(
+            "cam-1".to_string(),
+            CameraSource {
+                rtsp_uri: "rtsp://10.0.0.1/stream".into(),
+                push_key: None,
+                live_rtsp_uri: "rtsp://10.0.0.1/stream".into(),
+                snapshot_uri: Some(snapshot),
+                username: None,
+                password: None,
+            },
+        );
+        let policies = vec![vms_domain::RecordingPolicy {
+            camera_id: "cam-1".into(),
+            gateway_id: "gw-1".into(),
+            mode: vms_domain::RecordingMode::Continuous,
+            keep: vec![vms_domain::KeepRule::OnAnalysis {
+                plugin_id: "ai-demo".into(),
+                every_seconds: 30,
+                threshold: 0.75,
+                pre_roll_seconds: 20,
+                post_roll_seconds: 0,
+            }],
+            retention_days: 7,
+            storage_plugin_id: "storage-s3".into(),
+            updated_at: Utc::now(),
+        }];
+
+        let mut pacing = analysis::Pacing::new();
+        let mut incidents = incident::Incidents::new();
+        let now = Utc::now();
+        watch_with_plugins(
+            &config,
+            &reqwest::Client::new(),
+            &policies,
+            &sources,
+            &mut pacing,
+            &mut incidents,
+            now,
+        )
+        .await;
+
+        let due = incidents.due(now);
+        assert_eq!(due.len(), 1, "the plugin was sure and nothing was kept");
+        assert_eq!(due[0].0, "cam-1");
+        assert_eq!(due[0].1.from, now - chrono::Duration::seconds(20));
+        assert_eq!(plane.seen.read().await.analyses, 1);
+        assert_eq!(
+            plane.seen.read().await.uploads,
+            0,
+            "looking at a camera does not store the picture"
+        );
+
+        // Asked again straight away, it does not call the plugin again: the
+        // policy said every thirty seconds, and a plugin costs money.
+        watch_with_plugins(
+            &config,
+            &reqwest::Client::new(),
+            &policies,
+            &sources,
+            &mut pacing,
+            &mut incidents,
+            now + chrono::Duration::seconds(5),
+        )
+        .await;
+        assert_eq!(plane.seen.read().await.analyses, 1);
+    }
+
+    #[tokio::test]
+    async fn a_camera_with_no_snapshot_is_reported_rather_than_watched() {
+        // Only cameras that advertise a snapshot URI over ONVIF can be looked
+        // at; a pushed stream has no such thing, and pretending otherwise
+        // would make a policy look set and do nothing.
+        let plane = fake_control_plane::FakeControlPlane::start(vec![], 0).await;
+        let config = config(&plane.url);
+        let mut sources = HashMap::new();
+        sources.insert(
+            "cam-1".to_string(),
+            CameraSource {
+                rtsp_uri: "rtmp://gw/live/key".into(),
+                push_key: Some("key".into()),
+                live_rtsp_uri: "rtmp://gw/live/key".into(),
+                snapshot_uri: None,
+                username: None,
+                password: None,
+            },
+        );
+        let policies = vec![vms_domain::RecordingPolicy {
+            camera_id: "cam-1".into(),
+            gateway_id: "gw-1".into(),
+            mode: vms_domain::RecordingMode::Continuous,
+            keep: vec![vms_domain::KeepRule::OnAnalysis {
+                plugin_id: "ai-demo".into(),
+                every_seconds: 30,
+                threshold: 0.5,
+                pre_roll_seconds: 20,
+                post_roll_seconds: 0,
+            }],
+            retention_days: 7,
+            storage_plugin_id: "storage-s3".into(),
+            updated_at: Utc::now(),
+        }];
+
+        let mut pacing = analysis::Pacing::new();
+        let mut incidents = incident::Incidents::new();
+        let now = Utc::now();
+        watch_with_plugins(
+            &config,
+            &reqwest::Client::new(),
+            &policies,
+            &sources,
+            &mut pacing,
+            &mut incidents,
+            now,
+        )
+        .await;
+        assert!(incidents.due(now).is_empty());
+        assert_eq!(plane.seen.read().await.analyses, 0);
+    }
+
     /// The list is state, not an event: a gateway that cannot reach the API keeps
     /// carrying what it was last told, rather than dropping every source.
     #[tokio::test]
@@ -1946,7 +2802,7 @@ mod tests {
         );
     }
 
-    fn config(api_url: &str) -> Config {
+    pub(crate) fn config(api_url: &str) -> Config {
         Config {
             api_url: api_url.to_owned(),
             gateway_id: "gw-1".into(),
@@ -1971,6 +2827,9 @@ mod tests {
             explicit_camera_name: "Camera".into(),
             onvif_hosts: Vec::new(),
             ingest: crate::ingest::Ingest::new(),
+            recording_dir: None,
+            recording_budget_bytes: 2 * 1024 * 1024 * 1024,
+            cutting: crate::schedule::Cutting::default(),
         }
     }
 
@@ -2049,9 +2908,103 @@ mod tests {
         // The upload to a storage plugin will fail — none is configured — but
         // the loop must still report a definite outcome either way, and must
         // never leave the command unanswered.
-        eprintln!(
-            "DEBUG completion: {}",
-            serde_json::to_string_pretty(result).unwrap()
+        assert!(
+            result["status"] == "succeeded" || result["status"] == "failed",
+            "a command must always come back with an outcome: {result}"
+        );
+    }
+
+    fn clip_command(id: &str, camera_id: &str, seconds: u32) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "gateway_id": "gw-1",
+            "created_at": Utc::now(),
+            "expires_at": Utc::now() + chrono::Duration::minutes(2),
+            "kind": {
+                "type": "save_clip",
+                "camera_id": camera_id,
+                "seconds": seconds,
+                "storage_plugin_id": "storage-s3",
+            },
+        })
+    }
+
+    /// Fill a camera's ring with a few seconds of video, without a camera.
+    async fn ring_with_video(dir: &std::path::Path, camera_id: &str) {
+        let ring = ringbuffer::Ring::open(dir, camera_id, 10 * 1024 * 1024).unwrap();
+        let mut source = crate::frames::testing::ScriptedSource {
+            frames: (0..500)
+                .map(|index| crate::frames::Frame {
+                    data: bytes::Bytes::from(vec![0_u8; 512]),
+                    timestamp: index * 3_600,
+                    clock_rate: 90_000,
+                    keyframe: index % 25 == 0,
+                    new_parameters: index == 0,
+                })
+                .collect(),
+            parameters: Some(crate::frames::VideoParameters {
+                rfc6381_codec: "avc1.42e01e".into(),
+                pixel_dimensions: (640, 480),
+                extra_data: vec![
+                    1, 0x42, 0xe0, 0x1e, 0xff, 0xe1, 0, 4, 0x67, 0x42, 0xe0, 0x1e, 1, 0, 4, 0x68,
+                    0xee, 0x3c, 0x80,
+                ],
+                frame_rate: Some((1, 25)),
+            }),
+        };
+        ring.record(&mut source, &tokio::sync::Notify::new())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_clip_command_answers_out_of_the_ring_without_dialling_anything() {
+        // No camera, no source entry, no network: a clip is video that has
+        // already been recorded, and the only question is whether it is still
+        // on disk.
+        let dir = tempfile::tempdir().unwrap();
+        ring_with_video(dir.path(), "cam-1").await;
+        let api = FakeControlPlane::start(vec![clip_command("cmd-8", "cam-1", 3600)], 0).await;
+        let mut config = config(&api.url);
+        config.recording_dir = Some(dir.path().to_path_buf());
+        tokio::spawn(command_loop(
+            config,
+            reqwest::Client::new(),
+            Arc::new(RwLock::new(HashMap::new())),
+        ));
+
+        let completions = api.wait_for_completions(1, Duration::from_secs(20)).await;
+        let result = &completions[0];
+        assert_eq!(result["command_id"], "cmd-8");
+        // The upload has no storage plugin behind it here, so this fails at
+        // the upload — which is proof the clip itself was assembled.
+        let error = result["error"].as_str().unwrap_or_default();
+        assert!(
+            !error.contains("nothing recorded") && !error.contains("only goes back"),
+            "the ring should have answered: {error}"
+        );
+        let seen = api.seen.read().await;
+        assert!(seen.uploads > 0, "a clip is uploaded like any recording");
+    }
+
+    #[tokio::test]
+    async fn a_clip_nobody_recorded_says_so_rather_than_failing_obscurely() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = FakeControlPlane::start(vec![clip_command("cmd-9", "cam-2", 60)], 0).await;
+        let mut config = config(&api.url);
+        config.recording_dir = Some(dir.path().to_path_buf());
+        tokio::spawn(command_loop(
+            config,
+            reqwest::Client::new(),
+            Arc::new(RwLock::new(HashMap::new())),
+        ));
+
+        let completions = api.wait_for_completions(1, Duration::from_secs(10)).await;
+        assert_eq!(completions[0]["status"], "failed");
+        let error = completions[0]["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("nothing recorded"),
+            "an operator has to learn the ring is empty, not guess: {error}"
         );
     }
 

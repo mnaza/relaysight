@@ -10,7 +10,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use sha2::{Digest, Sha256};
 use vms_domain::{
     AuditView, CameraTelemetryBatch, EnrollmentRequest, GatewayEnrollmentRequest, GatewayView,
-    IncidentView, RecordingManifest, VideoSource,
+    IncidentView, RecordingManifest, RecordingPolicy, VideoSource,
 };
 
 #[derive(Debug, Clone)]
@@ -235,6 +235,22 @@ pub trait Store: Send + Sync {
 
     /// `NotFound` when there is nothing to remove.
     async fn delete_video_source(&self, id: &str) -> Result<(), StoreError>;
+
+    /// Set how a camera is recorded, replacing whatever it had.
+    async fn set_recording_policy(&self, policy: &RecordingPolicy) -> Result<(), StoreError>;
+
+    /// One camera's policy, or `None` while it has never been given one —
+    /// which means off.
+    async fn recording_policy(
+        &self,
+        camera_id: &str,
+    ) -> Result<Option<RecordingPolicy>, StoreError>;
+
+    /// One gateway's policies: what its poll answers.
+    async fn gateway_recording_policies(
+        &self,
+        gateway_id: &str,
+    ) -> Result<Vec<RecordingPolicy>, StoreError>;
 
     /// One audit row. Callers treat failure as loggable, never fatal.
     async fn record_audit(

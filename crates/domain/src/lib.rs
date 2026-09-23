@@ -184,6 +184,14 @@ pub enum GatewayCommandKind {
         storage_plugin_id: String,
         tasks: Vec<String>,
     },
+    /// Keep what has already happened: the last `seconds` out of the
+    /// gateway's ring buffer. Nothing is dialled — the video is already on the
+    /// gateway's disk or it is gone.
+    SaveClip {
+        camera_id: String,
+        seconds: u32,
+        storage_plugin_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -323,6 +331,93 @@ pub struct AiAnalysisResult {
     #[serde(default)]
     pub metadata: serde_json::Value,
     pub snapshot: RecordingObject,
+}
+
+/// Whether a camera is being recorded all the time, or only when asked.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordingMode {
+    /// The default. Nothing is recorded until a command asks for it, and
+    /// nothing can be saved after the fact.
+    Off,
+    /// The gateway keeps a ring buffer on its own disk, so the minutes before
+    /// something happened can still be kept.
+    Continuous,
+}
+
+impl RecordingMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RecordingMode::Off => "off",
+            RecordingMode::Continuous => "continuous",
+        }
+    }
+}
+
+/// When a stretch of the ring is worth uploading.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum KeepRule {
+    /// A window of the week, in the gateway's own local time. `to` before
+    /// `from` means the window crosses midnight.
+    Schedule {
+        /// Monday is bit 0. 0 means every day.
+        days: u8,
+        from_minute: u16,
+        to_minute: u16,
+    },
+    /// The source stopped answering: keep what led up to it.
+    OnIncident {
+        pre_roll_seconds: u16,
+        post_roll_seconds: u16,
+    },
+    /// An AI plugin's result crossed a threshold.
+    OnAnalysis {
+        plugin_id: String,
+        every_seconds: u16,
+        threshold: f32,
+        pre_roll_seconds: u16,
+        post_roll_seconds: u16,
+    },
+}
+
+/// How one camera is recorded.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RecordingPolicy {
+    pub camera_id: String,
+    pub gateway_id: String,
+    pub mode: RecordingMode,
+    #[serde(default)]
+    pub keep: Vec<KeepRule>,
+    /// How long a kept clip lives in the cloud. 0 means forever.
+    #[serde(default)]
+    pub retention_days: u16,
+    /// Where a clip this policy keeps should go. The control plane fills it
+    /// in: a gateway has no way to know which storage plugin a customer uses.
+    #[serde(default)]
+    pub storage_plugin_id: String,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecordingPolicyRequest {
+    pub mode: RecordingMode,
+    #[serde(default)]
+    pub keep: Vec<KeepRule>,
+    #[serde(default)]
+    pub retention_days: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClipRequest {
+    /// How far back to reach. The ring decides whether it still has it.
+    #[serde(default = "default_clip_seconds")]
+    pub seconds: u32,
+    pub storage_plugin_id: Option<String>,
+}
+
+fn default_clip_seconds() -> u32 {
+    60
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

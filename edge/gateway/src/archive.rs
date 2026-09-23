@@ -1,12 +1,15 @@
-use std::{num::NonZeroU32, time::Duration};
+//! On-demand recording: a fixed number of seconds, as fMP4.
+//!
+//! The cutting is `segmenter`'s, which a ring buffer also uses. What belongs
+//! here is knowing when to stop: at a keyframe at or after the requested
+//! duration, so the recording ends on a GOP boundary.
+
+use std::time::Duration;
 
 use anyhow::{Context, anyhow};
-use shiguredo_mp4::{
-    TrackKind, Uint,
-    boxes::{Avc1Box, AvccBox, SampleEntry, VisualSampleEntryFields},
-    mux::{Fmp4SegmentMuxer, Sample},
-};
 use tokio::time::timeout;
+
+use crate::segmenter::{ClosedSegment, Pushed, Segmenter, ticks_to_ms};
 
 #[derive(Debug, Clone)]
 pub struct CmafSegment {
@@ -25,23 +28,6 @@ pub struct CmafRecording {
     pub segments: Vec<CmafSegment>,
 }
 
-#[derive(Debug)]
-struct EncodedFrame {
-    timestamp: i64,
-    data: Vec<u8>,
-    keyframe: bool,
-}
-
-#[derive(Debug)]
-struct AvccConfig {
-    profile: u8,
-    compatibility: u8,
-    level: u8,
-    length_size_minus_one: u8,
-    sps: Vec<Vec<u8>>,
-    pps: Vec<Vec<u8>>,
-}
-
 pub async fn record_h264_cmaf(
     raw_url: &str,
     username: Option<&str>,
@@ -55,8 +41,8 @@ pub async fn record_h264_cmaf(
     record_from(&mut source, total_duration, target_segment_duration).await
 }
 
-/// The recorder itself, over anything that yields H.264: an RTSP camera today,
-/// a pushed stream once ingest exists.
+/// The recorder itself, over anything that yields H.264: an RTSP camera, a
+/// pushed stream, a ring buffer being replayed.
 pub(crate) async fn record_from(
     source: &mut dyn crate::frames::FrameSource,
     total_duration: Duration,
@@ -64,13 +50,9 @@ pub(crate) async fn record_from(
 ) -> anyhow::Result<CmafRecording> {
     let receive_deadline = total_duration + Duration::from_secs(12);
     let receive_started = tokio::time::Instant::now();
-    let mut first_timestamp = None;
-    let mut clock_rate: Option<u32> = None;
-    let mut frames: Vec<EncodedFrame> = Vec::new();
-    let mut codec = None;
-    let mut dimensions = None;
-    let mut avcc = None;
-    let mut fallback_duration = None;
+    let mut segmenter = Segmenter::new(target_segment_duration)?;
+    let mut closed: Vec<ClosedSegment> = Vec::new();
+    let mut first_timestamp: Option<i64> = None;
 
     while receive_started.elapsed() < receive_deadline {
         let frame = timeout(Duration::from_secs(4), source.next_frame())
@@ -78,135 +60,62 @@ pub(crate) async fn record_from(
             .context("frame timeout")??;
         let Some(frame) = frame else { break };
 
-        // A recording must start at a random access point so it can be decoded independently.
-        if first_timestamp.is_none() && !frame.keyframe {
-            continue;
-        }
-
-        if first_timestamp.is_none() || frame.new_parameters {
-            let params = source
-                .parameters()
-                .ok_or_else(|| anyhow!("video parameters unavailable after H264 frame"))?;
-            let new_codec = params.rfc6381_codec.clone();
-            let new_dimensions = params.pixel_dimensions;
-            let new_avcc = parse_avcc(&params.extra_data)?;
-            if first_timestamp.is_some()
-                && (codec.as_ref() != Some(&new_codec) || dimensions != Some(new_dimensions))
-            {
+        match segmenter.push(&frame, source.parameters().as_ref())? {
+            Pushed::Segment(segment) => closed.push(segment),
+            Pushed::Nothing => {}
+            Pushed::ParametersChanged => {
                 return Err(anyhow!(
                     "camera changed H264 parameters during recording; start a new recording"
                 ));
             }
-            codec = Some(new_codec);
-            dimensions = Some(new_dimensions);
-            avcc = Some(new_avcc);
-            fallback_duration = params.frame_rate.and_then(|(num, den)| {
-                if den == 0 {
-                    None
-                } else {
-                    let rate = frame.clock_rate as f64;
-                    Some(((rate * num as f64 / den as f64).round() as u32).max(1))
-                }
-            });
         }
+        if segmenter.pending_frames() == 0 {
+            // Nothing decodable has arrived yet.
+            continue;
+        }
+        let first = *first_timestamp.get_or_insert(frame.timestamp);
 
-        if first_timestamp.is_none() {
-            first_timestamp = Some(frame.timestamp);
-            clock_rate = Some(frame.clock_rate);
-        }
-        if Some(frame.clock_rate) != clock_rate {
-            return Err(anyhow!("video clock rate changed during recording"));
-        }
-        let start = first_timestamp.expect("set above");
-        let elapsed_ticks = frame.timestamp.saturating_sub(start).max(0) as u64;
+        let elapsed_ticks = frame.timestamp.saturating_sub(first).max(0) as u64;
         let elapsed = Duration::from_secs_f64(elapsed_ticks as f64 / frame.clock_rate as f64);
-
-        let keyframe = frame.keyframe;
-        frames.push(EncodedFrame {
-            timestamp: frame.timestamp,
-            data: frame.data.to_vec(),
-            keyframe,
-        });
-
-        // Continue until a keyframe at/after requested duration. This makes the final
-        // media segment naturally close on a GOP boundary without decoding frames.
-        if elapsed >= total_duration
-            && frames.len() > 1
-            && frames.last().is_some_and(|f| f.keyframe)
-        {
+        // Stop at a keyframe at or after the requested duration, so the last
+        // media segment closes on a GOP boundary without decoding anything.
+        if elapsed >= total_duration && frame.keyframe && !closed.is_empty() {
             break;
         }
     }
 
-    if frames.len() < 2 {
+    if let Some(segment) = segmenter.flush()? {
+        closed.push(segment);
+    }
+    if closed.is_empty() {
         return Err(anyhow!("not enough H264 frames to build fMP4 recording"));
     }
-    let clock_rate = clock_rate
-        .and_then(NonZeroU32::new)
+    let clock_rate = segmenter
+        .clock_rate()
         .ok_or_else(|| anyhow!("missing RTP clock rate"))?;
-    let codec = codec.ok_or_else(|| anyhow!("missing H264 codec parameters"))?;
-    let (width, height) = dimensions.ok_or_else(|| anyhow!("missing video dimensions"))?;
-    let avcc = avcc.ok_or_else(|| anyhow!("missing AVCDecoderConfigurationRecord"))?;
-    let sample_entry = create_avc1_sample_entry(width, height, &avcc)?;
+    let codec = segmenter
+        .codec()
+        .ok_or_else(|| anyhow!("missing H264 codec parameters"))?
+        .to_owned();
+    let (width, height) = segmenter
+        .dimensions()
+        .ok_or_else(|| anyhow!("missing video dimensions"))?;
+    let first = first_timestamp.unwrap_or_default();
+    let init = segmenter.init()?;
 
-    let mut durations = Vec::with_capacity(frames.len());
-    let mut last_good = fallback_duration.unwrap_or_else(|| (clock_rate.get() / 25).max(1));
-    for pair in frames.windows(2) {
-        let delta = pair[1].timestamp.saturating_sub(pair[0].timestamp);
-        if delta > 0 {
-            last_good = u32::try_from(delta).unwrap_or(u32::MAX).max(1);
-        }
-        durations.push(last_good);
-    }
-    durations.push(last_good);
+    let segments = closed
+        .into_iter()
+        .map(|segment| CmafSegment {
+            sequence: segment.sequence,
+            start_offset_ms: ticks_to_ms(
+                segment.start_timestamp.saturating_sub(first).max(0) as u64,
+                clock_rate,
+            ),
+            duration_ms: ticks_to_ms(segment.duration_ticks, clock_rate),
+            bytes: segment.bytes,
+        })
+        .collect();
 
-    let target_ticks = (target_segment_duration.as_secs_f64() * clock_rate.get() as f64)
-        .round()
-        .max(1.0) as i64;
-    let groups = split_on_keyframes(&frames, target_ticks);
-    let first_ts = frames[0].timestamp;
-    let mut muxer = Fmp4SegmentMuxer::new()?;
-    let mut segments = Vec::with_capacity(groups.len());
-
-    for (sequence, (start_idx, end_idx)) in groups.into_iter().enumerate() {
-        let mut samples = Vec::with_capacity(end_idx - start_idx);
-        let mut payloads: Vec<&[u8]> = Vec::with_capacity(end_idx - start_idx);
-        let mut data_offset = 0_u64;
-        let mut segment_ticks = 0_u64;
-        for idx in start_idx..end_idx {
-            let frame = &frames[idx];
-            let duration = durations[idx];
-            samples.push(Sample {
-                track_kind: TrackKind::Video,
-                timescale: clock_rate,
-                sample_entry: Some(sample_entry.clone()),
-                duration,
-                keyframe: frame.keyframe,
-                composition_time_offset: None,
-                data_offset,
-                data_size: frame.data.len(),
-            });
-            payloads.push(&frame.data);
-            data_offset = data_offset.saturating_add(frame.data.len() as u64);
-            segment_ticks = segment_ticks.saturating_add(duration as u64);
-        }
-        let metadata = muxer.create_media_segment_metadata(&samples)?;
-        let mut bytes = metadata;
-        bytes.reserve(data_offset as usize);
-        for payload in payloads {
-            bytes.extend_from_slice(payload);
-        }
-
-        let start_ticks = frames[start_idx].timestamp.saturating_sub(first_ts).max(0) as u64;
-        segments.push(CmafSegment {
-            sequence: sequence as u32,
-            start_offset_ms: ticks_to_ms(start_ticks, clock_rate),
-            duration_ms: ticks_to_ms(segment_ticks, clock_rate),
-            bytes,
-        });
-    }
-
-    let init = muxer.init_segment_bytes()?;
     Ok(CmafRecording {
         codec,
         width,
@@ -216,120 +125,10 @@ pub(crate) async fn record_from(
     })
 }
 
-fn split_on_keyframes(frames: &[EncodedFrame], target_ticks: i64) -> Vec<(usize, usize)> {
-    let mut groups = Vec::new();
-    let mut start = 0_usize;
-    for idx in 1..frames.len() {
-        let elapsed = frames[idx]
-            .timestamp
-            .saturating_sub(frames[start].timestamp);
-        if elapsed >= target_ticks && frames[idx].keyframe {
-            groups.push((start, idx));
-            start = idx;
-        }
-    }
-    if start < frames.len() {
-        groups.push((start, frames.len()));
-    }
-    groups.retain(|(start, end)| end > start);
-    groups
-}
-
-fn ticks_to_ms(ticks: u64, clock_rate: NonZeroU32) -> u64 {
-    ((ticks as u128 * 1000) / clock_rate.get() as u128) as u64
-}
-
-fn create_avc1_sample_entry(
-    width: u32,
-    height: u32,
-    avcc: &AvccConfig,
-) -> anyhow::Result<SampleEntry> {
-    let width = u16::try_from(width).context("video width exceeds MP4 avc1 field")?;
-    let height = u16::try_from(height).context("video height exceeds MP4 avc1 field")?;
-    Ok(SampleEntry::Avc1(Avc1Box {
-        visual: VisualSampleEntryFields {
-            data_reference_index: VisualSampleEntryFields::DEFAULT_DATA_REFERENCE_INDEX,
-            width,
-            height,
-            horizresolution: VisualSampleEntryFields::DEFAULT_HORIZRESOLUTION,
-            vertresolution: VisualSampleEntryFields::DEFAULT_VERTRESOLUTION,
-            frame_count: VisualSampleEntryFields::DEFAULT_FRAME_COUNT,
-            compressorname: VisualSampleEntryFields::NULL_COMPRESSORNAME,
-            depth: VisualSampleEntryFields::DEFAULT_DEPTH,
-        },
-        avcc_box: AvccBox {
-            avc_profile_indication: avcc.profile,
-            profile_compatibility: avcc.compatibility,
-            avc_level_indication: avcc.level,
-            length_size_minus_one: Uint::new(avcc.length_size_minus_one),
-            sps_list: avcc.sps.clone(),
-            pps_list: avcc.pps.clone(),
-            chroma_format: None,
-            bit_depth_luma_minus8: None,
-            bit_depth_chroma_minus8: None,
-            sps_ext_list: vec![],
-        },
-        unknown_boxes: vec![],
-    }))
-}
-
-fn parse_avcc(data: &[u8]) -> anyhow::Result<AvccConfig> {
-    if data.len() < 7 || data[0] != 1 {
-        return Err(anyhow!("invalid AVCDecoderConfigurationRecord"));
-    }
-    let profile = data[1];
-    let compatibility = data[2];
-    let level = data[3];
-    let length_size_minus_one = data[4] & 0x03;
-    if length_size_minus_one != 3 {
-        return Err(anyhow!("only 4-byte H264 NAL lengths are supported"));
-    }
-    let mut cursor = 6_usize;
-    let sps_count = (data[5] & 0x1f) as usize;
-    let mut sps = Vec::with_capacity(sps_count);
-    for _ in 0..sps_count {
-        sps.push(read_avcc_nal(data, &mut cursor)?);
-    }
-    let pps_count = *data
-        .get(cursor)
-        .ok_or_else(|| anyhow!("AVCC missing PPS count"))? as usize;
-    cursor += 1;
-    let mut pps = Vec::with_capacity(pps_count);
-    for _ in 0..pps_count {
-        pps.push(read_avcc_nal(data, &mut cursor)?);
-    }
-    if sps.is_empty() || pps.is_empty() {
-        return Err(anyhow!("AVCC has no SPS/PPS"));
-    }
-    Ok(AvccConfig {
-        profile,
-        compatibility,
-        level,
-        length_size_minus_one,
-        sps,
-        pps,
-    })
-}
-
-fn read_avcc_nal(data: &[u8], cursor: &mut usize) -> anyhow::Result<Vec<u8>> {
-    let len_bytes = data
-        .get(*cursor..*cursor + 2)
-        .ok_or_else(|| anyhow!("AVCC truncated NAL length"))?;
-    let len = u16::from_be_bytes([len_bytes[0], len_bytes[1]]) as usize;
-    *cursor += 2;
-    let nal = data
-        .get(*cursor..*cursor + len)
-        .ok_or_else(|| anyhow!("AVCC truncated NAL"))?
-        .to_vec();
-    *cursor += len;
-    Ok(nal)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{EncodedFrame, parse_avcc, record_from, split_on_keyframes, ticks_to_ms};
+    use super::record_from;
     use crate::frames::{Frame, VideoParameters, testing::ScriptedSource};
-    use std::num::NonZeroU32;
     use std::time::Duration;
 
     /// A minimal AVCDecoderConfigurationRecord: baseline, one SPS, one PPS,
@@ -377,88 +176,6 @@ mod tests {
         );
         assert_eq!(recording.segments[0].start_offset_ms, 0);
         assert!(recording.segments.iter().all(|s| !s.bytes.is_empty()));
-    }
-
-    #[test]
-    fn parses_avcc_sps_pps() {
-        let data = [
-            1, 0x64, 0, 0x1f, 0xff, 0xe1, 0, 4, 0x67, 0x64, 0, 0x1f, 1, 0, 4, 0x68, 0xee, 0x3c,
-            0x80,
-        ];
-        let avcc = parse_avcc(&data).unwrap();
-        assert_eq!(avcc.profile, 0x64);
-        assert_eq!(avcc.sps.len(), 1);
-        assert_eq!(avcc.pps.len(), 1);
-        assert_eq!(avcc.length_size_minus_one, 3);
-    }
-
-    #[test]
-    fn segments_only_on_keyframes() {
-        let frames: Vec<_> = [
-            (0, true),
-            (3000, false),
-            (6000, false),
-            (9000, true),
-            (12000, false),
-            (15000, false),
-            (18000, true),
-        ]
-        .into_iter()
-        .map(|(timestamp, keyframe)| EncodedFrame {
-            timestamp,
-            data: vec![1],
-            keyframe,
-        })
-        .collect();
-        assert_eq!(
-            split_on_keyframes(&frames, 8000),
-            vec![(0, 3), (3, 6), (6, 7)]
-        );
-    }
-
-    #[test]
-    fn an_empty_frame_list_produces_no_segments() {
-        assert!(split_on_keyframes(&[], 90_000).is_empty());
-    }
-
-    #[test]
-    fn a_long_gop_still_yields_one_segment_rather_than_none() {
-        // Segments may only start on a keyframe. A camera with a GOP longer than
-        // the target must produce one long segment, never zero — dropping the
-        // recording entirely is the worse failure.
-        let frames: Vec<_> = (0..10)
-            .map(|i| EncodedFrame {
-                timestamp: i * 3000,
-                keyframe: i == 0,
-                data: Vec::new(),
-            })
-            .collect();
-        let groups = split_on_keyframes(&frames, 9_000);
-        assert_eq!(groups, vec![(0, 10)]);
-    }
-
-    #[test]
-    fn a_trailing_partial_segment_is_kept() {
-        // Frames after the last split must still be written out.
-        let frames: Vec<_> = [(0, true), (90_000, true), (93_000, false)]
-            .into_iter()
-            .map(|(timestamp, keyframe)| EncodedFrame {
-                timestamp,
-                keyframe,
-                data: Vec::new(),
-            })
-            .collect();
-        let groups = split_on_keyframes(&frames, 90_000);
-        assert_eq!(groups, vec![(0, 1), (1, 3)]);
-    }
-
-    #[test]
-    fn ticks_convert_without_overflowing_at_long_durations() {
-        // ticks * 1000 exceeds u64 well inside a plausible recording, hence the
-        // u128 widening; this pins it.
-        let clock = NonZeroU32::new(90_000).unwrap();
-        assert_eq!(ticks_to_ms(90_000, clock), 1_000);
-        assert_eq!(ticks_to_ms(u64::MAX / 1000, clock), (u64::MAX / 1000) / 90);
     }
 
     // ---- end to end, against the fake camera in `fake_camera.rs` ----
