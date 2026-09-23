@@ -220,5 +220,18 @@
   "app.policy.day3": "Jue",
   "app.policy.day4": "Vie",
   "app.policy.day5": "Sáb",
-  "app.policy.day6": "Dom"
+  "app.policy.day6": "Dom",
+  "app.alerts.title": "Alertas",
+  "app.alerts.subtitle": "Qué salió del edificio y si llegó. La entrega la hace un plugin event_sink.",
+  "app.alerts.when": "Cuándo",
+  "app.alerts.what": "Qué pasó",
+  "app.alerts.delivery": "Entrega",
+  "app.alerts.test": "Enviar alerta de prueba",
+  "app.alerts.testFailed": "No se pudo enviar la alerta de prueba",
+  "app.alerts.empty": "Todavía no hay nada",
+  "app.alerts.delivered": "entregada",
+  "app.alerts.declined": "no es para este destino",
+  "app.alerts.retrying": "reintentando",
+  "app.alerts.gaveUp": "se dio por vencido",
+  "app.alerts.nosinks": "ningún plugin event_sink registrado"
 }

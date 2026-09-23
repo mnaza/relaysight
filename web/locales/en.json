@@ -220,5 +220,18 @@
   "app.policy.day3": "Thu",
   "app.policy.day4": "Fri",
   "app.policy.day5": "Sat",
-  "app.policy.day6": "Sun"
+  "app.policy.day6": "Sun",
+  "app.alerts.title": "Alerts",
+  "app.alerts.subtitle": "What left the building, and whether it arrived. Delivery is an event_sink plugin's job.",
+  "app.alerts.when": "When",
+  "app.alerts.what": "What happened",
+  "app.alerts.delivery": "Delivery",
+  "app.alerts.test": "Send a test alert",
+  "app.alerts.testFailed": "The test alert could not be sent",
+  "app.alerts.empty": "Nothing has been raised yet",
+  "app.alerts.delivered": "delivered",
+  "app.alerts.declined": "not for this sink",
+  "app.alerts.retrying": "retrying",
+  "app.alerts.gaveUp": "gave up",
+  "app.alerts.nosinks": "no event_sink plugin registered"
 }

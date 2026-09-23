@@ -63,6 +63,49 @@ Storage plugins should preferably return **presigned transfers**. Video bytes th
 
 The included `plugins/examples/storage-s3` implements this contract for S3-compatible storage.
 
+## Event sink capability
+
+Capability: `event_sink`
+
+Endpoint: `POST /v1/events`
+
+The control plane hands over facts; the plugin decides who hears about them
+and how. That is why no SMTP password, chat token or webhook URL is ever
+stored here: it belongs to the sink, in the sink's own environment.
+
+```json
+{
+  "context": {"site_id": "site-1", "trace_id": "evt-9f3c"},
+  "event": {
+    "id": "9f3c…",
+    "kind": "camera_offline",
+    "severity": "critical",
+    "occurred_at": "2026-09-23T09:41:02Z",
+    "customer_id": "cust-1",
+    "site_id": "site-1",
+    "site_name": "Bakery",
+    "gateway_id": "gw-1",
+    "camera_id": "cam-1",
+    "title": "Yard camera stopped answering at Bakery",
+    "detail": "RTSP probe failed",
+    "metadata": {"reconnects": 3}
+  }
+}
+```
+
+The answer is `{"delivered": true}`, or `{"delivered": false, "detail": "…"}`
+for an event the sink decided is not for it — which is not an error and is not
+retried. Anything other than a 2xx **is** retried, with a growing delay.
+
+`title` is written for a human already: a sink that posts nothing but that
+line is useful. `id` is stable across every retry and every sink, so a sink
+that has already posted a message can recognise it rather than posting twice.
+
+Event kinds today: `camera_offline`, `camera_recovered`, `gateway_offline`,
+`gateway_recovered`, and `test` for the dashboard's "send a test event". A
+sink must ignore kinds it does not know: more will be added without a protocol
+bump.
+
 ## Versioning
 
 Current protocol version: `1` (`vms-plugin-sdk::PLUGIN_PROTOCOL_VERSION`).
@@ -71,9 +114,8 @@ Breaking wire changes require a new protocol version. Adding optional JSON field
 
 ## Future capabilities
 
-The enum already reserves an `event_sink` capability. Natural next extensions are:
+Natural next extensions are:
 
-- event/webhook sinks
 - identity/SSO connectors
 - custom camera drivers
 - license-plate OCR

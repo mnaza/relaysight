@@ -67,7 +67,12 @@ export async function startDashboard({ brand, locale, dict }) {
     catch { return []; }
   }
 
-  let [fleet, telemetry, edition, plugins, gateways, incidents, videoSources] = await Promise.all([loadFleet(), loadTelemetry(), loadEdition(), loadPlugins(), loadGateways(), loadIncidents(), loadSources()]);
+  async function loadEvents() {
+    try { return await tryJson('api/v1/events'); }
+    catch { return []; }
+  }
+
+  let [fleet, telemetry, edition, plugins, gateways, incidents, videoSources, alerts] = await Promise.all([loadFleet(), loadTelemetry(), loadEdition(), loadPlugins(), loadGateways(), loadIncidents(), loadSources(), loadEvents()]);
   let telemetryById = new Map(telemetry.map(camera => [camera.camera_id, camera]));
   const isLive = fleet.source === 'live';
   const sourceTag = document.querySelector('#fleet-source');
@@ -129,6 +134,51 @@ export async function startDashboard({ brand, locale, dict }) {
     }
   }
   paintIncidents();
+
+  // What left the building, and whether it arrived. An alert nobody could
+  // deliver is the case an operator has to see: silence that means nobody was
+  // listening rather than nothing happened.
+  function deliveryText(event) {
+    if (!event.deliveries?.length) return t(dict, 'app.alerts.nosinks');
+    return event.deliveries.map(delivery => {
+      if (delivery.delivered_at && !delivery.declined) return `${delivery.plugin_id}: ${t(dict, 'app.alerts.delivered')}`;
+      if (delivery.declined) return `${delivery.plugin_id}: ${t(dict, 'app.alerts.declined')}`;
+      const state = delivery.next_attempt_at ? t(dict, 'app.alerts.retrying') : t(dict, 'app.alerts.gaveUp');
+      return `${delivery.plugin_id}: ${state}${delivery.last_error ? ` — ${delivery.last_error}` : ''}`;
+    }).join(' · ');
+  }
+
+  function paintAlerts() {
+    const body = document.querySelector('#alerts-body');
+    if (!body) return;
+    body.replaceChildren();
+    document.querySelector('#alerts-empty').hidden = alerts.length > 0;
+    const cell = (text, className) => {
+      const td = document.createElement('td');
+      td.textContent = text;
+      if (className) td.className = className;
+      return td;
+    };
+    for (const event of alerts) {
+      const row = document.createElement('tr');
+      row.append(
+        cell(new Date(event.occurred_at).toLocaleString()),
+        cell(event.title, event.severity === 'critical' ? 'alert-critical' : ''),
+        cell(deliveryText(event)),
+      );
+      body.appendChild(row);
+    }
+  }
+  paintAlerts();
+
+  document.querySelector('#send-test-alert')?.addEventListener('click', async event => {
+    const button = event.target;
+    button.disabled = true;
+    const response = await fetch('api/v1/events/test', { method: 'POST' }).catch(() => null);
+    if (!response || !response.ok) alert(t(dict, 'app.alerts.testFailed'));
+    button.disabled = false;
+    refresh();
+  });
 
   const planTitle = document.querySelector('#plan-title');
   const planUsage = document.querySelector('#free-usage');
@@ -626,16 +676,17 @@ export async function startDashboard({ brand, locale, dict }) {
     if (document.querySelector('.modal-backdrop.open')) return;
     let next;
     try {
-      next = await Promise.all([loadFleet(), loadTelemetry(), loadGateways(), loadIncidents(), loadSources()]);
+      next = await Promise.all([loadFleet(), loadTelemetry(), loadGateways(), loadIncidents(), loadSources(), loadEvents()]);
     } catch {
       return;
     }
-    [fleet, telemetry, gateways, incidents, videoSources] = next;
+    [fleet, telemetry, gateways, incidents, videoSources, alerts] = next;
     telemetryById = new Map(telemetry.map(camera => [camera.camera_id, camera]));
     rows = fleet.customers.flatMap(customer => customer.sites.map(site => ({ customer, site })));
     allCameras = rows.flatMap(row => row.site.cameras);
     paintStats();
     paintIncidents();
+    paintAlerts();
     render(currentFilter);
     renderGateways();
     renderSources();

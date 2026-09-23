@@ -5,9 +5,10 @@ use reqwest::Client;
 use tokio::sync::RwLock;
 use tracing::warn;
 use vms_plugin_sdk::{
-    AiAnalyzeRequest, AiAnalyzeResponse, PLUGIN_PROTOCOL_VERSION, PluginCapability, PluginHealth,
-    PluginManifest, PluginRegistration, RegisteredPlugin, SignedTransfer, StorageDeleteRequest,
-    StorageDeleteResponse, StorageDownloadRequest, StorageUploadRequest,
+    AiAnalyzeRequest, AiAnalyzeResponse, EventDeliveryRequest, EventDeliveryResponse,
+    PLUGIN_PROTOCOL_VERSION, PluginCapability, PluginHealth, PluginManifest, PluginRegistration,
+    RegisteredPlugin, SignedTransfer, StorageDeleteRequest, StorageDeleteResponse,
+    StorageDownloadRequest, StorageUploadRequest,
 };
 
 #[derive(Clone)]
@@ -160,6 +161,38 @@ impl PluginRegistry {
             Some(body),
         )
         .await
+    }
+
+    /// Hand one event to one sink. Anything but a 2xx is an error the caller
+    /// will retry; a sink that does not want the event answers `delivered:
+    /// false` and is not asked again.
+    pub async fn deliver_event(
+        &self,
+        id: &str,
+        body: &EventDeliveryRequest,
+    ) -> anyhow::Result<EventDeliveryResponse> {
+        let entry = self
+            .entry_with_capability(id, PluginCapability::EventSink)
+            .await?;
+        self.request(&entry, reqwest::Method::POST, "/v1/events", Some(body))
+            .await
+    }
+
+    /// Every plugin that is enabled, reachable and says it takes events.
+    pub async fn event_sinks(&self) -> Vec<String> {
+        self.plugins
+            .read()
+            .await
+            .values()
+            .filter(|entry| {
+                entry.registration.enabled
+                    && entry
+                        .manifest
+                        .capabilities
+                        .contains(&PluginCapability::EventSink)
+            })
+            .map(|entry| entry.manifest.id.clone())
+            .collect()
     }
 
     pub async fn storage_download(
@@ -621,6 +654,165 @@ mod tests {
             }
         });
         (endpoint, seen_token)
+    }
+
+    /// A plugin that takes events, and remembers what it was given.
+    async fn fake_sink(
+        id: &'static str,
+        accept: bool,
+    ) -> (String, Arc<RwLock<Vec<serde_json::Value>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let seen: Arc<RwLock<Vec<serde_json::Value>>> = Arc::new(RwLock::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let recorder = Arc::clone(&recorder);
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 16384];
+                    let Ok(read) = socket.read(&mut buf).await else {
+                        return;
+                    };
+                    let request = String::from_utf8_lossy(&buf[..read]).to_string();
+                    let body = if request.contains("/v1/plugin/manifest") {
+                        manifest(id, &["event_sink"], PLUGIN_PROTOCOL_VERSION).to_string()
+                    } else if request.contains("/v1/plugin/health") {
+                        serde_json::json!({"healthy": true, "detail": null}).to_string()
+                    } else {
+                        if let Some(payload) = request.split("\r\n\r\n").nth(1)
+                            && let Ok(parsed) =
+                                serde_json::from_str::<serde_json::Value>(payload.trim())
+                        {
+                            recorder.write().await.push(parsed);
+                        }
+                        serde_json::json!({
+                            "delivered": accept,
+                            "detail": if accept { None } else { Some("not for me") },
+                        })
+                        .to_string()
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        (endpoint, seen)
+    }
+
+    fn event() -> vms_plugin_sdk::FleetEvent {
+        vms_plugin_sdk::FleetEvent {
+            id: "evt-1".into(),
+            kind: vms_plugin_sdk::FleetEventKind::CameraOffline,
+            severity: vms_plugin_sdk::EventSeverity::Critical,
+            occurred_at: chrono::Utc::now(),
+            customer_id: "cust-1".into(),
+            site_id: "site-1".into(),
+            site_name: "Bakery".into(),
+            gateway_id: Some("gw-1".into()),
+            camera_id: Some("cam-1".into()),
+            title: "Yard camera stopped answering at Bakery".into(),
+            detail: Some("RTSP probe failed".into()),
+            metadata: serde_json::json!({"reconnects": 3}),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_event_reaches_a_sink_whole() {
+        let (endpoint, seen) = fake_sink("sink-1", true).await;
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "sink.json",
+            &serde_json::json!({"endpoint": endpoint, "enabled": true, "manifest": null}),
+        );
+        let registry = PluginRegistry::load_dir(dir.path()).await.unwrap();
+        assert_eq!(registry.event_sinks().await, vec!["sink-1".to_string()]);
+
+        let answer = registry
+            .deliver_event(
+                "sink-1",
+                &EventDeliveryRequest {
+                    context: Default::default(),
+                    event: event(),
+                },
+            )
+            .await
+            .expect("the sink answered");
+        assert!(answer.delivered);
+
+        let seen = seen.read().await;
+        assert_eq!(seen.len(), 1, "one call, one event");
+        // The sink has to be able to write a message from this and nothing
+        // else, so the whole event goes over, not an id to look up.
+        assert_eq!(seen[0]["event"]["id"], "evt-1");
+        assert_eq!(seen[0]["event"]["kind"], "camera_offline");
+        assert_eq!(seen[0]["event"]["severity"], "critical");
+        assert_eq!(
+            seen[0]["event"]["title"],
+            "Yard camera stopped answering at Bakery"
+        );
+        assert_eq!(seen[0]["event"]["site_name"], "Bakery");
+        assert_eq!(seen[0]["event"]["metadata"]["reconnects"], 3);
+    }
+
+    #[tokio::test]
+    async fn a_sink_that_does_not_want_an_event_says_so_rather_than_failing() {
+        let (endpoint, _) = fake_sink("sink-quiet", false).await;
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "sink.json",
+            &serde_json::json!({"endpoint": endpoint, "enabled": true, "manifest": null}),
+        );
+        let registry = PluginRegistry::load_dir(dir.path()).await.unwrap();
+        let answer = registry
+            .deliver_event(
+                "sink-quiet",
+                &EventDeliveryRequest {
+                    context: Default::default(),
+                    event: event(),
+                },
+            )
+            .await
+            .expect("declining is an answer, not an error");
+        assert!(!answer.delivered);
+        assert_eq!(answer.detail.as_deref(), Some("not for me"));
+    }
+
+    #[tokio::test]
+    async fn a_plugin_that_does_not_take_events_is_not_asked_to() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "ai.json", &offline("ai-only", &["ai_analyze"]));
+        let registry = PluginRegistry::load_dir(dir.path()).await.unwrap();
+        assert!(registry.event_sinks().await.is_empty());
+
+        let error = registry
+            .deliver_event(
+                "ai-only",
+                &EventDeliveryRequest {
+                    context: Default::default(),
+                    event: event(),
+                },
+            )
+            .await
+            .expect_err("it never said it takes events");
+        assert!(error.to_string().contains("EventSink"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_disabled_sink_is_not_in_the_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut registration = offline("sink-off", &["event_sink"]);
+        registration["enabled"] = serde_json::json!(false);
+        write(dir.path(), "sink.json", &registration);
+        let registry = PluginRegistry::load_dir(dir.path()).await.unwrap();
+        assert!(registry.event_sinks().await.is_empty());
     }
 
     #[tokio::test]

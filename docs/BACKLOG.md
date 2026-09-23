@@ -87,7 +87,7 @@
 - [ ] mTLS/service identity for plugin calls
 - [ ] Network policies / resource limits / plugin timeouts and circuit breaker metrics
 - [ ] AI snapshot/frame scheduler
-- [ ] Event-sink capability implementation
+- [x] Event-sink capability implementation — contract, runtime call, and a reference webhook sink in `relaysight-plugins`
 - [x] Storage lifecycle / archive index integration (prototype/in-memory)
 - [ ] Persist archive index and lifecycle policies in Postgres
 - [ ] Plugin protocol compatibility tests / SDK examples for Python and Go
@@ -107,7 +107,7 @@
 
 - [ ] Technician/team RBAC
 - [ ] Customer login
-- [ ] Email/webhook alerts
+- [x] Email/webhook alerts — the control plane raises fleet events and an `event_sink` plugin delivers them, with an outbox that retries and a panel showing where each one got to (`docs/ALERTS.md`, spec: `docs/superpowers/specs/2026-09-23-alerts-design.md`); no real chat service has received one yet
 - [ ] Remote NVR access tunnel
 - [ ] 7/30-day health history
 - [x] On-demand cloud recording / archive pipeline through storage plugins

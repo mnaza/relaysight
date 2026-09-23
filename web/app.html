@@ -82,6 +82,20 @@
           <div id="incidents-empty" class="metric-sub" hidden data-i18n="app.incidents.empty"></div>
         </section>
 
+        <section id="alerts" class="panel">
+          <div class="panel-head">
+            <div><strong data-i18n="app.alerts.title"></strong><div class="metric-sub" data-i18n="app.alerts.subtitle"></div></div>
+            <button id="send-test-alert" class="button small" data-i18n="app.alerts.test"></button>
+          </div>
+          <div style="overflow-x:auto">
+            <table class="fleet-table">
+              <thead><tr><th data-i18n="app.alerts.when"></th><th data-i18n="app.alerts.what"></th><th data-i18n="app.alerts.delivery"></th></tr></thead>
+              <tbody id="alerts-body"></tbody>
+            </table>
+          </div>
+          <div id="alerts-empty" class="metric-sub" hidden data-i18n="app.alerts.empty"></div>
+        </section>
+
         <section id="gateways" class="panel">
           <div class="panel-head">
             <div><strong data-i18n="app.gateways.title"></strong><div class="metric-sub" data-i18n="app.gateways.subtitle"></div></div>

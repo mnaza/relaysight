@@ -12,6 +12,34 @@ use vms_domain::{
     AuditView, CameraTelemetryBatch, EnrollmentRequest, GatewayEnrollmentRequest, GatewayView,
     IncidentView, RecordingManifest, RecordingPolicy, VideoSource,
 };
+use vms_plugin_sdk::FleetEvent;
+
+/// An event waiting for one sink.
+#[derive(Debug, Clone)]
+pub struct DueDelivery {
+    pub event: FleetEvent,
+    pub plugin_id: String,
+    pub attempts: i64,
+}
+
+/// What the dashboard shows: an event and how each sink got on with it.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct EventView {
+    #[serde(flatten)]
+    pub event: FleetEvent,
+    pub deliveries: Vec<DeliveryView>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DeliveryView {
+    pub plugin_id: String,
+    pub attempts: i64,
+    pub delivered_at: Option<DateTime<Utc>>,
+    pub declined: bool,
+    pub last_error: Option<String>,
+    /// `None` with no delivery means it was given up on.
+    pub next_attempt_at: Option<DateTime<Utc>>,
+}
 
 #[derive(Debug, Clone)]
 pub struct CameraRecord {
@@ -171,21 +199,24 @@ pub trait Store: Send + Sync {
     async fn delete_expired_sessions(&self, now: DateTime<Utc>) -> Result<(), StoreError>;
 
     /// Open a disconnect incident. Idempotent: at most one open incident per
-    /// camera, enforced by the database.
+    /// camera, enforced by the database. `true` when this call is what opened
+    /// it — the difference between an outage starting and an outage being
+    /// reported again.
     async fn open_incident(
         &self,
         camera_id: &str,
         started_at: DateTime<Utc>,
         detail: Option<&str>,
-    ) -> Result<(), StoreError>;
+    ) -> Result<bool, StoreError>;
 
     /// Close the camera's open incident, if any. Closing nothing is Ok — the
-    /// reconciler closes unconditionally.
+    /// reconciler closes unconditionally — and `true` means this call is the
+    /// one that closed it.
     async fn close_incident(
         &self,
         camera_id: &str,
         ended_at: DateTime<Utc>,
-    ) -> Result<(), StoreError>;
+    ) -> Result<bool, StoreError>;
 
     /// Open incidents first (newest-started first), then closed ones
     /// newest-first — an open incident can never be paged out by the limit.
@@ -251,6 +282,49 @@ pub trait Store: Send + Sync {
         &self,
         gateway_id: &str,
     ) -> Result<Vec<RecordingPolicy>, StoreError>;
+
+    /// Write an event down and queue it for each sink named. Writing it
+    /// first is the point: a sink that is restarting must not be able to lose
+    /// it.
+    async fn record_event(
+        &self,
+        event: &FleetEvent,
+        sinks: &[String],
+        now: DateTime<Utc>,
+    ) -> Result<(), StoreError>;
+
+    /// Deliveries that are due, oldest event first, with the event to send.
+    async fn due_deliveries(
+        &self,
+        now: DateTime<Utc>,
+        limit: i64,
+    ) -> Result<Vec<DueDelivery>, StoreError>;
+
+    /// A sink took it, or decided it was not for it. Either way it is done.
+    async fn delivery_succeeded(
+        &self,
+        event_id: &str,
+        plugin_id: &str,
+        declined: bool,
+        at: DateTime<Utc>,
+        detail: Option<&str>,
+    ) -> Result<(), StoreError>;
+
+    /// A sink did not take it. `next_attempt_at` of `None` means giving up,
+    /// and the reason stays on the row where the dashboard can show it.
+    async fn delivery_failed(
+        &self,
+        event_id: &str,
+        plugin_id: &str,
+        error: &str,
+        next_attempt_at: Option<DateTime<Utc>>,
+    ) -> Result<(), StoreError>;
+
+    /// The recent events with how each sink got on, newest first.
+    async fn recent_events(&self, limit: i64) -> Result<Vec<EventView>, StoreError>;
+
+    /// Drop events older than the cutoff, deliveries and all.
+    async fn delete_events_before(&self, cutoff: DateTime<Utc>) -> Result<(), StoreError>;
 
     /// One audit row. Callers treat failure as loggable, never fatal.
     async fn record_audit(

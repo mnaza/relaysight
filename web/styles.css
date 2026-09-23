@@ -178,6 +178,7 @@ button { cursor: pointer; }
 .policy-form { display:grid; grid-template-columns:repeat(auto-fit,minmax(120px,1fr)); gap:8px; align-items:end; margin-top:12px; padding-top:10px; border-top:1px solid rgba(255,255,255,.065); }
 .policy-days { grid-column:1 / -1; display:flex; flex-wrap:wrap; gap:10px; color:var(--muted); font-size:12px; }
 .policy-days label { display:flex; align-items:center; gap:4px; }
+.alert-critical { color: var(--danger); }
 .recording-status { min-height:18px; margin-top:7px; color:var(--muted); font-size:11px; }
 .timeline { margin-top:12px; border-top:1px solid rgba(255,255,255,.065); padding-top:10px; }
 .timeline-head { display:flex; justify-content:space-between; align-items:center; margin-bottom:7px; font-size:12px; }

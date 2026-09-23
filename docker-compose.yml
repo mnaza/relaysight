@@ -26,6 +26,7 @@ services:
       RTC_TURN_TTL_SECS: ${RTC_TURN_TTL_SECS:-600}
       AI_PLUGIN_TOKEN: ${AI_PLUGIN_TOKEN:-demo-ai-plugin-token}
       STORAGE_PLUGIN_TOKEN: ${STORAGE_PLUGIN_TOKEN:-demo-storage-plugin-token}
+      WEBHOOK_PLUGIN_TOKEN: ${WEBHOOK_PLUGIN_TOKEN:-demo-webhook-plugin-token}
       # Empty means Community: the API answers the Community entitlement itself
       # and never calls out. `make demo-commercial` points this at the stand-in
       # control plane below; a commercial deployment points it at the real one.
@@ -120,6 +121,21 @@ services:
       SIMULATED_AI: ${SIMULATED_AI:-true}
     ports:
       - "9001:9001"
+
+  webhook-sink:
+    profiles: ["plugins"]
+    # Reference plugins live in their own repository. This one takes the
+    # alerts the control plane raises and posts them somewhere a person will
+    # see them; without WEBHOOK_URL it reports itself unhealthy, which is the
+    # honest answer for a sink with nowhere to post.
+    image: ${WEBHOOK_PLUGIN_IMAGE:-relaysight/webhook-sink:latest}
+    environment:
+      PLUGIN_TOKEN: ${WEBHOOK_PLUGIN_TOKEN:-demo-webhook-plugin-token}
+      WEBHOOK_URL: ${WEBHOOK_URL:-}
+      WEBHOOK_FORMAT: ${WEBHOOK_FORMAT:-text}
+      MIN_SEVERITY: ${WEBHOOK_MIN_SEVERITY:-info}
+    ports:
+      - "9003:9003"
 
   minio:
     profiles: ["plugins"]

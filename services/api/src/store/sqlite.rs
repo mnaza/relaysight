@@ -1,13 +1,16 @@
 //! SQLite implementation of the fleet store.
 
 use crate::store::{
-    CameraRecord, OrganizationRecord, SiteRecord, Store, StoreError, parse_ts, token_hash, ts,
+    CameraRecord, DeliveryView, DueDelivery, EventView, OrganizationRecord, SiteRecord, Store,
+    StoreError, parse_ts, token_hash, ts,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sqlx::Row;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use std::str::FromStr;
+use vms_plugin_sdk::{EventSeverity, FleetEvent, FleetEventKind};
+
 use vms_domain::{
     AuditView, CameraTelemetryBatch, EnrollmentRequest, GatewayEnrollmentRequest, GatewayView,
     IncidentView, RecordingManifest, RecordingPolicy, VideoSource,
@@ -491,8 +494,8 @@ impl Store for SqliteStore {
         camera_id: &str,
         started_at: DateTime<Utc>,
         detail: Option<&str>,
-    ) -> Result<(), StoreError> {
-        sqlx::query(
+    ) -> Result<bool, StoreError> {
+        let inserted = sqlx::query(
             "INSERT INTO incidents (id, camera_id, started_at, ended_at, detail)
              VALUES (?1, ?2, ?3, NULL, ?4)
              ON CONFLICT(camera_id) WHERE ended_at IS NULL DO NOTHING",
@@ -503,20 +506,26 @@ impl Store for SqliteStore {
         .bind(detail)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        // Nothing inserted means this camera was already down: the same
+        // outage, reported again, not a new one.
+        Ok(inserted.rows_affected() > 0)
     }
 
     async fn close_incident(
         &self,
         camera_id: &str,
         ended_at: DateTime<Utc>,
-    ) -> Result<(), StoreError> {
-        sqlx::query("UPDATE incidents SET ended_at = ?2 WHERE camera_id = ?1 AND ended_at IS NULL")
-            .bind(camera_id)
-            .bind(ts(&ended_at))
-            .execute(&self.pool)
-            .await?;
-        Ok(())
+    ) -> Result<bool, StoreError> {
+        let closed = sqlx::query(
+            "UPDATE incidents SET ended_at = ?2 WHERE camera_id = ?1 AND ended_at IS NULL",
+        )
+        .bind(camera_id)
+        .bind(ts(&ended_at))
+        .execute(&self.pool)
+        .await?;
+        // The reconciler closes unconditionally every pass, so most calls
+        // close nothing. One that does is a camera coming back.
+        Ok(closed.rows_affected() > 0)
     }
 
     async fn incidents(&self, limit: i64) -> Result<Vec<IncidentView>, StoreError> {
@@ -661,6 +670,175 @@ impl Store for SqliteStore {
         rows.iter().map(policy_from_row).collect()
     }
 
+    async fn record_event(
+        &self,
+        event: &FleetEvent,
+        sinks: &[String],
+        now: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO fleet_events
+                 (id, kind, severity, occurred_at, customer_id, site_id, site_name,
+                  gateway_id, camera_id, title, detail, metadata)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+             ON CONFLICT(id) DO NOTHING",
+        )
+        .bind(&event.id)
+        .bind(event.kind.as_str())
+        .bind(event.severity.as_str())
+        .bind(ts(&event.occurred_at))
+        .bind(&event.customer_id)
+        .bind(&event.site_id)
+        .bind(&event.site_name)
+        .bind(&event.gateway_id)
+        .bind(&event.camera_id)
+        .bind(&event.title)
+        .bind(&event.detail)
+        .bind(serde_json::to_string(&event.metadata).unwrap_or_else(|_| "{}".into()))
+        .execute(&mut *transaction)
+        .await?;
+        for plugin_id in sinks {
+            sqlx::query(
+                "INSERT INTO event_deliveries (event_id, plugin_id, attempts, next_attempt_at)
+                 VALUES (?1, ?2, 0, ?3)
+                 ON CONFLICT(event_id, plugin_id) DO NOTHING",
+            )
+            .bind(&event.id)
+            .bind(plugin_id)
+            .bind(ts(&now))
+            .execute(&mut *transaction)
+            .await?;
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    async fn due_deliveries(
+        &self,
+        now: DateTime<Utc>,
+        limit: i64,
+    ) -> Result<Vec<DueDelivery>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT d.plugin_id AS plugin_id, d.attempts AS attempts, e.*
+             FROM event_deliveries d JOIN fleet_events e ON e.id = d.event_id
+             WHERE d.delivered_at IS NULL AND d.next_attempt_at IS NOT NULL
+                   AND d.next_attempt_at <= ?1
+             ORDER BY e.occurred_at, d.plugin_id
+             LIMIT ?2",
+        )
+        .bind(ts(&now))
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                Ok(DueDelivery {
+                    event: event_from_row(row)?,
+                    plugin_id: row.try_get("plugin_id")?,
+                    attempts: row.try_get("attempts")?,
+                })
+            })
+            .collect()
+    }
+
+    async fn delivery_succeeded(
+        &self,
+        event_id: &str,
+        plugin_id: &str,
+        declined: bool,
+        at: DateTime<Utc>,
+        detail: Option<&str>,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE event_deliveries
+             SET delivered_at = ?3, declined = ?4, last_error = ?5,
+                 next_attempt_at = NULL, attempts = attempts + 1
+             WHERE event_id = ?1 AND plugin_id = ?2",
+        )
+        .bind(event_id)
+        .bind(plugin_id)
+        .bind(ts(&at))
+        .bind(i64::from(declined))
+        .bind(detail)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn delivery_failed(
+        &self,
+        event_id: &str,
+        plugin_id: &str,
+        error: &str,
+        next_attempt_at: Option<DateTime<Utc>>,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE event_deliveries
+             SET attempts = attempts + 1, last_error = ?3, next_attempt_at = ?4
+             WHERE event_id = ?1 AND plugin_id = ?2",
+        )
+        .bind(event_id)
+        .bind(plugin_id)
+        .bind(error)
+        .bind(next_attempt_at.as_ref().map(ts))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn recent_events(&self, limit: i64) -> Result<Vec<EventView>, StoreError> {
+        let rows = sqlx::query("SELECT * FROM fleet_events ORDER BY occurred_at DESC, id LIMIT ?1")
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
+        let mut views = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let event = event_from_row(row)?;
+            let deliveries = sqlx::query(
+                "SELECT * FROM event_deliveries WHERE event_id = ?1 ORDER BY plugin_id",
+            )
+            .bind(&event.id)
+            .fetch_all(&self.pool)
+            .await?;
+            let deliveries = deliveries
+                .iter()
+                .map(|row| {
+                    Ok(DeliveryView {
+                        plugin_id: row.try_get("plugin_id")?,
+                        attempts: row.try_get("attempts")?,
+                        delivered_at: row
+                            .try_get::<Option<String>, _>("delivered_at")?
+                            .as_deref()
+                            .map(parse_ts)
+                            .transpose()?,
+                        declined: row.try_get::<i64, _>("declined")? != 0,
+                        last_error: row.try_get("last_error")?,
+                        next_attempt_at: row
+                            .try_get::<Option<String>, _>("next_attempt_at")?
+                            .as_deref()
+                            .map(parse_ts)
+                            .transpose()?,
+                    })
+                })
+                .collect::<Result<Vec<_>, StoreError>>()?;
+            views.push(EventView { event, deliveries });
+        }
+        Ok(views)
+    }
+
+    async fn delete_events_before(&self, cutoff: DateTime<Utc>) -> Result<(), StoreError> {
+        sqlx::query("DELETE FROM event_deliveries WHERE event_id IN (SELECT id FROM fleet_events WHERE occurred_at < ?1)")
+            .bind(ts(&cutoff))
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("DELETE FROM fleet_events WHERE occurred_at < ?1")
+            .bind(ts(&cutoff))
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     async fn delete_video_source(&self, id: &str) -> Result<(), StoreError> {
         let removed = sqlx::query("DELETE FROM video_sources WHERE id = ?1")
             .bind(id)
@@ -799,6 +977,43 @@ impl Store for SqliteStore {
             .await?;
         Ok(())
     }
+}
+
+fn event_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<FleetEvent, StoreError> {
+    let kind: String = row.try_get("kind")?;
+    let kind = match kind.as_str() {
+        "camera_offline" => FleetEventKind::CameraOffline,
+        "camera_recovered" => FleetEventKind::CameraRecovered,
+        "gateway_offline" => FleetEventKind::GatewayOffline,
+        "gateway_recovered" => FleetEventKind::GatewayRecovered,
+        "test" => FleetEventKind::Test,
+        other => {
+            return Err(StoreError::Internal(anyhow::anyhow!(
+                "stored event kind {other:?} is not one this build knows"
+            )));
+        }
+    };
+    let severity: String = row.try_get("severity")?;
+    let severity = match severity.as_str() {
+        "critical" => EventSeverity::Critical,
+        "warning" => EventSeverity::Warning,
+        _ => EventSeverity::Info,
+    };
+    let metadata: String = row.try_get("metadata")?;
+    Ok(FleetEvent {
+        id: row.try_get("id")?,
+        kind,
+        severity,
+        occurred_at: parse_ts(row.try_get("occurred_at")?)?,
+        customer_id: row.try_get("customer_id")?,
+        site_id: row.try_get("site_id")?,
+        site_name: row.try_get("site_name")?,
+        gateway_id: row.try_get("gateway_id")?,
+        camera_id: row.try_get("camera_id")?,
+        title: row.try_get("title")?,
+        detail: row.try_get("detail")?,
+        metadata: serde_json::from_str(&metadata).unwrap_or(serde_json::Value::Null),
+    })
 }
 
 fn policy_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<RecordingPolicy, StoreError> {

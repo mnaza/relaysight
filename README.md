@@ -161,7 +161,7 @@ It is not needed to run this. Nothing here links to it unless
 `docs/ARCHITECTURE.md`, `docs/PLUGIN-SDK.md`,
 `docs/EDITIONS.md`, `docs/DEMO.md`, `docs/INSTALL-GATEWAY.md`,
 `docs/ARCHIVE.md`, `docs/LIVE.md`, `docs/AI.md`,
-`docs/VIDEO-SOURCES.md`, `docs/RECORDING.md`.
+`docs/VIDEO-SOURCES.md`, `docs/RECORDING.md`, `docs/ALERTS.md`.
 
 `docs/TURN-COSTS.md` is the one to read if you are pricing
 relay bandwidth. The finding is that a flat-rate box makes

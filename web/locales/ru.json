@@ -220,5 +220,18 @@
   "app.policy.day3": "Чт",
   "app.policy.day4": "Пт",
   "app.policy.day5": "Сб",
-  "app.policy.day6": "Вс"
+  "app.policy.day6": "Вс",
+  "app.alerts.title": "Оповещения",
+  "app.alerts.subtitle": "Что ушло наружу и дошло ли. Доставкой занимается плагин event_sink.",
+  "app.alerts.when": "Когда",
+  "app.alerts.what": "Что произошло",
+  "app.alerts.delivery": "Доставка",
+  "app.alerts.test": "Отправить тестовое",
+  "app.alerts.testFailed": "Тестовое оповещение не ушло",
+  "app.alerts.empty": "Пока ничего не было",
+  "app.alerts.delivered": "доставлено",
+  "app.alerts.declined": "не для этого получателя",
+  "app.alerts.retrying": "повтор",
+  "app.alerts.gaveUp": "сдался",
+  "app.alerts.nosinks": "плагин event_sink не зарегистрирован"
 }

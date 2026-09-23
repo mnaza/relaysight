@@ -26,7 +26,7 @@ use axum::{
     http::{HeaderMap, Method, StatusCode, header::AUTHORIZATION},
     routing::{get, post},
 };
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 use tokio::sync::RwLock;
 use tower_http::{
@@ -271,6 +271,8 @@ fn build_router(state: AppState) -> Router {
             "/api/v1/cameras/{camera_id}/recordings",
             post(create_recording).get(camera_timeline),
         )
+        .route("/api/v1/events", get(fleet_events))
+        .route("/api/v1/events/test", post(test_event))
         .route("/api/v1/cameras/{camera_id}/clips", post(create_clip))
         .route(
             "/api/v1/cameras/{camera_id}/recording-policy",
@@ -1316,6 +1318,49 @@ async fn create_recording(
     ))
 }
 
+/// What has been raised lately and whether each sink took it. An alert
+/// nobody delivered is exactly what an operator needs to see, so the failure
+/// travels with the event rather than staying in a log.
+async fn fleet_events(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<crate::store::EventView>>, StatusCode> {
+    state
+        .store
+        .recent_events(100)
+        .await
+        .map(Json)
+        .map_err(store_status)
+}
+
+/// Send a test event, because the first question anyone asks about alerting
+/// is whether it is wired up at all.
+async fn test_event(State(state): State<AppState>) -> Result<Json<serde_json::Value>, StatusCode> {
+    let sinks = state.plugins.event_sinks().await;
+    let event = vms_plugin_sdk::FleetEvent {
+        id: Uuid::new_v4().to_string(),
+        kind: vms_plugin_sdk::FleetEventKind::Test,
+        severity: vms_plugin_sdk::EventSeverity::Info,
+        occurred_at: Utc::now(),
+        customer_id: String::new(),
+        site_id: String::new(),
+        site_name: String::new(),
+        gateway_id: None,
+        camera_id: None,
+        title: "Test alert from the dashboard".into(),
+        detail: Some("Nothing is wrong. Somebody pressed the button.".into()),
+        metadata: serde_json::json!({}),
+    };
+    let event_id = event.id.clone();
+    raise_event(&state, event).await;
+    audit(&state, "admin", "alert.test", &event_id, None).await;
+    // Sent now rather than on the next minute's pass: whoever pressed the
+    // button is watching for it.
+    delivery_pass(&state, Utc::now()).await;
+    Ok(Json(
+        serde_json::json!({"event_id": event_id, "sinks": sinks.len()}),
+    ))
+}
+
 /// Keep what already happened. The gateway answers out of its ring buffer,
 /// or says how far back the ring goes; nothing is dialled either way.
 async fn create_clip(
@@ -1537,11 +1582,243 @@ async fn recording_playback(
 
 async fn retention_loop(state: AppState) {
     let mut interval = tokio::time::interval(Duration::from_secs(60));
+    // Whether each gateway was reporting last time round. In memory, because
+    // a restart should not announce an outage it never saw start.
+    let mut reporting: HashMap<String, bool> = HashMap::new();
     loop {
         interval.tick().await;
         retention_pass(&state).await;
         incident_pass(&state).await;
+        gateway_pass(&state, &mut reporting).await;
+        delivery_pass(&state, Utc::now()).await;
     }
+}
+
+/// Notice a gateway going quiet, which nothing did before: the gateways
+/// screen works out `online` when it is read, so a gateway could stop
+/// reporting at midnight and the first anyone knew was the next time someone
+/// opened the page.
+///
+/// A gateway going quiet is worse news than a camera going quiet — it takes
+/// every camera behind it with it — and it is the one outage the site cannot
+/// report itself.
+async fn gateway_pass(state: &AppState, reporting: &mut HashMap<String, bool>) {
+    if state.up_since.elapsed() < state.incident_grace {
+        return;
+    }
+    let views = match state.store.gateway_views().await {
+        Ok(views) => views,
+        Err(err) => {
+            warn!(error = %err, "gateway pass could not list gateways");
+            return;
+        }
+    };
+    let now = Utc::now();
+    let live = state.gateways.read().await.clone();
+    let mut present = std::collections::HashSet::new();
+
+    for view in views {
+        // A revoked gateway is not an outage, it is a decision.
+        if view.revoked_at.is_some() {
+            reporting.remove(&view.gateway_id);
+            continue;
+        }
+        present.insert(view.gateway_id.clone());
+        let last_seen = live
+            .get(&view.gateway_id)
+            .map(|heartbeat| heartbeat.sent_at)
+            .max(view.last_seen);
+        let online =
+            last_seen.is_some_and(|seen| (now - seen).num_seconds() <= state.stale_camera_seconds);
+        let previous = reporting.insert(view.gateway_id.clone(), online);
+        // First sight of a gateway says nothing: this process has no idea
+        // whether that state is new.
+        let Some(previous) = previous else { continue };
+        if previous == online {
+            continue;
+        }
+        // Name the box the way the screen does: the heartbeat knows the
+        // hostname even when the roster has not caught up.
+        let name = live
+            .get(&view.gateway_id)
+            .map(|heartbeat| heartbeat.hostname.clone())
+            .or_else(|| view.hostname.clone())
+            .unwrap_or_else(|| view.gateway_id.clone());
+        let site = if view.site_name.is_empty() {
+            view.site_id.clone()
+        } else {
+            view.site_name.clone()
+        };
+        raise_event(
+            state,
+            vms_plugin_sdk::FleetEvent {
+                id: Uuid::new_v4().to_string(),
+                kind: if online {
+                    vms_plugin_sdk::FleetEventKind::GatewayRecovered
+                } else {
+                    vms_plugin_sdk::FleetEventKind::GatewayOffline
+                },
+                severity: if online {
+                    vms_plugin_sdk::EventSeverity::Info
+                } else {
+                    vms_plugin_sdk::EventSeverity::Critical
+                },
+                occurred_at: now,
+                customer_id: String::new(),
+                site_id: view.site_id.clone(),
+                site_name: site.clone(),
+                gateway_id: Some(view.gateway_id.clone()),
+                camera_id: None,
+                title: format!(
+                    "Gateway {name} {} at {site}",
+                    if online {
+                        "is reporting again"
+                    } else {
+                        "stopped reporting"
+                    }
+                ),
+                detail: last_seen.map(|seen| format!("last heard from at {}", seen.to_rfc3339())),
+                metadata: serde_json::json!({"cameras": view.heartbeat.as_ref().map(|h| h.cameras_seen)}),
+            },
+        )
+        .await;
+    }
+    // A gateway nobody lists any more cannot come back as a surprise.
+    reporting.retain(|gateway_id, _| present.contains(gateway_id));
+}
+
+/// How long to wait before trying a sink again, by how many times it has
+/// already refused. After the last one the event is given up on and the
+/// reason stays on the row.
+pub(crate) fn retry_after(attempts: i64) -> Option<Duration> {
+    match attempts {
+        0 => Some(Duration::from_secs(10)),
+        1 => Some(Duration::from_secs(60)),
+        2 => Some(Duration::from_secs(300)),
+        3 => Some(Duration::from_secs(1800)),
+        // Four refusals over half an hour is a sink that is not coming back
+        // in time to matter. An alert nobody can deliver is not worth
+        // retrying until the end of days.
+        _ => None,
+    }
+}
+
+/// Hand due events to their sinks.
+async fn delivery_pass(state: &AppState, now: DateTime<Utc>) {
+    let due = match state.store.due_deliveries(now, 50).await {
+        Ok(due) => due,
+        Err(err) => {
+            warn!(error = %err, "could not read the alert outbox");
+            return;
+        }
+    };
+    for delivery in due {
+        let request = vms_plugin_sdk::EventDeliveryRequest {
+            context: vms_plugin_sdk::PluginInvocationContext {
+                site_id: Some(delivery.event.site_id.clone()),
+                camera_id: delivery.event.camera_id.clone(),
+                trace_id: Some(delivery.event.id.clone()),
+                ..Default::default()
+            },
+            event: delivery.event.clone(),
+        };
+        let outcome = state
+            .plugins
+            .deliver_event(&delivery.plugin_id, &request)
+            .await;
+        let result = match outcome {
+            Ok(answer) => {
+                if answer.delivered {
+                    info!(
+                        event_id = %delivery.event.id, plugin_id = %delivery.plugin_id,
+                        "an alert was delivered"
+                    );
+                } else {
+                    info!(
+                        event_id = %delivery.event.id, plugin_id = %delivery.plugin_id,
+                        detail = ?answer.detail, "a sink declined an alert"
+                    );
+                }
+                state
+                    .store
+                    .delivery_succeeded(
+                        &delivery.event.id,
+                        &delivery.plugin_id,
+                        !answer.delivered,
+                        now,
+                        answer.detail.as_deref(),
+                    )
+                    .await
+            }
+            Err(error) => {
+                let next = retry_after(delivery.attempts).map(|wait| {
+                    now + chrono::Duration::from_std(wait).unwrap_or(chrono::Duration::minutes(1))
+                });
+                if next.is_none() {
+                    warn!(
+                        event_id = %delivery.event.id, plugin_id = %delivery.plugin_id, %error,
+                        "an alert was given up on"
+                    );
+                }
+                state
+                    .store
+                    .delivery_failed(
+                        &delivery.event.id,
+                        &delivery.plugin_id,
+                        &error.to_string(),
+                        next,
+                    )
+                    .await
+            }
+        };
+        if let Err(err) = result {
+            warn!(error = %err, "the alert outbox could not be updated");
+        }
+    }
+}
+
+/// Where a site is, by site id: enough to write a sentence a human can read.
+struct Place {
+    customer_id: String,
+    site_name: String,
+}
+
+async fn places_by_site(state: &AppState) -> HashMap<String, Place> {
+    let mut places = HashMap::new();
+    let Ok(organizations) = state.store.fleet_identity().await else {
+        // Without names an event still goes out, naming ids. Silence would be
+        // the worse answer.
+        return places;
+    };
+    for organization in organizations {
+        for site in organization.sites {
+            places.insert(
+                site.id.clone(),
+                Place {
+                    customer_id: organization.id.clone(),
+                    site_name: site.name.clone(),
+                },
+            );
+        }
+    }
+    places
+}
+
+/// Write an event down and queue it for every sink registered right now.
+///
+/// A sink registered later gets nothing: alerts are about now. Failure here
+/// is logged and never fatal — an alert must not be able to break the thing
+/// it is reporting on.
+async fn raise_event(state: &AppState, event: vms_plugin_sdk::FleetEvent) {
+    let sinks = state.plugins.event_sinks().await;
+    if let Err(err) = state.store.record_event(&event, &sinks, Utc::now()).await {
+        warn!(error = %err, kind = event.kind.as_str(), "an event was not written down");
+        return;
+    }
+    info!(
+        event_id = %event.id, kind = event.kind.as_str(), sinks = sinks.len(),
+        title = %event.title, "raised an event"
+    );
 }
 
 async fn retention_pass(state: &AppState) {
@@ -1602,6 +1879,18 @@ async fn retention_pass(state: &AppState) {
     {
         warn!(error = %err, "retention could not prune closed incidents");
     }
+    // Events age out with incidents: they are the same outages, said out
+    // loud, and keeping the shouting longer than the record would be odd.
+    if state.incident_retention_days > 0
+        && let Err(err) = state
+            .store
+            .delete_events_before(
+                Utc::now() - chrono::Duration::days(state.incident_retention_days),
+            )
+            .await
+    {
+        warn!(error = %err, "retention could not prune old events");
+    }
     if state.audit_retention_days > 0
         && let Err(err) = state
             .store
@@ -1629,6 +1918,9 @@ async fn incident_pass(state: &AppState) {
     };
     let now = Utc::now();
     let live = newest_camera_map(&*state.camera_batches.read().await);
+    // Where each camera is, so an event can say "Yard camera at Bakery"
+    // rather than a pair of uuids.
+    let places = places_by_site(state).await;
     let mut revoked_gateways: std::collections::HashMap<String, bool> =
         std::collections::HashMap::new();
     for record in records {
@@ -1663,22 +1955,80 @@ async fn incident_pass(state: &AppState) {
             None => (record.last_seen, false, None),
         };
         let stale = (now - last_seen).num_seconds() > state.stale_camera_seconds;
-        let result = if stale {
+        let (detail, result) = if stale {
             let started = last_seen + chrono::Duration::seconds(state.stale_camera_seconds);
-            state
-                .store
-                .open_incident(&record.id, started, Some("gateway telemetry is stale"))
-                .await
+            let detail = "gateway telemetry is stale";
+            (
+                Some(detail.to_owned()),
+                state
+                    .store
+                    .open_incident(&record.id, started, Some(detail))
+                    .await,
+            )
         } else if reported_offline {
-            state
-                .store
-                .open_incident(&record.id, now, last_error.as_deref())
-                .await
+            (
+                last_error.clone(),
+                state
+                    .store
+                    .open_incident(&record.id, now, last_error.as_deref())
+                    .await,
+            )
         } else {
-            state.store.close_incident(&record.id, now).await
+            (None, state.store.close_incident(&record.id, now).await)
         };
-        if let Err(err) = result {
-            warn!(camera_id = %record.id, error = %err, "incident pass store failure");
+        match result {
+            // Only a transition is news. The reconciler opens and closes every
+            // pass; without this an outage would be reported every minute for
+            // as long as it lasted.
+            Ok(true) => {
+                let place = places.get(&record.site_id);
+                let down = stale || reported_offline;
+                raise_event(
+                    state,
+                    vms_plugin_sdk::FleetEvent {
+                        id: Uuid::new_v4().to_string(),
+                        kind: if down {
+                            vms_plugin_sdk::FleetEventKind::CameraOffline
+                        } else {
+                            vms_plugin_sdk::FleetEventKind::CameraRecovered
+                        },
+                        severity: if down {
+                            vms_plugin_sdk::EventSeverity::Critical
+                        } else {
+                            vms_plugin_sdk::EventSeverity::Info
+                        },
+                        occurred_at: now,
+                        customer_id: place
+                            .map(|place| place.customer_id.clone())
+                            .unwrap_or_default(),
+                        site_id: record.site_id.clone(),
+                        site_name: place
+                            .map(|place| place.site_name.clone())
+                            .unwrap_or_else(|| record.site_id.clone()),
+                        gateway_id: Some(record.gateway_id.clone()),
+                        camera_id: Some(record.id.clone()),
+                        title: format!(
+                            "{} {} at {}",
+                            record.name,
+                            if down {
+                                "stopped answering"
+                            } else {
+                                "is answering again"
+                            },
+                            place
+                                .map(|place| place.site_name.clone())
+                                .unwrap_or_else(|| record.site_id.clone()),
+                        ),
+                        detail,
+                        metadata: serde_json::json!({"gateway_id": record.gateway_id}),
+                    },
+                )
+                .await;
+            }
+            Ok(false) => {}
+            Err(err) => {
+                warn!(camera_id = %record.id, error = %err, "incident pass store failure")
+            }
         }
     }
 }
@@ -2074,6 +2424,228 @@ mod tests {
             fleet["customers"][0]["sites"][0]["cameras"][0]["status"],
             "offline"
         );
+    }
+
+    /// A sink that either takes events or refuses them, and remembers what it
+    /// was given.
+    async fn fake_sink(
+        id: &'static str,
+        accept: bool,
+    ) -> (String, Arc<RwLock<Vec<serde_json::Value>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let seen: Arc<RwLock<Vec<serde_json::Value>>> = Arc::new(RwLock::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let recorder = Arc::clone(&recorder);
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buffer = vec![0_u8; 16384];
+                    let Ok(read) = socket.read(&mut buffer).await else {
+                        return;
+                    };
+                    let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+                    let response = if request.contains("/v1/plugin/manifest") {
+                        Some(
+                            serde_json::json!({
+                                "id": id, "name": id, "version": "0.1.0",
+                                "protocol_version": 1, "vendor": "test",
+                                "description": null, "capabilities": ["event_sink"],
+                            })
+                            .to_string(),
+                        )
+                    } else if request.contains("/v1/events") {
+                        if let Some(body) = request.split("\r\n\r\n").nth(1)
+                            && let Ok(parsed) =
+                                serde_json::from_str::<serde_json::Value>(body.trim())
+                        {
+                            recorder.write().await.push(parsed);
+                        }
+                        accept.then(|| serde_json::json!({"delivered": true}).to_string())
+                    } else {
+                        Some(serde_json::json!({"healthy": true}).to_string())
+                    };
+                    let wire = match response {
+                        Some(body) => format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                            body.len()
+                        ),
+                        None => "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_owned(),
+                    };
+                    let _ = socket.write_all(wire.as_bytes()).await;
+                });
+            }
+        });
+        (endpoint, seen)
+    }
+
+    /// An AppState whose plugin registry holds these sinks.
+    async fn state_with_sinks(sinks: &[(&str, &str)]) -> AppState {
+        let store: Arc<dyn crate::store::Store> = Arc::new(
+            crate::store::SqliteStore::in_memory()
+                .await
+                .expect("in-memory store"),
+        );
+        let dir = tempfile::tempdir().expect("temp plugin dir");
+        for (name, endpoint) in sinks {
+            std::fs::write(
+                dir.path().join(format!("{name}.json")),
+                serde_json::json!({"endpoint": endpoint, "enabled": true, "manifest": null})
+                    .to_string(),
+            )
+            .unwrap();
+        }
+        let plugin_dir = dir.keep();
+        let mut state = test_state_with(store).await;
+        state.plugins = PluginRegistry::load_dir(&plugin_dir)
+            .await
+            .expect("a plugin dir with sinks");
+        state.plugin_dir = Arc::new(plugin_dir);
+        state
+    }
+
+    fn test_event(id: &str) -> vms_plugin_sdk::FleetEvent {
+        vms_plugin_sdk::FleetEvent {
+            id: id.into(),
+            kind: vms_plugin_sdk::FleetEventKind::CameraOffline,
+            severity: vms_plugin_sdk::EventSeverity::Critical,
+            occurred_at: Utc::now(),
+            customer_id: "cust-1".into(),
+            site_id: "site-1".into(),
+            site_name: "Bakery".into(),
+            gateway_id: Some("gw-1".into()),
+            camera_id: Some("cam-1".into()),
+            title: "Yard camera stopped answering at Bakery".into(),
+            detail: None,
+            metadata: serde_json::json!({}),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_event_is_written_down_before_anyone_tries_to_deliver_it() {
+        // The whole point of an outbox: a sink that is restarting cannot lose
+        // an alert, because the alert exists before the sink is called.
+        let (endpoint, seen) = fake_sink("sink-1", true).await;
+        let state = state_with_sinks(&[("sink", &endpoint)]).await;
+
+        raise_event(&state, test_event("evt-1")).await;
+        let stored = state.store.recent_events(10).await.unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].deliveries.len(), 1, "queued for the one sink");
+        assert!(stored[0].deliveries[0].delivered_at.is_none());
+        assert!(seen.read().await.is_empty(), "nothing has been sent yet");
+
+        delivery_pass(&state, Utc::now()).await;
+        assert_eq!(seen.read().await.len(), 1, "and now it has");
+        let stored = state.store.recent_events(10).await.unwrap();
+        assert!(stored[0].deliveries[0].delivered_at.is_some());
+        assert!(!stored[0].deliveries[0].declined);
+    }
+
+    #[tokio::test]
+    async fn a_sink_that_is_down_is_retried_later_and_not_sooner() {
+        let (endpoint, _) = fake_sink("sink-down", false).await;
+        let state = state_with_sinks(&[("sink", &endpoint)]).await;
+        raise_event(&state, test_event("evt-2")).await;
+        // A freshly raised event is due at once; everything after it waits.
+        let now = Utc::now();
+
+        delivery_pass(&state, now).await;
+        let stored = state.store.recent_events(10).await.unwrap();
+        let delivery = &stored[0].deliveries[0];
+        assert_eq!(delivery.attempts, 1);
+        assert!(delivery.delivered_at.is_none());
+        assert!(
+            delivery
+                .last_error
+                .as_deref()
+                .is_some_and(|e| !e.is_empty()),
+            "the reason stays on the row"
+        );
+        let due_at = delivery.next_attempt_at.expect("it will be tried again");
+        assert!(due_at > now, "and not immediately");
+
+        // Before it is due, nothing happens at all.
+        delivery_pass(&state, due_at - chrono::Duration::seconds(1)).await;
+        let stored = state.store.recent_events(10).await.unwrap();
+        assert_eq!(stored[0].deliveries[0].attempts, 1, "not tried early");
+
+        delivery_pass(&state, due_at).await;
+        let stored = state.store.recent_events(10).await.unwrap();
+        assert_eq!(stored[0].deliveries[0].attempts, 2);
+        assert!(
+            stored[0].deliveries[0].next_attempt_at.unwrap() > due_at,
+            "each wait is longer than the last"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sink_that_never_answers_is_given_up_on_with_the_reason_kept() {
+        let (endpoint, _) = fake_sink("sink-gone", false).await;
+        let state = state_with_sinks(&[("sink", &endpoint)]).await;
+        raise_event(&state, test_event("evt-3")).await;
+
+        let mut now = Utc::now();
+        for _ in 0..6 {
+            delivery_pass(&state, now).await;
+            now += chrono::Duration::hours(1);
+        }
+        let stored = state.store.recent_events(10).await.unwrap();
+        let delivery = &stored[0].deliveries[0];
+        assert!(
+            delivery.next_attempt_at.is_none() && delivery.delivered_at.is_none(),
+            "an alert nobody can deliver is not retried until the end of days"
+        );
+        assert!(
+            delivery.last_error.is_some(),
+            "and the reason is still there"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sink_that_declines_is_done_rather_than_retried() {
+        let (endpoint, _) = fake_sink("sink-1", true).await;
+        let state = state_with_sinks(&[("sink", &endpoint)]).await;
+        raise_event(&state, test_event("evt-4")).await;
+        delivery_pass(&state, Utc::now()).await;
+        let stored = state.store.recent_events(10).await.unwrap();
+        assert!(stored[0].deliveries[0].next_attempt_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_sink_registered_after_the_event_gets_no_history() {
+        // Alerts are about now. A sink plugged in this afternoon should not
+        // start by replaying this morning.
+        let state = state_with_sinks(&[]).await;
+        raise_event(&state, test_event("evt-5")).await;
+        let stored = state.store.recent_events(10).await.unwrap();
+        assert_eq!(stored.len(), 1, "the event is still recorded");
+        assert!(stored[0].deliveries.is_empty(), "with nowhere to go");
+
+        let (endpoint, seen) = fake_sink("sink-late", true).await;
+        std::fs::write(
+            state.plugin_dir.join("late.json"),
+            serde_json::json!({"endpoint": endpoint, "enabled": true, "manifest": null})
+                .to_string(),
+        )
+        .unwrap();
+        state.plugins.reload(&*state.plugin_dir).await.unwrap();
+        delivery_pass(&state, Utc::now()).await;
+        assert!(seen.read().await.is_empty());
+    }
+
+    #[test]
+    fn each_retry_waits_longer_than_the_last_and_then_stops() {
+        let waits: Vec<_> = (0..4).map(retry_after).collect();
+        assert!(waits.iter().all(Option::is_some));
+        for pair in waits.windows(2) {
+            assert!(pair[1].unwrap() > pair[0].unwrap(), "{waits:?}");
+        }
+        assert_eq!(retry_after(4), None, "four refusals is enough");
     }
 
     #[tokio::test]
@@ -4542,6 +5114,190 @@ mod tests {
         );
         assert!(cam1[0].ended_at.is_some());
         assert!(incident_for(&incidents, "cam-2")[0].ended_at.is_none());
+    }
+
+    /// The whole point of alerts: the camera goes quiet, and something
+    /// outside this building hears about it without anyone looking.
+    #[tokio::test]
+    async fn a_camera_going_quiet_raises_one_event_and_coming_back_raises_another() {
+        let (endpoint, seen) = fake_sink("sink-1", true).await;
+        let state = state_with_sinks(&[("sink", &endpoint)]).await;
+        let went_dark = Utc::now() - chrono::Duration::seconds(300);
+        state
+            .store
+            .upsert_fleet_identity(
+                &typed_batch("gw-1", "cam-1", HealthStatus::Healthy, went_dark, None),
+                went_dark,
+            )
+            .await
+            .unwrap();
+
+        incident_pass(&state).await;
+        delivery_pass(&state, Utc::now()).await;
+        let sent = seen.read().await.clone();
+        assert_eq!(sent.len(), 1, "one outage, one alert: {sent:?}");
+        assert_eq!(sent[0]["event"]["kind"], "camera_offline");
+        assert_eq!(sent[0]["event"]["severity"], "critical");
+        assert!(
+            sent[0]["event"]["title"]
+                .as_str()
+                .is_some_and(|title| title.contains("stopped answering")),
+            "the title is written for a human: {:?}",
+            sent[0]["event"]["title"]
+        );
+
+        // Still down on the next pass: the same outage, not a new one.
+        incident_pass(&state).await;
+        delivery_pass(&state, Utc::now()).await;
+        assert_eq!(
+            seen.read().await.len(),
+            1,
+            "an outage that lasts an hour is not sixty alerts"
+        );
+
+        // And back.
+        let now = Utc::now();
+        let batch = typed_batch("gw-1", "cam-1", HealthStatus::Healthy, now, None);
+        state
+            .store
+            .upsert_fleet_identity(&batch, now)
+            .await
+            .unwrap();
+        state
+            .camera_batches
+            .write()
+            .await
+            .insert("gw-1".into(), batch);
+        incident_pass(&state).await;
+        delivery_pass(&state, Utc::now()).await;
+        let sent = seen.read().await.clone();
+        assert_eq!(sent.len(), 2, "coming back is news too: {sent:?}");
+        assert_eq!(sent[1]["event"]["kind"], "camera_recovered");
+        assert_eq!(sent[1]["event"]["severity"], "info");
+    }
+
+    /// A gateway going quiet takes every camera behind it with it, and it is
+    /// the one outage a site cannot report itself.
+    #[tokio::test]
+    async fn a_gateway_that_stops_reporting_is_announced_once() {
+        let (endpoint, seen) = fake_sink("sink-1", true).await;
+        let mut state = state_with_sinks(&[("sink", &endpoint)]).await;
+        state.incident_grace = Duration::from_secs(0);
+
+        let fresh = Utc::now();
+        let batch = typed_batch("gw-1", "cam-1", HealthStatus::Healthy, fresh, None);
+        state
+            .store
+            .upsert_fleet_identity(&batch, fresh)
+            .await
+            .unwrap();
+        state.gateways.write().await.insert(
+            "gw-1".into(),
+            GatewayHeartbeat {
+                gateway_id: "gw-1".into(),
+                site_id: "site-1".into(),
+                hostname: "edge-1".into(),
+                version: "0.1.0".into(),
+                uptime_seconds: 10,
+                cpu_percent: 1.0,
+                memory_percent: 1.0,
+                cameras_seen: 1,
+                healthy_cameras: 1,
+                warning_cameras: 0,
+                offline_cameras: 0,
+                sent_at: fresh,
+            },
+        );
+
+        let mut reporting = HashMap::new();
+        gateway_pass(&state, &mut reporting).await;
+        delivery_pass(&state, Utc::now()).await;
+        assert!(
+            seen.read().await.is_empty(),
+            "the first sight of a gateway is not news"
+        );
+
+        // It stops reporting: the heartbeat ages out.
+        let stale = Utc::now() - chrono::Duration::seconds(3_600);
+        state
+            .gateways
+            .write()
+            .await
+            .get_mut("gw-1")
+            .unwrap()
+            .sent_at = stale;
+        state
+            .store
+            .upsert_fleet_identity(
+                &typed_batch("gw-1", "cam-1", HealthStatus::Healthy, stale, None),
+                stale,
+            )
+            .await
+            .unwrap();
+
+        gateway_pass(&state, &mut reporting).await;
+        delivery_pass(&state, Utc::now()).await;
+        let sent = seen.read().await.clone();
+        assert_eq!(sent.len(), 1, "one silence, one alert: {sent:?}");
+        assert_eq!(sent[0]["event"]["kind"], "gateway_offline");
+        assert_eq!(sent[0]["event"]["severity"], "critical");
+        assert!(
+            sent[0]["event"]["title"]
+                .as_str()
+                .is_some_and(|title| title.contains("edge-1")),
+            "the alert names the box: {:?}",
+            sent[0]["event"]["title"]
+        );
+
+        gateway_pass(&state, &mut reporting).await;
+        delivery_pass(&state, Utc::now()).await;
+        assert_eq!(
+            seen.read().await.len(),
+            1,
+            "a gateway that is still gone is still the same outage"
+        );
+
+        // And it comes back.
+        let now = Utc::now();
+        state
+            .gateways
+            .write()
+            .await
+            .get_mut("gw-1")
+            .unwrap()
+            .sent_at = now;
+        gateway_pass(&state, &mut reporting).await;
+        delivery_pass(&state, Utc::now()).await;
+        let sent = seen.read().await.clone();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[1]["event"]["kind"], "gateway_recovered");
+    }
+
+    #[tokio::test]
+    async fn a_revoked_gateway_going_quiet_is_a_decision_not_an_outage() {
+        let (endpoint, seen) = fake_sink("sink-1", true).await;
+        let mut state = state_with_sinks(&[("sink", &endpoint)]).await;
+        state.incident_grace = Duration::from_secs(0);
+        let fresh = Utc::now();
+        state
+            .store
+            .upsert_fleet_identity(
+                &typed_batch("gw-1", "cam-1", HealthStatus::Healthy, fresh, None),
+                fresh,
+            )
+            .await
+            .unwrap();
+        let mut reporting = HashMap::new();
+        gateway_pass(&state, &mut reporting).await;
+
+        state
+            .store
+            .revoke_gateway("gw-1", Utc::now())
+            .await
+            .unwrap();
+        gateway_pass(&state, &mut reporting).await;
+        delivery_pass(&state, Utc::now()).await;
+        assert!(seen.read().await.is_empty(), "nobody needs telling");
     }
 
     #[tokio::test]

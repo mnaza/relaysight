@@ -192,3 +192,90 @@ pub struct StorageDeleteRequest {
 pub struct StorageDeleteResponse {
     pub deleted: bool,
 }
+
+/// What happened, in a shape a sink can turn into a message without knowing
+/// anything about this system.
+///
+/// `EventSink` has been a capability in the protocol since it was written and
+/// had nothing behind it. This is what it means: the control plane hands over
+/// facts, and the plugin decides who hears about them and how.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FleetEventKind {
+    CameraOffline,
+    CameraRecovered,
+    GatewayOffline,
+    GatewayRecovered,
+    /// Sent by hand from the dashboard, to prove a sink is wired up.
+    Test,
+}
+
+impl FleetEventKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FleetEventKind::CameraOffline => "camera_offline",
+            FleetEventKind::CameraRecovered => "camera_recovered",
+            FleetEventKind::GatewayOffline => "gateway_offline",
+            FleetEventKind::GatewayRecovered => "gateway_recovered",
+            FleetEventKind::Test => "test",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EventSeverity {
+    Info,
+    Warning,
+    Critical,
+}
+
+impl EventSeverity {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            EventSeverity::Info => "info",
+            EventSeverity::Warning => "warning",
+            EventSeverity::Critical => "critical",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FleetEvent {
+    /// Stable across every retry and every sink, so a plugin that has already
+    /// posted this message can say so rather than posting it twice.
+    pub id: String,
+    pub kind: FleetEventKind,
+    pub severity: EventSeverity,
+    pub occurred_at: DateTime<Utc>,
+    pub customer_id: String,
+    pub site_id: String,
+    pub site_name: String,
+    #[serde(default)]
+    pub gateway_id: Option<String>,
+    #[serde(default)]
+    pub camera_id: Option<String>,
+    /// One line, already written for a human. A sink should be able to post
+    /// this and nothing else and still be useful.
+    pub title: String,
+    #[serde(default)]
+    pub detail: Option<String>,
+    #[serde(default)]
+    pub metadata: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventDeliveryRequest {
+    #[serde(default)]
+    pub context: PluginInvocationContext,
+    pub event: FleetEvent,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventDeliveryResponse {
+    /// False is not an error: a sink may decide an event is not for it, and
+    /// saying so beats a delivery that quietly went nowhere.
+    pub delivered: bool,
+    #[serde(default)]
+    pub detail: Option<String>,
+}

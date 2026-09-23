@@ -1,0 +1,17 @@
+{
+  "endpoint": "http://webhook-sink:9003",
+  "enabled": true,
+  "token_env": "WEBHOOK_PLUGIN_TOKEN",
+  "manifest": {
+    "id": "webhook-sink",
+    "name": "Webhook Event Sink",
+    "version": "0.1.0",
+    "protocol_version": 1,
+    "vendor": "example",
+    "description": "Post fleet events to Slack, Discord or your own endpoint.",
+    "capabilities": [
+      "event_sink"
+    ]
+  },
+  "placement": "control_plane"
+}
