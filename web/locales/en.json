@@ -266,5 +266,8 @@
   "app.audit.subject": "On what",
   "app.audit.export": "Export CSV",
   "app.audit.intact": "{checked} rows verified, {unchained} written before the chain existed",
-  "app.audit.broken": "The log has been edited: the chain breaks at {row}"
+  "app.audit.broken": "The log has been edited: the chain breaks at {row}",
+  "app.tunnel.open": "Device page",
+  "app.tunnel.refused": "That device page could not be opened",
+  "app.tunnel.noAddress": "This camera has not reported an address to reach"
 }

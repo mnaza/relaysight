@@ -15,7 +15,8 @@ const demoFleet = JSON.parse(read('demo-fleet.json'));
 const cameras = [
   { camera_id: 'cam-1', gateway_id: 'gw-live', site_id: 'site-1', name: 'Yard', status: 'healthy',
     fps: 25, bitrate_kbps: 2000, packet_loss: 0, reconnects: 0, codec: 'H264', width: 1920,
-    height: 1080, last_seen: new Date().toISOString(), last_error: null },
+    height: 1080, last_seen: new Date().toISOString(), last_error: null,
+    rtsp_endpoint: 'rtsp://10.0.0.7:554/stream' },
 ];
 const roster = [
   { gateway_id: 'gw-live', site_id: 'site-1', site_name: 'Site', customer_name: 'Customer',
@@ -143,4 +144,23 @@ test('a camera recorded around the clock keeps no schedule rule', async () => {
 
   const saved = posted.find(entry => entry.path.includes('recording-policy'));
   assert.deepEqual(saved.body.keep, [], 'no window means the ring is kept for clipping only');
+});
+
+test('a camera offers a way to its own web page', async () => {
+  await startDashboard({ brand, locale: 'en', dict });
+  document.querySelector('#fleet-body [data-live]').dispatchEvent(new Event('click', { bubbles: true }));
+  await new Promise(resolve => setTimeout(resolve, 10));
+
+  const button = document.querySelector('[data-open-device]');
+  assert.ok(button, 'a camera card offers the device page');
+  globalThis.window.open = (url) => { globalThis.window.__opened = url; return null; };
+  button.dispatchEvent(new Event('click', { bubbles: true }));
+  await new Promise(resolve => setTimeout(resolve, 10));
+
+  const opened = posted.find(entry => entry.path.includes('/tunnel'));
+  assert.ok(opened, `expected a tunnel request, got ${JSON.stringify(posted)}`);
+  assert.match(opened.path, /gateways\/gw-live\/tunnel/);
+  assert.equal(typeof opened.body.host, 'string');
+  assert.ok(opened.body.host.length > 0, 'the host comes from what the camera reported');
+  assert.equal(opened.body.port, 80);
 });

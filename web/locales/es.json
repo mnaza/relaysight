@@ -266,5 +266,8 @@
   "app.audit.subject": "Sobre qué",
   "app.audit.export": "Exportar CSV",
   "app.audit.intact": "{checked} filas verificadas, {unchained} anteriores a la cadena",
-  "app.audit.broken": "El registro fue editado: la cadena se rompe en {row}"
+  "app.audit.broken": "El registro fue editado: la cadena se rompe en {row}",
+  "app.tunnel.open": "Página del equipo",
+  "app.tunnel.refused": "No se pudo abrir la página del equipo",
+  "app.tunnel.noAddress": "Esta cámara no ha reportado una dirección"
 }

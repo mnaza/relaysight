@@ -484,6 +484,61 @@ pub struct UpdateUserRequest {
     pub customer_id: Option<Option<String>>,
 }
 
+/// A bounded way to reach one device's own web page through the gateway.
+///
+/// Not a VPN and not a video path: one host, one port, a few minutes, a
+/// capped response, and only a host the gateway already reported.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TunnelRequest {
+    pub host: String,
+    pub port: u16,
+    #[serde(default = "default_tunnel_minutes")]
+    pub minutes: u16,
+}
+
+fn default_tunnel_minutes() -> u16 {
+    10
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TunnelSession {
+    pub id: String,
+    pub gateway_id: String,
+    pub host: String,
+    pub port: u16,
+    pub opened_by: String,
+    pub opened_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    /// How many requests have gone through, so closing one can say what it
+    /// was used for rather than only that it existed.
+    pub requests: u32,
+}
+
+/// One request waiting for the gateway to perform it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TunnelCall {
+    pub id: String,
+    pub session_id: String,
+    pub host: String,
+    pub port: u16,
+    pub method: String,
+    /// Path and query, as the browser asked for it.
+    pub path: String,
+}
+
+/// What the device answered, as the gateway saw it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TunnelAnswer {
+    pub id: String,
+    pub status: u16,
+    pub content_type: Option<String>,
+    /// Base64: a device page is HTML, an image, or a font, and none of those
+    /// survive being treated as text.
+    pub body_base64: String,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClipRequest {
     /// How far back to reach. The ring decides whether it still has it.

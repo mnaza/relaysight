@@ -31,6 +31,7 @@ mod segmenter;
 mod snapshot;
 #[cfg(feature = "srt")]
 mod srt;
+mod tunnel;
 mod turn_bridge;
 mod update;
 
@@ -359,6 +360,11 @@ async fn main() -> anyhow::Result<()> {
             }
         });
         info!(%address, "listening for pushed SRT streams");
+    }
+
+    // Reaching a device's own web page, if this site allows it at all.
+    if tunnel::enabled() {
+        tokio::spawn(tunnel::serve(config.clone(), client.clone()));
     }
 
     let probe_task = tokio::spawn(probe_loop(

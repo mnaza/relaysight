@@ -78,6 +78,14 @@ struct AppState {
     /// restart every camera looks silent until its gateway re-reports.
     incident_grace: Duration,
     incident_retention_days: i64,
+    /// Open tunnel sessions, keyed by session id. In memory on purpose: a
+    /// restart should close every way into a site network rather than
+    /// carrying them across.
+    tunnels: Arc<RwLock<HashMap<String, vms_domain::TunnelSession>>>,
+    /// Requests waiting for a gateway to perform them, per gateway.
+    tunnel_calls: Arc<RwLock<HashMap<String, VecDeque<vms_domain::TunnelCall>>>>,
+    /// Answers the gateway has posted back, keyed by request id.
+    tunnel_answers: Arc<RwLock<HashMap<String, vms_domain::TunnelAnswer>>>,
     /// How long the hourly rollups are kept. Thirty days is two screens of
     /// history and a few hundred rows per camera.
     health_retention_days: i64,
@@ -174,6 +182,9 @@ async fn main() -> anyhow::Result<()> {
         login_throttle: Arc::new(tokio::sync::Mutex::new(auth::LoginThrottle::default())),
         cookie_secure: env::var("AUTH_COOKIE_SECURE").is_ok_and(|value| value == "true"),
         incident_grace: Duration::from_secs(stale_camera_seconds.max(0) as u64),
+        tunnels: Arc::new(RwLock::new(HashMap::new())),
+        tunnel_calls: Arc::new(RwLock::new(HashMap::new())),
+        tunnel_answers: Arc::new(RwLock::new(HashMap::new())),
         health_retention_days: env::var("HEALTH_RETENTION_DAYS")
             .ok()
             .and_then(|raw| raw.parse().ok())
@@ -238,6 +249,14 @@ fn build_router(state: AppState) -> Router {
         .route(
             "/api/v1/gateways/{gateway_id}/recordings",
             post(gateway_recording),
+        )
+        .route(
+            "/api/v1/gateways/{gateway_id}/tunnel/next",
+            get(next_tunnel_call),
+        )
+        .route(
+            "/api/v1/gateways/{gateway_id}/tunnel/answer",
+            post(answer_tunnel_call),
         )
         .route(
             "/api/v1/gateways/{gateway_id}/sources",
@@ -329,6 +348,9 @@ fn build_router(state: AppState) -> Router {
             post(set_camera_recording_policy),
         )
         .route("/api/v1/events/test", post(test_event))
+        .route("/api/v1/gateways/{gateway_id}/tunnel", post(open_tunnel))
+        .route("/api/v1/tunnels/{session_id}/close", post(close_tunnel))
+        .route("/api/v1/tunnels/{session_id}/{*path}", get(through_tunnel))
         .route(
             "/api/v1/plugins/{plugin_id}/storage/downloads",
             post(plugin_storage_download),
@@ -1765,6 +1787,240 @@ fn csv_field(value: &str) -> String {
     }
 }
 
+/// The device addresses this gateway has actually told us about.
+///
+/// A tunnel reaches those and nothing else. Anything looser is a proxy into
+/// somebody's network wearing a camera's name, and the distance between the
+/// two is one typo in a host field.
+async fn tunnel_hosts(state: &AppState, gateway_id: &str) -> std::collections::HashSet<String> {
+    let mut hosts = std::collections::HashSet::new();
+    let host_of = |value: &str| -> Option<String> {
+        let value = value.trim();
+        let after_scheme = value.split("://").nth(1).unwrap_or(value);
+        let authority = after_scheme.split(['/', '?']).next()?;
+        let authority = authority.rsplit('@').next()?;
+        let host = authority
+            .rsplit_once(':')
+            .map_or(authority, |(host, _)| host)
+            .trim_matches(['[', ']']);
+        (!host.is_empty()).then(|| host.to_owned())
+    };
+    if let Some(batch) = state.camera_batches.read().await.get(gateway_id) {
+        for camera in &batch.cameras {
+            if let Some(endpoint) = &camera.rtsp_endpoint
+                && let Some(host) = host_of(endpoint)
+            {
+                hosts.insert(host);
+            }
+        }
+    }
+    if let Ok(sources) = state.store.gateway_video_sources(gateway_id).await {
+        for source in sources {
+            if let Some(host) = host_of(&source.address) {
+                hosts.insert(host);
+            }
+        }
+    }
+    hosts
+}
+
+/// Open a way to one device's own web page, for a few minutes.
+async fn open_tunnel(
+    State(state): State<AppState>,
+    Path(gateway_id): Path<String>,
+    Extension(who): Extension<crate::store::SessionUser>,
+    Json(request): Json<vms_domain::TunnelRequest>,
+) -> Result<Json<vms_domain::TunnelSession>, (StatusCode, String)> {
+    // A scoped login is a viewer and cannot reach this route at all; this is
+    // the belt to that braces.
+    if who.customer_id.is_some() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "a scoped login may not open a tunnel".into(),
+        ));
+    }
+    let host = request.host.trim().to_owned();
+    if !tunnel_hosts(&state, &gateway_id).await.contains(&host) {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "that gateway has never reported a device at that address".into(),
+        ));
+    }
+    if request.port == 0 {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "port 0 reaches nothing".into(),
+        ));
+    }
+    let now = Utc::now();
+    // An hour is already generous for looking at a device's settings page.
+    let minutes = i64::from(request.minutes.clamp(1, 60));
+    let session = vms_domain::TunnelSession {
+        id: Uuid::new_v4().to_string(),
+        gateway_id: gateway_id.clone(),
+        host: host.clone(),
+        port: request.port,
+        opened_by: who.email.clone(),
+        opened_at: now,
+        expires_at: now + chrono::Duration::minutes(minutes),
+        requests: 0,
+    };
+    state
+        .tunnels
+        .write()
+        .await
+        .insert(session.id.clone(), session.clone());
+    audit(
+        &state,
+        &who.email,
+        "tunnel.opened",
+        &format!("{gateway_id} {host}:{}", request.port),
+        Some(&format!("{minutes} minutes")),
+    )
+    .await;
+    Ok(Json(session))
+}
+
+async fn close_tunnel(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    Extension(who): Extension<crate::store::SessionUser>,
+) -> Result<StatusCode, StatusCode> {
+    let session = state.tunnels.write().await.remove(&session_id);
+    let Some(session) = session else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    audit(
+        &state,
+        &who.email,
+        "tunnel.closed",
+        &format!("{} {}:{}", session.gateway_id, session.host, session.port),
+        Some(&format!("{} requests", session.requests)),
+    )
+    .await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// One request through an open tunnel, answered by the gateway.
+async fn through_tunnel(
+    State(state): State<AppState>,
+    Path((session_id, path)): Path<(String, String)>,
+    Extension(who): Extension<crate::store::SessionUser>,
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    use axum::response::IntoResponse as _;
+    let session = {
+        let mut tunnels = state.tunnels.write().await;
+        let Some(session) = tunnels.get_mut(&session_id) else {
+            return Err((StatusCode::NOT_FOUND, String::new()));
+        };
+        if session.expires_at < Utc::now() {
+            tunnels.remove(&session_id);
+            return Err((StatusCode::GONE, "that tunnel has expired".into()));
+        }
+        session.requests += 1;
+        session.clone()
+    };
+    if who.customer_id.is_some() {
+        return Err((StatusCode::FORBIDDEN, String::new()));
+    }
+
+    let call = vms_domain::TunnelCall {
+        id: Uuid::new_v4().to_string(),
+        session_id: session.id.clone(),
+        host: session.host.clone(),
+        port: session.port,
+        method: "GET".into(),
+        path: if path.starts_with('/') {
+            path
+        } else {
+            format!("/{path}")
+        },
+    };
+    state
+        .tunnel_calls
+        .write()
+        .await
+        .entry(session.gateway_id.clone())
+        .or_default()
+        .push_back(call.clone());
+
+    // The gateway is holding a long poll; waiting here is waiting for one
+    // round trip on a LAN, not for a poll interval.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while tokio::time::Instant::now() < deadline {
+        if let Some(answer) = state.tunnel_answers.write().await.remove(&call.id) {
+            if let Some(error) = answer.error {
+                return Err((StatusCode::BAD_GATEWAY, error));
+            }
+            let body = base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                answer.body_base64.as_bytes(),
+            )
+            .map_err(|_| (StatusCode::BAD_GATEWAY, "unreadable answer".to_string()))?;
+            let status =
+                StatusCode::from_u16(answer.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            let content_type = answer
+                .content_type
+                .unwrap_or_else(|| "application/octet-stream".into());
+            return Ok((
+                status,
+                [(axum::http::header::CONTENT_TYPE, content_type)],
+                body,
+            )
+                .into_response());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Err((
+        StatusCode::GATEWAY_TIMEOUT,
+        "the gateway did not answer; it may not have tunnelling enabled".into(),
+    ))
+}
+
+/// The gateway's side: hold here until there is something to fetch.
+async fn next_tunnel_call(
+    State(state): State<AppState>,
+    Path(gateway_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<Option<vms_domain::TunnelCall>>, StatusCode> {
+    if !authorized_gateway(&headers, &state, &gateway_id).await {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while tokio::time::Instant::now() < deadline {
+        if let Some(call) = state
+            .tunnel_calls
+            .write()
+            .await
+            .get_mut(&gateway_id)
+            .and_then(|queue| queue.pop_front())
+        {
+            return Ok(Json(Some(call)));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // Nothing to do. The gateway asks again; an idle tunnel costs one held
+    // request and no polling.
+    Ok(Json(None))
+}
+
+async fn answer_tunnel_call(
+    State(state): State<AppState>,
+    Path(gateway_id): Path<String>,
+    headers: HeaderMap,
+    Json(answer): Json<vms_domain::TunnelAnswer>,
+) -> StatusCode {
+    if !authorized_gateway(&headers, &state, &gateway_id).await {
+        return StatusCode::UNAUTHORIZED;
+    }
+    state
+        .tunnel_answers
+        .write()
+        .await
+        .insert(answer.id.clone(), answer);
+    StatusCode::NO_CONTENT
+}
+
 /// Everybody who can get in, and what they may do.
 async fn list_users(State(state): State<AppState>) -> Result<Json<Vec<UserView>>, StatusCode> {
     state.store.users().await.map(Json).map_err(store_status)
@@ -2877,6 +3133,9 @@ mod tests {
             )),
             cookie_secure: false,
             incident_grace: Duration::ZERO,
+            tunnels: Arc::new(RwLock::new(HashMap::new())),
+            tunnel_calls: Arc::new(RwLock::new(HashMap::new())),
+            tunnel_answers: Arc::new(RwLock::new(HashMap::new())),
             health_retention_days: 30,
             incident_retention_days: 90,
             audit_retention_days: 0,
@@ -3732,6 +3991,210 @@ mod tests {
             let (status, _) = send(&state, with_cookie(get(uri), &technician)).await;
             assert_eq!(status, StatusCode::FORBIDDEN, "{uri}");
         }
+    }
+
+    /// A tunnel reaches devices this gateway has reported and nothing else.
+    /// Anything looser is a proxy into somebody's network wearing a camera's
+    /// name.
+    #[tokio::test]
+    async fn a_tunnel_only_opens_onto_a_device_the_gateway_reported() {
+        let state = test_state().await;
+        seed_admin(&state).await;
+        let technician = user_cookie(&state, "technician").await;
+
+        let mut batch = typed_batch("gw-1", "cam-1", HealthStatus::Healthy, Utc::now(), None);
+        batch.cameras[0].rtsp_endpoint = Some("rtsp://10.0.0.7:554/stream".into());
+        state
+            .camera_batches
+            .write()
+            .await
+            .insert("gw-1".into(), batch);
+
+        let (status, session) = send(
+            &state,
+            with_cookie(
+                post(
+                    "/api/v1/gateways/gw-1/tunnel",
+                    None,
+                    serde_json::json!({ "host": "10.0.0.7", "port": 80, "minutes": 5 }),
+                ),
+                &technician,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{session}");
+        assert_eq!(session["host"], "10.0.0.7");
+        assert_eq!(session["opened_by"], "technician@example.test");
+
+        // Any other address on that network is not this system's to reach.
+        for host in ["10.0.0.8", "127.0.0.1", "169.254.169.254"] {
+            let (status, _) = send(
+                &state,
+                with_cookie(
+                    post(
+                        "/api/v1/gateways/gw-1/tunnel",
+                        None,
+                        serde_json::json!({ "host": host, "port": 80 }),
+                    ),
+                    &technician,
+                ),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "a tunnel opened onto {host}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_request_goes_to_the_gateway_and_the_answer_comes_back() {
+        let state = test_state().await;
+        seed_admin(&state).await;
+        let technician = user_cookie(&state, "technician").await;
+        let mut batch = typed_batch("gw-1", "cam-1", HealthStatus::Healthy, Utc::now(), None);
+        batch.cameras[0].rtsp_endpoint = Some("rtsp://10.0.0.7:554/stream".into());
+        state
+            .camera_batches
+            .write()
+            .await
+            .insert("gw-1".into(), batch);
+        let (_, session) = send(
+            &state,
+            with_cookie(
+                post(
+                    "/api/v1/gateways/gw-1/tunnel",
+                    None,
+                    serde_json::json!({ "host": "10.0.0.7", "port": 80 }),
+                ),
+                &technician,
+            ),
+        )
+        .await;
+        let session_id = session["id"].as_str().unwrap().to_owned();
+
+        // A gateway holding its long poll, answering whatever arrives.
+        let gateway = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                let (_, call) = send(
+                    &state,
+                    Request::builder()
+                        .uri("/api/v1/gateways/gw-1/tunnel/next")
+                        .header("authorization", format!("Bearer {SHARED_TOKEN}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await;
+                let id = call["id"].as_str().expect("a call").to_owned();
+                assert_eq!(call["host"], "10.0.0.7");
+                assert_eq!(call["path"], "/doc/index.html");
+                let (status, _) = send(
+                    &state,
+                    post(
+                        "/api/v1/gateways/gw-1/tunnel/answer",
+                        Some(SHARED_TOKEN),
+                        serde_json::json!({
+                            "id": id, "status": 200,
+                            "content_type": "text/html",
+                            "body_base64": "PGgxPk5WUjwvaDE+",
+                            "error": null,
+                        }),
+                    ),
+                )
+                .await;
+                assert_eq!(status, StatusCode::NO_CONTENT);
+            })
+        };
+
+        let response = build_router(state.clone())
+            .oneshot(with_cookie(
+                get(&format!("/api/v1/tunnels/{session_id}/doc/index.html")),
+                &technician,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[axum::http::header::CONTENT_TYPE],
+            "text/html"
+        );
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8(body.to_vec()).unwrap(), "<h1>NVR</h1>");
+        gateway.await.unwrap();
+
+        // Closing says what it was used for, not only that it existed.
+        let (status, _) = send(
+            &state,
+            with_cookie(
+                post(
+                    &format!("/api/v1/tunnels/{session_id}/close"),
+                    None,
+                    serde_json::json!({}),
+                ),
+                &technician,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let entries = state.store.audit_entries(20).await.unwrap();
+        assert!(
+            entries.iter().any(|entry| entry.action == "tunnel.closed"
+                && entry.detail.as_deref() == Some("1 requests")),
+            "{entries:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_expired_tunnel_is_gone_rather_than_slow() {
+        let state = test_state().await;
+        seed_admin(&state).await;
+        let technician = user_cookie(&state, "technician").await;
+        let expired = vms_domain::TunnelSession {
+            id: "stale".into(),
+            gateway_id: "gw-1".into(),
+            host: "10.0.0.7".into(),
+            port: 80,
+            opened_by: "technician@example.test".into(),
+            opened_at: Utc::now() - chrono::Duration::hours(2),
+            expires_at: Utc::now() - chrono::Duration::hours(1),
+            requests: 0,
+        };
+        state.tunnels.write().await.insert("stale".into(), expired);
+
+        let (status, _) = send(
+            &state,
+            with_cookie(get("/api/v1/tunnels/stale/index.html"), &technician),
+        )
+        .await;
+        assert_eq!(status, StatusCode::GONE);
+        assert!(
+            state.tunnels.read().await.is_empty(),
+            "an expired tunnel is forgotten, not kept around"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_viewer_may_not_reach_into_a_site() {
+        let state = test_state().await;
+        seed_admin(&state).await;
+        let viewer = user_cookie(&state, "viewer").await;
+        let (status, _) = send(
+            &state,
+            with_cookie(
+                post(
+                    "/api/v1/gateways/gw-1/tunnel",
+                    None,
+                    serde_json::json!({ "host": "10.0.0.7", "port": 80 }),
+                ),
+                &viewer,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
@@ -5425,6 +5888,9 @@ mod tests {
         ("GET", "/api/v1/cameras/cam-1/health"),
         ("GET", "/api/v1/events"),
         ("POST", "/api/v1/events/test"),
+        ("POST", "/api/v1/gateways/gw-1/tunnel"),
+        ("POST", "/api/v1/tunnels/s-1/close"),
+        ("GET", "/api/v1/tunnels/s-1/index.html"),
         ("POST", "/api/v1/cameras/cam-1/clips"),
         ("GET", "/api/v1/cameras/cam-1/recording-policy"),
         ("POST", "/api/v1/cameras/cam-1/recording-policy"),

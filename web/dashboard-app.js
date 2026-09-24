@@ -662,7 +662,7 @@ export async function startDashboard({ brand, locale, dict }) {
         <div class="telemetry-metric"><span>${escapeHtml(t(dict,'app.telemetry.reconnects'))}</span><strong>${fmt(camera.reconnects)}</strong></div>
       </div>
       ${camera.last_error ? `<div class="telemetry-error">${escapeHtml(t(dict,'app.telemetry.error'))}: ${escapeHtml(camera.last_error)}</div>` : ''}
-      <div class="camera-actions"><button class="button small primary" data-live-camera>${escapeHtml(t(dict,'app.live.start'))}</button><button class="button small" data-analyze>${escapeHtml(t(dict,'app.ai.analyze'))}</button><button class="button small" data-record>${escapeHtml(t(dict,'app.archive.record10'))}</button><button class="button small" data-save-clip>${escapeHtml(t(dict,'app.archive.saveLast'))}</button></div>
+      <div class="camera-actions"><button class="button small primary" data-live-camera>${escapeHtml(t(dict,'app.live.start'))}</button><button class="button small" data-analyze>${escapeHtml(t(dict,'app.ai.analyze'))}</button><button class="button small" data-record>${escapeHtml(t(dict,'app.archive.record10'))}</button><button class="button small" data-save-clip>${escapeHtml(t(dict,'app.archive.saveLast'))}</button><button class="button small" data-open-device>${escapeHtml(t(dict,'app.tunnel.open'))}</button></div>
       <form class="policy-form" data-policy-form>
         <label class="field"><span>${escapeHtml(t(dict,'app.policy.mode'))}</span><select name="mode">
           <option value="off">${escapeHtml(t(dict,'app.policy.off'))}</option>
@@ -683,6 +683,7 @@ export async function startDashboard({ brand, locale, dict }) {
       const analyzeButton = item.querySelector('[data-analyze]');
       const recordButton = item.querySelector('[data-record]');
       const clipButton = item.querySelector('[data-save-clip]');
+      const deviceButton = item.querySelector('[data-open-device]');
       const recordStatus = item.querySelector('[data-record-status]');
       const aiResult = item.querySelector('[data-ai-result]');
       const timeline = item.querySelector('[data-timeline]');
@@ -735,6 +736,35 @@ export async function startDashboard({ brand, locale, dict }) {
           } finally { recordButton.disabled = false; }
         });
       }
+      // The device's own web page, through the gateway. The host comes from
+      // what the camera reported: the control plane refuses anything else,
+      // and offering a box to type an address into would only invite it.
+      const deviceHost = (() => {
+        const endpoint = camera.rtsp_endpoint || '';
+        const authority = endpoint.split('://')[1]?.split(/[/?]/)[0] || '';
+        const hostOnly = authority.split('@').pop() || '';
+        return hostOnly.replace(/:\d+$/, '');
+      })();
+      if (!deviceHost) {
+        deviceButton.disabled = true;
+        deviceButton.title = t(dict, 'app.tunnel.noAddress');
+      } else {
+        deviceButton.addEventListener('click', async () => {
+          deviceButton.disabled = true;
+          const response = await fetch(
+            `api/v1/gateways/${encodeURIComponent(camera.gateway_id)}/tunnel`,
+            { method: 'POST', headers: {'Content-Type': 'application/json'},
+              body: JSON.stringify({ host: deviceHost, port: 80, minutes: 10 }) },
+          ).catch(() => null);
+          deviceButton.disabled = false;
+          if (!response || !response.ok) { alert(t(dict, 'app.tunnel.refused')); return; }
+          const session = await response.json();
+          // A new tab, because a device's own page is somebody else's HTML
+          // and does not belong inside this one.
+          window.open(`api/v1/tunnels/${encodeURIComponent(session.id)}/`, '_blank', 'noopener');
+        });
+      }
+
       // How this camera's week went, out of the same rollups the overview
       // uses. A camera nobody heard from says so rather than showing 100%.
       const healthNode = item.querySelector('[data-camera-health]');

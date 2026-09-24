@@ -266,5 +266,8 @@
   "app.audit.subject": "Над чем",
   "app.audit.export": "Выгрузить CSV",
   "app.audit.intact": "проверено строк: {checked}, до появления цепочки: {unchained}",
-  "app.audit.broken": "Журнал правили: цепочка рвётся на {row}"
+  "app.audit.broken": "Журнал правили: цепочка рвётся на {row}",
+  "app.tunnel.open": "Страница устройства",
+  "app.tunnel.refused": "Страницу устройства открыть не удалось",
+  "app.tunnel.noAddress": "Камера не сообщила адрес, по которому её можно открыть"
 }
