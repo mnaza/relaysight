@@ -1,8 +1,8 @@
 //! SQLite implementation of the fleet store.
 
 use crate::store::{
-    CameraRecord, DeliveryView, DueDelivery, EventView, HealthHour, OrganizationRecord, SiteRecord,
-    Store, StoreError, parse_ts, token_hash, ts,
+    CameraRecord, DeliveryView, DueDelivery, EventView, HealthHour, OrganizationRecord,
+    SessionUser, SiteRecord, Store, StoreError, StoredUser, parse_ts, token_hash, ts,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -13,7 +13,7 @@ use vms_plugin_sdk::{EventSeverity, FleetEvent, FleetEventKind};
 
 use vms_domain::{
     AuditView, CameraTelemetryBatch, EnrollmentRequest, GatewayEnrollmentRequest, GatewayView,
-    IncidentView, RecordingManifest, RecordingPolicy, VideoSource,
+    IncidentView, RecordingManifest, RecordingPolicy, Role, UserView, VideoSource,
 };
 
 fn manifest_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<RecordingManifest, StoreError> {
@@ -440,30 +440,178 @@ impl Store for SqliteStore {
     async fn create_session(
         &self,
         session_id: &str,
+        user_id: &str,
         now: DateTime<Utc>,
         expires_at: DateTime<Utc>,
     ) -> Result<(), StoreError> {
-        sqlx::query("INSERT INTO sessions (id_hash, created_at, expires_at) VALUES (?1, ?2, ?3)")
-            .bind(token_hash(session_id))
-            .bind(ts(&now))
-            .bind(ts(&expires_at))
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            "INSERT INTO sessions (id_hash, created_at, expires_at, user_id)
+             VALUES (?1, ?2, ?3, ?4)",
+        )
+        .bind(token_hash(session_id))
+        .bind(ts(&now))
+        .bind(ts(&expires_at))
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
-    async fn session_is_valid(
+    async fn session_user(
         &self,
         session_id: &str,
         now: DateTime<Utc>,
-    ) -> Result<bool, StoreError> {
-        let row: Option<i64> =
-            sqlx::query_scalar("SELECT 1 FROM sessions WHERE id_hash = ?1 AND expires_at > ?2")
-                .bind(token_hash(session_id))
-                .bind(ts(&now))
-                .fetch_optional(&self.pool)
+    ) -> Result<Option<SessionUser>, StoreError> {
+        let row = sqlx::query(
+            "SELECT u.id AS id, u.email AS email, u.role AS role, u.customer_id AS customer_id
+             FROM sessions s JOIN users u ON u.id = s.user_id
+             WHERE s.id_hash = ?1 AND s.expires_at > ?2 AND u.disabled_at IS NULL",
+        )
+        .bind(token_hash(session_id))
+        .bind(ts(&now))
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else { return Ok(None) };
+        let role: String = row.try_get("role")?;
+        Ok(Some(SessionUser {
+            id: row.try_get("id")?,
+            email: row.try_get("email")?,
+            // An unknown role reads as the least of them: a newer control
+            // plane's "superuser" must not become one here.
+            role: Role::parse(&role).unwrap_or(Role::Viewer),
+            customer_id: row.try_get("customer_id")?,
+        }))
+    }
+
+    async fn create_user(
+        &self,
+        id: &str,
+        email: &str,
+        password_hash: &str,
+        role: Role,
+        customer_id: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        let inserted = sqlx::query(
+            "INSERT INTO users (id, email, password_hash, role, customer_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(email) DO NOTHING",
+        )
+        .bind(id)
+        .bind(email)
+        .bind(password_hash)
+        .bind(role.as_str())
+        .bind(customer_id)
+        .bind(ts(&now))
+        .execute(&self.pool)
+        .await?;
+        if inserted.rows_affected() == 0 {
+            return Err(StoreError::AlreadyExists);
+        }
+        Ok(())
+    }
+
+    async fn user_by_email(&self, email: &str) -> Result<Option<StoredUser>, StoreError> {
+        let row = sqlx::query("SELECT * FROM users WHERE email = ?1")
+            .bind(email)
+            .fetch_optional(&self.pool)
+            .await?;
+        let Some(row) = row else { return Ok(None) };
+        let role: String = row.try_get("role")?;
+        Ok(Some(StoredUser {
+            id: row.try_get("id")?,
+            email: row.try_get("email")?,
+            password_hash: row.try_get("password_hash")?,
+            role: Role::parse(&role).unwrap_or(Role::Viewer),
+            disabled: row.try_get::<Option<String>, _>("disabled_at")?.is_some(),
+        }))
+    }
+
+    async fn users(&self) -> Result<Vec<UserView>, StoreError> {
+        let rows = sqlx::query("SELECT * FROM users ORDER BY email")
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter()
+            .map(|row| {
+                let role: String = row.try_get("role")?;
+                Ok(UserView {
+                    id: row.try_get("id")?,
+                    email: row.try_get("email")?,
+                    role: Role::parse(&role).unwrap_or(Role::Viewer),
+                    customer_id: row.try_get("customer_id")?,
+                    created_at: parse_ts(row.try_get("created_at")?)?,
+                    disabled_at: row
+                        .try_get::<Option<String>, _>("disabled_at")?
+                        .as_deref()
+                        .map(parse_ts)
+                        .transpose()?,
+                })
+            })
+            .collect()
+    }
+
+    async fn update_user(
+        &self,
+        id: &str,
+        role: Option<Role>,
+        password_hash: Option<&str>,
+        disabled: Option<bool>,
+        customer_id: Option<Option<&str>>,
+        now: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        let mut changed = false;
+        if let Some(role) = role {
+            sqlx::query("UPDATE users SET role = ?2 WHERE id = ?1")
+                .bind(id)
+                .bind(role.as_str())
+                .execute(&self.pool)
                 .await?;
-        Ok(row.is_some())
+            changed = true;
+        }
+        if let Some(hash) = password_hash {
+            sqlx::query("UPDATE users SET password_hash = ?2 WHERE id = ?1")
+                .bind(id)
+                .bind(hash)
+                .execute(&self.pool)
+                .await?;
+            changed = true;
+        }
+        if let Some(disabled) = disabled {
+            sqlx::query("UPDATE users SET disabled_at = ?2 WHERE id = ?1")
+                .bind(id)
+                .bind(disabled.then(|| ts(&now)))
+                .execute(&self.pool)
+                .await?;
+            changed = true;
+        }
+        if let Some(customer_id) = customer_id {
+            sqlx::query("UPDATE users SET customer_id = ?2 WHERE id = ?1")
+                .bind(id)
+                .bind(customer_id)
+                .execute(&self.pool)
+                .await?;
+            changed = true;
+        }
+        if !changed {
+            return Ok(());
+        }
+        // Prove the user existed, rather than reporting success for a typo.
+        let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE id = ?1")
+            .bind(id)
+            .fetch_one(&self.pool)
+            .await?;
+        if exists == 0 {
+            return Err(StoreError::NotFound);
+        }
+        Ok(())
+    }
+
+    async fn delete_sessions_of(&self, user_id: &str) -> Result<(), StoreError> {
+        sqlx::query("DELETE FROM sessions WHERE user_id = ?1")
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     async fn delete_session(&self, session_id: &str) -> Result<(), StoreError> {
@@ -2047,22 +2195,46 @@ mod tests {
         assert_eq!(rows, 1, "the second seed must replace, not accumulate");
     }
 
+    /// A user to hang sessions on.
+    async fn a_user(store: &SqliteStore, email: &str) -> String {
+        let id = uuid::Uuid::new_v4().to_string();
+        store
+            .create_user(&id, email, "$argon2id$fake", Role::Owner, None, Utc::now())
+            .await
+            .unwrap();
+        id
+    }
+
     #[tokio::test]
     async fn sessions_validate_until_expiry_and_ids_are_not_stored_in_plaintext() {
         let store = SqliteStore::in_memory().await.unwrap();
         let now = Utc::now();
+        let user = a_user(&store, "owner@example.test").await;
         store
-            .create_session("session-secret", now, now + Duration::days(7))
+            .create_session("session-secret", &user, now, now + Duration::days(7))
             .await
             .unwrap();
-        assert!(store.session_is_valid("session-secret", now).await.unwrap());
+        let who = store
+            .session_user("session-secret", now)
+            .await
+            .unwrap()
+            .expect("a live session knows whose it is");
+        assert_eq!(who.email, "owner@example.test");
+        assert_eq!(who.role, Role::Owner);
         assert!(
-            !store
-                .session_is_valid("session-secret", now + Duration::days(8))
+            store
+                .session_user("session-secret", now + Duration::days(8))
                 .await
                 .unwrap()
+                .is_none()
         );
-        assert!(!store.session_is_valid("never-issued", now).await.unwrap());
+        assert!(
+            store
+                .session_user("never-issued", now)
+                .await
+                .unwrap()
+                .is_none()
+        );
         let stored: String = sqlx::query_scalar("SELECT id_hash FROM sessions")
             .fetch_one(&store.pool)
             .await
@@ -2075,21 +2247,22 @@ mod tests {
     async fn deleting_sessions_one_all_and_expired() {
         let store = SqliteStore::in_memory().await.unwrap();
         let now = Utc::now();
+        let user = a_user(&store, "owner@example.test").await;
         store
-            .create_session("s1", now, now + Duration::days(7))
+            .create_session("s1", &user, now, now + Duration::days(7))
             .await
             .unwrap();
         store
-            .create_session("s2", now, now + Duration::days(7))
+            .create_session("s2", &user, now, now + Duration::days(7))
             .await
             .unwrap();
         store
-            .create_session("s3", now, now - Duration::seconds(1))
+            .create_session("s3", &user, now, now - Duration::seconds(1))
             .await
             .unwrap();
 
         store.delete_session("s1").await.unwrap();
-        assert!(!store.session_is_valid("s1", now).await.unwrap());
+        assert!(store.session_user("s1", now).await.unwrap().is_none());
         // Logging out twice must not error.
         store.delete_session("s1").await.unwrap();
 
@@ -2101,6 +2274,6 @@ mod tests {
         assert_eq!(left, 1, "only the live s2 row should remain");
 
         store.delete_all_sessions().await.unwrap();
-        assert!(!store.session_is_valid("s2", now).await.unwrap());
+        assert!(store.session_user("s2", now).await.unwrap().is_none());
     }
 }

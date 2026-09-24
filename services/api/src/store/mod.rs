@@ -10,9 +10,28 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use sha2::{Digest, Sha256};
 use vms_domain::{
     AuditView, CameraTelemetryBatch, EnrollmentRequest, GatewayEnrollmentRequest, GatewayView,
-    IncidentView, RecordingManifest, RecordingPolicy, VideoSource,
+    IncidentView, RecordingManifest, RecordingPolicy, Role, UserView, VideoSource,
 };
 use vms_plugin_sdk::FleetEvent;
+
+/// Who is asking, resolved from a session.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionUser {
+    pub id: String,
+    pub email: String,
+    pub role: Role,
+    pub customer_id: Option<String>,
+}
+
+/// A user as stored, hash included. Only the login path sees this.
+#[derive(Debug, Clone)]
+pub struct StoredUser {
+    pub id: String,
+    pub email: String,
+    pub password_hash: String,
+    pub role: Role,
+    pub disabled: bool,
+}
 
 /// One hour of a camera's life, or of a fleet's.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
@@ -200,16 +219,50 @@ pub trait Store: Send + Sync {
     async fn create_session(
         &self,
         session_id: &str,
+        user_id: &str,
         now: DateTime<Utc>,
         expires_at: DateTime<Utc>,
     ) -> Result<(), StoreError>;
 
-    /// True only for a stored, unexpired session.
-    async fn session_is_valid(
+    /// Who this session belongs to, if it is alive and they are not disabled.
+    /// `None` covers all three failures on purpose: the caller's answer is the
+    /// same for each, and telling them apart is how an endpoint leaks whether
+    /// an account exists.
+    async fn session_user(
         &self,
         session_id: &str,
         now: DateTime<Utc>,
-    ) -> Result<bool, StoreError>;
+    ) -> Result<Option<SessionUser>, StoreError>;
+
+    /// Add a user. `AlreadyExists` when that email is taken.
+    async fn create_user(
+        &self,
+        id: &str,
+        email: &str,
+        password_hash: &str,
+        role: Role,
+        customer_id: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> Result<(), StoreError>;
+
+    /// By email, lowercased by the caller. Disabled users come back too: the
+    /// login path has to tell "wrong password" from "turned off".
+    async fn user_by_email(&self, email: &str) -> Result<Option<StoredUser>, StoreError>;
+
+    async fn users(&self) -> Result<Vec<UserView>, StoreError>;
+
+    async fn update_user(
+        &self,
+        id: &str,
+        role: Option<Role>,
+        password_hash: Option<&str>,
+        disabled: Option<bool>,
+        customer_id: Option<Option<&str>>,
+        now: DateTime<Utc>,
+    ) -> Result<(), StoreError>;
+
+    /// Sessions belonging to one user, for a password change or a disable.
+    async fn delete_sessions_of(&self, user_id: &str) -> Result<(), StoreError>;
 
     /// Deleting an absent session is Ok — logging out twice is not an error.
     async fn delete_session(&self, session_id: &str) -> Result<(), StoreError>;
@@ -388,6 +441,8 @@ pub enum StoreError {
     NotFound,
     /// The row exists but is no longer usable (claimed or expired enrollment).
     Gone,
+    /// Something unique is already taken — an email, so far.
+    AlreadyExists,
     Internal(anyhow::Error),
 }
 
@@ -396,6 +451,7 @@ impl std::fmt::Display for StoreError {
         match self {
             StoreError::NotFound => write!(f, "not found"),
             StoreError::Gone => write!(f, "gone"),
+            StoreError::AlreadyExists => write!(f, "already exists"),
             StoreError::Internal(err) => write!(f, "store error: {err}"),
         }
     }

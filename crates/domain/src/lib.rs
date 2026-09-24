@@ -408,6 +408,82 @@ pub struct RecordingPolicyRequest {
     pub retention_days: u16,
 }
 
+/// What somebody is allowed to do. Three, not thirty: a permission per
+/// endpoint is a matrix nobody maintains and everybody ends up granting in
+/// full.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Role {
+    /// Everything, including users and plugins.
+    Owner,
+    /// Runs the fleet: gateways, sources, policies, recordings, live.
+    Technician,
+    /// Reads.
+    Viewer,
+}
+
+impl Role {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Role::Owner => "owner",
+            Role::Technician => "technician",
+            Role::Viewer => "viewer",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "owner" => Some(Role::Owner),
+            "technician" => Some(Role::Technician),
+            "viewer" => Some(Role::Viewer),
+            _ => None,
+        }
+    }
+
+    /// Whoever may change the system itself.
+    pub fn is_owner(&self) -> bool {
+        matches!(self, Role::Owner)
+    }
+
+    /// Whoever may operate the fleet.
+    pub fn can_operate(&self) -> bool {
+        matches!(self, Role::Owner | Role::Technician)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct UserView {
+    pub id: String,
+    pub email: String,
+    pub role: Role,
+    /// Set for a customer login: this user sees that customer and nothing
+    /// else.
+    pub customer_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub disabled_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateUserRequest {
+    pub email: String,
+    pub password: String,
+    pub role: Role,
+    #[serde(default)]
+    pub customer_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateUserRequest {
+    #[serde(default)]
+    pub role: Option<Role>,
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default)]
+    pub disabled: Option<bool>,
+    #[serde(default)]
+    pub customer_id: Option<Option<String>>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClipRequest {
     /// How far back to reach. The ring decides whether it still has it.

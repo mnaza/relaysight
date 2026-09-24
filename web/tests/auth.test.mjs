@@ -12,10 +12,15 @@ const dict = JSON.parse(read('locales/en.json'));
 
 let requireSession, installUnauthorizedTrap;
 let responses; // path suffix -> status
+let bodies; // path suffix -> the body that was posted to it
 
 function stubFetch() {
   globalThis.fetch = async (url, options = {}) => {
     const path = String(url);
+    if (options.body) {
+      const key = Object.keys(responses).find(suffix => path.includes(suffix)) ?? path;
+      bodies[key] = options.body;
+    }
     const match = Object.entries(responses).find(([suffix]) => path.includes(suffix));
     const status = match ? match[1] : 404;
     return {
@@ -40,6 +45,7 @@ function loadPage() {
 beforeEach(async () => {
   loadPage();
   responses = {};
+  bodies = {};
   stubFetch();
   ({ requireSession, installUnauthorizedTrap } = await import('../auth.js'));
 });
@@ -62,10 +68,16 @@ test('no session shows the login view and a successful login resolves the gate',
   assert.notEqual(heading.textContent, '', 'the login view is untranslated');
 
   const form = document.querySelector('#login-form');
+  form.querySelector('input[name=email]').value = 'owner@example.test';
   form.querySelector('input[name=password]').value = 'a fine password';
   form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
   await gate;
   assert.ok(!view.classList.contains('open'), 'the login view stayed up after login');
+  // Who is logging in goes with the password: there is no one shared
+  // account any more.
+  const sent = JSON.parse(bodies['api/v1/auth/login']);
+  assert.equal(sent.email, 'owner@example.test');
+  assert.equal(sent.password, 'a fine password');
 });
 
 test('a wrong password shows the error line and keeps the view open', async () => {

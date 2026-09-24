@@ -193,6 +193,7 @@
   "app.sources.confirmRemove": "Убрать этот источник? Шлюз перестанет его вести; уже сделанные записи останутся.",
   "app.auth.title": "Вход",
   "app.auth.subtitle": "Эта панель управляет камерами. Ей нужно знать, кто вы.",
+  "app.auth.email": "Почта",
   "app.auth.password": "Пароль",
   "app.auth.signIn": "Войти",
   "app.auth.failed": "Пароль не принят.",
@@ -238,5 +239,18 @@
   "app.stat.sub.uptime": "отчёты покрыли {covered}% недели",
   "app.health.week": "{uptime}% за 7 дней · переподключений: {reconnects} · отчёты покрыли {covered}% недели",
   "app.health.none": "Истории пока нет",
-  "app.health.loading": "Читаю историю…"
+  "app.health.loading": "Читаю историю…",
+  "app.users.title": "Люди",
+  "app.users.subtitle": "Кто может войти и что ему можно.",
+  "app.users.email": "Почта",
+  "app.users.password": "Пароль",
+  "app.users.role": "Роль",
+  "app.users.customer": "Клиент (необязательно)",
+  "app.users.add": "Добавить",
+  "app.users.scopeNote": "Доступ, ограниченный клиентом, — только на чтение: виден парк этого клиента и ничего больше.",
+  "app.users.scopedTo": "ограничен",
+  "app.users.disabled": "отключён",
+  "app.users.disable": "Отключить",
+  "app.users.enable": "Включить",
+  "app.users.failed": "Изменение отклонено"
 }

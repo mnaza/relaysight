@@ -105,8 +105,8 @@
 
 ## After first installer feedback
 
-- [ ] Technician/team RBAC
-- [ ] Customer login
+- [x] Technician/team RBAC — owner, technician and viewer, enforced by router group (`docs/USERS.md`)
+- [x] Customer login — a user scoped to a customer sees that customer's fleet and nothing else; another customer's camera is 404
 - [x] Email/webhook alerts — the control plane raises fleet events and an `event_sink` plugin delivers them, with an outbox that retries and a panel showing where each one got to (`docs/ALERTS.md`, spec: `docs/superpowers/specs/2026-09-23-alerts-design.md`); no real chat service has received one yet
 - [ ] Remote NVR access tunnel
 - [x] 7/30-day health history — hourly rollups folded from the telemetry the fleet already sends, with uptime and how much of the window was actually reported (`docs/HEALTH.md`); nothing has run for a month yet

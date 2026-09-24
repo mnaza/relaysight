@@ -27,11 +27,11 @@ export async function requireSession(dict) {
   const form = document.querySelector('#login-form');
   form.addEventListener('submit', async event => {
     event.preventDefault();
-    const password = new FormData(form).get('password');
+    const data = new FormData(form);
     const response = await fetch('api/v1/auth/login', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ password }),
+      body: JSON.stringify({ email: data.get('email'), password: data.get('password') }),
     }).catch(() => ({ status: 0 }));
     if (response.status === 204) {
       view().classList.remove('open');

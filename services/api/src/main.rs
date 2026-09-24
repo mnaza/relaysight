@@ -22,7 +22,7 @@ use std::{
 };
 
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{Path, Query, State},
     http::{HeaderMap, Method, StatusCode, header::AUTHORIZATION},
     routing::{get, post},
@@ -38,13 +38,14 @@ use tracing::{info, warn};
 use uuid::Uuid;
 use vms_domain::{
     AiAnalysisRequest as CameraAiAnalysisRequest, AuditView, CameraSummary, CameraTelemetry,
-    CameraTelemetryBatch, ClipRequest, CommandAccepted, CustomerSummary, EditionEntitlement,
-    EnrollmentCreated, EnrollmentRequest, FleetSnapshot, FleetSource, GatewayCommand,
-    GatewayCommandKind, GatewayCommandResult, GatewayCommandStatus, GatewayCommandView,
-    GatewayEnrollmentRequest, GatewayEnrollmentResponse, GatewayHeartbeat, GatewayView,
-    HealthStatus, IncidentView, KeepRule, LiveSessionRequest, PlaybackManifest, PlaybackSegment,
-    RecordingMode, RecordingPolicy, RecordingPolicyRequest, RecordingRequest, RecordingTimeline,
-    RtcConfigResponse, SiteSummary, SourceKind, VideoSource, VideoSourceRequest,
+    CameraTelemetryBatch, ClipRequest, CommandAccepted, CreateUserRequest, CustomerSummary,
+    EditionEntitlement, EnrollmentCreated, EnrollmentRequest, FleetSnapshot, FleetSource,
+    GatewayCommand, GatewayCommandKind, GatewayCommandResult, GatewayCommandStatus,
+    GatewayCommandView, GatewayEnrollmentRequest, GatewayEnrollmentResponse, GatewayHeartbeat,
+    GatewayView, HealthStatus, IncidentView, KeepRule, LiveSessionRequest, PlaybackManifest,
+    PlaybackSegment, RecordingMode, RecordingPolicy, RecordingPolicyRequest, RecordingRequest,
+    RecordingTimeline, RtcConfigResponse, SiteSummary, SourceKind, UpdateUserRequest, UserView,
+    VideoSource, VideoSourceRequest,
 };
 use vms_plugin_runtime::PluginRegistry;
 use vms_plugin_sdk::{
@@ -134,7 +135,13 @@ async fn main() -> anyhow::Result<()> {
         .ok()
         .filter(|value| !value.is_empty());
     let force_reset = env::var("ADMIN_PASSWORD_RESET").is_ok_and(|value| value == "true");
-    auth::seed_admin_credential(store.as_ref(), admin_password.as_deref(), force_reset).await?;
+    auth::seed_credentials(
+        store.as_ref(),
+        &env::var("ADMIN_EMAIL").unwrap_or_else(|_| "admin@localhost".into()),
+        admin_password.as_deref(),
+        force_reset,
+    )
+    .await?;
     let stale_camera_seconds: i64 = env::var("STALE_CAMERA_SECONDS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -248,25 +255,57 @@ fn build_router(state: AppState) -> Router {
             state.clone(),
             require_machine_bearer,
         ));
-    let protected = Router::new()
+    // Three groups, not a check inside each handler: a route has to be put
+    // in one to exist at all, and where it goes is a decision somebody makes
+    // rather than one they forget.
+    //
+    // `readable` is everything a viewer may see. `operable` is running the
+    // fleet. `owned` is changing the system itself.
+    let readable = Router::new()
         .route("/api/v1/fleet", get(fleet))
         .route("/api/v1/incidents", get(incidents))
-        .route("/api/v1/audit", get(audit_entries))
+        .route("/api/v1/cameras", get(cameras))
+        .route("/api/v1/gateways", get(gateways))
+        .route("/api/v1/commands/{command_id}", get(command_view))
+        .route("/api/v1/rtc/config", get(rtc_config))
+        .route(
+            "/api/v1/cameras/{camera_id}/recordings",
+            get(camera_timeline),
+        )
+        .route("/api/v1/health", get(fleet_health))
+        .route("/api/v1/cameras/{camera_id}/health", get(camera_health))
+        .route("/api/v1/events", get(fleet_events))
+        .route(
+            "/api/v1/cameras/{camera_id}/recording-policy",
+            get(camera_recording_policy),
+        )
+        .route(
+            "/api/v1/recordings/{recording_id}/playback",
+            get(recording_playback),
+        )
+        .route("/api/v1/plugins", get(plugins_list))
+        .route("/api/v1/plugins/{plugin_id}/health", get(plugin_health))
+        .route("/api/v1/auth/logout", post(crate::auth::auth_logout))
+        .route(
+            "/api/v1/auth/password",
+            post(crate::auth::auth_change_password),
+        )
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::auth::require_viewer,
+        ));
+    let operable = Router::new()
         .route("/api/v1/enrollments", post(create_enrollment))
         .route("/api/v1/sources", post(add_video_source).get(video_sources))
         .route(
             "/api/v1/sources/{source_id}/delete",
             post(delete_video_source),
         )
-        .route("/api/v1/cameras", get(cameras))
-        .route("/api/v1/gateways", get(gateways))
         .route("/api/v1/gateways/{gateway_id}/revoke", post(revoke_gateway))
         .route(
             "/api/v1/gateways/{gateway_id}/cameras/retire",
             post(retire_gateway_cameras),
         )
-        .route("/api/v1/commands/{command_id}", get(command_view))
-        .route("/api/v1/rtc/config", get(rtc_config))
         .route(
             "/api/v1/cameras/{camera_id}/live",
             post(create_live_session),
@@ -277,24 +316,14 @@ fn build_router(state: AppState) -> Router {
         )
         .route(
             "/api/v1/cameras/{camera_id}/recordings",
-            post(create_recording).get(camera_timeline),
+            post(create_recording),
         )
-        .route("/api/v1/health", get(fleet_health))
-        .route("/api/v1/cameras/{camera_id}/health", get(camera_health))
-        .route("/api/v1/events", get(fleet_events))
-        .route("/api/v1/events/test", post(test_event))
         .route("/api/v1/cameras/{camera_id}/clips", post(create_clip))
         .route(
             "/api/v1/cameras/{camera_id}/recording-policy",
-            get(camera_recording_policy).post(set_camera_recording_policy),
+            post(set_camera_recording_policy),
         )
-        .route(
-            "/api/v1/recordings/{recording_id}/playback",
-            get(recording_playback),
-        )
-        .route("/api/v1/plugins", get(plugins_list))
-        .route("/api/v1/plugins/reload", post(plugins_reload))
-        .route("/api/v1/plugins/{plugin_id}/health", get(plugin_health))
+        .route("/api/v1/events/test", post(test_event))
         .route(
             "/api/v1/plugins/{plugin_id}/storage/downloads",
             post(plugin_storage_download),
@@ -303,17 +332,23 @@ fn build_router(state: AppState) -> Router {
             "/api/v1/plugins/{plugin_id}/storage/delete",
             post(plugin_storage_delete),
         )
-        .route("/api/v1/auth/logout", post(crate::auth::auth_logout))
-        .route(
-            "/api/v1/auth/password",
-            post(crate::auth::auth_change_password),
-        )
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
-            crate::auth::require_session,
+            crate::auth::require_technician,
+        ));
+    let owned = Router::new()
+        .route("/api/v1/audit", get(audit_entries))
+        .route("/api/v1/users", get(list_users).post(create_user))
+        .route("/api/v1/users/{user_id}", post(update_user))
+        .route("/api/v1/plugins/reload", post(plugins_reload))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::auth::require_owner,
         ));
     open.merge(machine_plugins)
-        .merge(protected)
+        .merge(readable)
+        .merge(operable)
+        .merge(owned)
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -475,6 +510,7 @@ fn store_status(err: crate::store::StoreError) -> StatusCode {
     match err {
         crate::store::StoreError::NotFound => StatusCode::NOT_FOUND,
         crate::store::StoreError::Gone => StatusCode::GONE,
+        crate::store::StoreError::AlreadyExists => StatusCode::CONFLICT,
         crate::store::StoreError::Internal(err) => {
             warn!(error = %err, "store failure");
             StatusCode::INTERNAL_SERVER_ERROR
@@ -760,7 +796,9 @@ async fn gateway_recording(
 async fn camera_recording_policy(
     State(state): State<AppState>,
     Path(camera_id): Path<String>,
+    Extension(who): Extension<crate::store::SessionUser>,
 ) -> Result<Json<RecordingPolicy>, StatusCode> {
+    refuse_unless_visible(&state, &who, &camera_id).await?;
     let gateway_id = gateway_for_camera(&state, &camera_id).await?;
     let stored = state
         .store
@@ -936,7 +974,11 @@ async fn retire_gateway_cameras(
     Ok(Json(serde_json::json!({ "retired": retired.len() })))
 }
 
-async fn gateways(State(state): State<AppState>) -> Result<Json<Vec<GatewayView>>, StatusCode> {
+async fn gateways(
+    State(state): State<AppState>,
+    Extension(who): Extension<crate::store::SessionUser>,
+) -> Result<Json<Vec<GatewayView>>, StatusCode> {
+    let visible = visible_to(&state, &who).await;
     // The store is the roster, memory is the liveness — same split as /cameras.
     let mut views = state.store.gateway_views().await.map_err(store_status)?;
     let now = Utc::now();
@@ -970,11 +1012,18 @@ async fn gateways(State(state): State<AppState>) -> Result<Json<Vec<GatewayView>
         }
     }
     drop(live);
+    if let Some(visible) = &visible {
+        views.retain(|view| visible.sites.contains(&view.site_id));
+    }
     views.sort_by(|a, b| a.gateway_id.cmp(&b.gateway_id));
     Ok(Json(views))
 }
 
-async fn cameras(State(state): State<AppState>) -> Result<Json<Vec<CameraTelemetry>>, StatusCode> {
+async fn cameras(
+    State(state): State<AppState>,
+    Extension(who): Extension<crate::store::SessionUser>,
+) -> Result<Json<Vec<CameraTelemetry>>, StatusCode> {
+    let visible = visible_to(&state, &who).await;
     // The store is the roster, memory is the liveness.
     let records = state.store.fleet_cameras().await.map_err(store_status)?;
     let now = Utc::now();
@@ -995,6 +1044,11 @@ async fn cameras(State(state): State<AppState>) -> Result<Json<Vec<CameraTelemet
             camera.bitrate_kbps = None;
             camera.last_error = Some("gateway telemetry is stale".into());
         }
+    }
+    if let Some(visible) = &visible {
+        values.retain(|camera| {
+            visible.cameras.contains(&camera.camera_id) || visible.sites.contains(&camera.site_id)
+        });
     }
     values.sort_by(|a, b| {
         a.name
@@ -1028,11 +1082,25 @@ fn offline_camera(record: crate::store::CameraRecord) -> CameraTelemetry {
     }
 }
 
-async fn fleet(State(state): State<AppState>) -> Result<Json<FleetSnapshot>, StatusCode> {
+async fn fleet(
+    State(state): State<AppState>,
+    Extension(who): Extension<crate::store::SessionUser>,
+) -> Result<Json<FleetSnapshot>, StatusCode> {
+    let scoped_to = who.customer_id.clone();
     // Identity from the store, status from memory.
     let orgs = state.store.fleet_identity().await.map_err(store_status)?;
     let batches = state.camera_batches.read().await;
     if orgs.is_empty() {
+        // Nothing enrolled yet. A scoped user sees an empty fleet rather than
+        // the demo one: their customer has nothing, and a demo would look
+        // like somebody else's cameras.
+        if scoped_to.is_some() {
+            return Ok(Json(FleetSnapshot {
+                generated_at: Utc::now(),
+                source: FleetSource::Live,
+                customers: Vec::new(),
+            }));
+        }
         if batches.values().any(|batch| !batch.cameras.is_empty()) {
             return Ok(Json(live_fleet(
                 batches.values().cloned().collect(),
@@ -1045,6 +1113,9 @@ async fn fleet(State(state): State<AppState>) -> Result<Json<FleetSnapshot>, Sta
     let live = newest_camera_map(&batches);
     let customers = orgs
         .into_iter()
+        // A customer's own login sees their own fleet. Everybody else's is
+        // not hidden on the screen: it never leaves here.
+        .filter(|org| scoped_to.as_ref().is_none_or(|scope| &org.id == scope))
         .map(|org| CustomerSummary {
             id: org.id.clone(),
             name: org.name,
@@ -1349,8 +1420,10 @@ fn default_health_days() -> i64 {
 async fn camera_health(
     State(state): State<AppState>,
     Path(camera_id): Path<String>,
+    Extension(who): Extension<crate::store::SessionUser>,
     Query(window): Query<HealthWindow>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    refuse_unless_visible(&state, &who, &camera_id).await?;
     let days = window.days.clamp(1, 90);
     let since = Utc::now() - chrono::Duration::days(days);
     let hours = state
@@ -1405,18 +1478,186 @@ fn health_answer(days: i64, hours: Vec<crate::store::HealthHour>) -> serde_json:
     })
 }
 
+/// What one session may see, or `None` for everything.
+///
+/// A user scoped to a customer sees that customer's sites and nothing else.
+/// Anything outside answers 404 rather than 403: a customer should not learn
+/// that another customer exists by being told they may not look.
+struct Visible {
+    sites: std::collections::HashSet<String>,
+    cameras: std::collections::HashSet<String>,
+}
+
+async fn visible_to(state: &AppState, who: &crate::store::SessionUser) -> Option<Visible> {
+    let customer_id = who.customer_id.as_deref()?;
+    let organizations = state.store.fleet_identity().await.unwrap_or_default();
+    let mut visible = Visible {
+        sites: std::collections::HashSet::new(),
+        cameras: std::collections::HashSet::new(),
+    };
+    for organization in organizations
+        .into_iter()
+        .filter(|organization| organization.id == customer_id)
+    {
+        for site in organization.sites {
+            visible.sites.insert(site.id.clone());
+            visible
+                .cameras
+                .extend(site.cameras.into_iter().map(|camera| camera.id));
+        }
+    }
+    Some(visible)
+}
+
+/// Everybody who can get in, and what they may do.
+async fn list_users(State(state): State<AppState>) -> Result<Json<Vec<UserView>>, StatusCode> {
+    state.store.users().await.map(Json).map_err(store_status)
+}
+
+async fn create_user(
+    State(state): State<AppState>,
+    Extension(who): Extension<crate::store::SessionUser>,
+    Json(request): Json<CreateUserRequest>,
+) -> Result<(StatusCode, Json<UserView>), (StatusCode, String)> {
+    let email = request.email.trim().to_lowercase();
+    if !email.contains('@') || email.len() < 3 {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "that is not an email address".into(),
+        ));
+    }
+    if request.password.len() < crate::auth::MIN_PASSWORD_LEN {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!(
+                "a password needs at least {} characters",
+                crate::auth::MIN_PASSWORD_LEN
+            ),
+        ));
+    }
+    if request.customer_id.is_some() && request.role != vms_domain::Role::Viewer {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a login scoped to a customer is a viewer: scoping only covers reading".into(),
+        ));
+    }
+    let hash = crate::auth::hash_password(&request.password)
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, String::new()))?;
+    let id = Uuid::new_v4().to_string();
+    let now = Utc::now();
+    state
+        .store
+        .create_user(
+            &id,
+            &email,
+            &hash,
+            request.role,
+            request.customer_id.as_deref(),
+            now,
+        )
+        .await
+        .map_err(|err| (store_status(err), String::new()))?;
+    audit(
+        &state,
+        &who.email,
+        "user.created",
+        &email,
+        Some(request.role.as_str()),
+    )
+    .await;
+    Ok((
+        StatusCode::CREATED,
+        Json(UserView {
+            id,
+            email,
+            role: request.role,
+            customer_id: request.customer_id,
+            created_at: now,
+            disabled_at: None,
+        }),
+    ))
+}
+
+/// Change somebody: their role, their password, whether they are turned off,
+/// which customer they are scoped to.
+async fn update_user(
+    State(state): State<AppState>,
+    Path(user_id): Path<String>,
+    Extension(who): Extension<crate::store::SessionUser>,
+    Json(request): Json<UpdateUserRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    // An owner locking themselves out of their own control plane is a support
+    // call nobody can answer.
+    if who.id == user_id && (request.disabled == Some(true) || request.role.is_some()) {
+        return Err((
+            StatusCode::CONFLICT,
+            "change somebody else's role, or ask another owner to change yours".into(),
+        ));
+    }
+    let hash = match &request.password {
+        Some(password) if password.len() < crate::auth::MIN_PASSWORD_LEN => {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!(
+                    "a password needs at least {} characters",
+                    crate::auth::MIN_PASSWORD_LEN
+                ),
+            ));
+        }
+        Some(password) => Some(
+            crate::auth::hash_password(password)
+                .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, String::new()))?,
+        ),
+        None => None,
+    };
+    state
+        .store
+        .update_user(
+            &user_id,
+            request.role,
+            hash.as_deref(),
+            request.disabled,
+            request.customer_id.as_ref().map(|id| id.as_deref()),
+            Utc::now(),
+        )
+        .await
+        .map_err(|err| (store_status(err), String::new()))?;
+    // A new password or a disabled account has to take effect now, not
+    // whenever the session happens to expire.
+    if hash.is_some() || request.disabled == Some(true) {
+        let _ = state.store.delete_sessions_of(&user_id).await;
+    }
+    audit(&state, &who.email, "user.updated", &user_id, None).await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// A camera that is not this user's is not found. 404 rather than 403: a
+/// customer should not learn another customer's camera ids by being told they
+/// may not look at them.
+async fn refuse_unless_visible(
+    state: &AppState,
+    who: &crate::store::SessionUser,
+    camera_id: &str,
+) -> Result<(), StatusCode> {
+    match visible_to(state, who).await {
+        Some(visible) if !visible.cameras.contains(camera_id) => Err(StatusCode::NOT_FOUND),
+        _ => Ok(()),
+    }
+}
+
 /// What has been raised lately and whether each sink took it. An alert
 /// nobody delivered is exactly what an operator needs to see, so the failure
 /// travels with the event rather than staying in a log.
 async fn fleet_events(
     State(state): State<AppState>,
+    Extension(who): Extension<crate::store::SessionUser>,
 ) -> Result<Json<Vec<crate::store::EventView>>, StatusCode> {
-    state
-        .store
-        .recent_events(100)
-        .await
-        .map(Json)
-        .map_err(store_status)
+    let visible = visible_to(&state, &who).await;
+    let mut events = state.store.recent_events(100).await.map_err(store_status)?;
+    if let Some(visible) = &visible {
+        events.retain(|entry| visible.sites.contains(&entry.event.site_id));
+    }
+    Ok(Json(events))
 }
 
 /// Send a test event, because the first question anyone asks about alerting
@@ -1572,7 +1813,9 @@ async fn command_view(
 async fn camera_timeline(
     State(state): State<AppState>,
     Path(camera_id): Path<String>,
+    Extension(who): Extension<crate::store::SessionUser>,
 ) -> Result<Json<RecordingTimeline>, StatusCode> {
+    refuse_unless_visible(&state, &who, &camera_id).await?;
     // Already newest-first from the store.
     let recordings = state
         .store
@@ -1585,14 +1828,17 @@ async fn camera_timeline(
     }))
 }
 
-async fn incidents(State(state): State<AppState>) -> Result<Json<Vec<IncidentView>>, StatusCode> {
+async fn incidents(
+    State(state): State<AppState>,
+    Extension(who): Extension<crate::store::SessionUser>,
+) -> Result<Json<Vec<IncidentView>>, StatusCode> {
+    let visible = visible_to(&state, &who).await;
     // Open first, newest-closed after; 200 is plenty for a screen.
-    state
-        .store
-        .incidents(200)
-        .await
-        .map(Json)
-        .map_err(store_status)
+    let mut incidents = state.store.incidents(200).await.map_err(store_status)?;
+    if let Some(visible) = &visible {
+        incidents.retain(|incident| visible.sites.contains(&incident.site_id));
+    }
+    Ok(Json(incidents))
 }
 
 async fn audit_entries(State(state): State<AppState>) -> Result<Json<Vec<AuditView>>, StatusCode> {
@@ -1607,12 +1853,14 @@ async fn audit_entries(State(state): State<AppState>) -> Result<Json<Vec<AuditVi
 async fn recording_playback(
     State(state): State<AppState>,
     Path(recording_id): Path<String>,
+    Extension(who): Extension<crate::store::SessionUser>,
 ) -> Result<Json<PlaybackManifest>, StatusCode> {
     let recording = state
         .store
         .recording(&recording_id)
         .await
         .map_err(store_status)?;
+    refuse_unless_visible(&state, &who, &recording.camera_id).await?;
     let context = vms_plugin_sdk::PluginInvocationContext {
         camera_id: Some(recording.camera_id.clone()),
         ..Default::default()
@@ -2313,11 +2561,19 @@ mod tests {
     const SHARED_TOKEN: &str = "shared-bootstrap-token";
     const ADMIN_PASSWORD: &str = "correct horse battery staple";
 
-    /// Seed the admin credential the way main() does at startup.
+    const ADMIN_EMAIL: &str = "admin@localhost";
+
+    /// Seed the way main() does at startup: the credential, then the owner it
+    /// belongs to.
     async fn seed_admin(state: &AppState) {
-        crate::auth::seed_admin_credential(state.store.as_ref(), Some(ADMIN_PASSWORD), false)
-            .await
-            .expect("seed admin credential");
+        crate::auth::seed_credentials(
+            state.store.as_ref(),
+            ADMIN_EMAIL,
+            Some(ADMIN_PASSWORD),
+            false,
+        )
+        .await
+        .expect("seed the owner");
     }
 
     async fn test_state() -> AppState {
@@ -2828,6 +3084,479 @@ mod tests {
         )
         .await;
         assert_eq!(health["days"], 90);
+    }
+
+    /// The password people already knew keeps working; what changes is that
+    /// the system now knows who used it.
+    /// Log in as somebody the owner just made.
+    async fn cookie_for(state: &AppState, email: &str, password: &str) -> String {
+        let response = build_router(state.clone())
+            .oneshot(post(
+                "/api/v1/auth/login",
+                None,
+                serde_json::json!({ "email": email, "password": password }),
+            ))
+            .await
+            .expect("router responds");
+        assert_eq!(response.status(), StatusCode::NO_CONTENT, "login refused");
+        response
+            .headers()
+            .get(axum::http::header::SET_COOKIE)
+            .expect("a cookie")
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned()
+    }
+
+    /// Make a user of this role and come back with their cookie.
+    async fn user_cookie(state: &AppState, role: &str) -> String {
+        let owner = login_cookie(state).await;
+        let email = format!("{role}@example.test");
+        let password = "a perfectly good passphrase";
+        let (status, body) = send(
+            state,
+            with_cookie(
+                post(
+                    "/api/v1/users",
+                    None,
+                    serde_json::json!({ "email": email, "password": password, "role": role }),
+                ),
+                &owner,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        cookie_for(state, &email, password).await
+    }
+
+    /// A customer's own login sees their own fleet. Everybody else's does
+    /// not get hidden on the screen — it never leaves the control plane.
+    #[tokio::test]
+    async fn a_customer_login_sees_one_customer() {
+        let state = test_state().await;
+        seed_admin(&state).await;
+        let owner = login_cookie(&state).await;
+
+        // Two customers, one camera each.
+        for (customer, gateway, camera, site) in [
+            ("cust-1", "gw-1", "cam-1", "site-1"),
+            ("cust-2", "gw-2", "cam-2", "site-2"),
+        ] {
+            let mut batch = typed_batch(gateway, camera, HealthStatus::Healthy, Utc::now(), None);
+            batch.customer_id = customer.into();
+            batch.customer_name = customer.into();
+            batch.site_id = site.into();
+            batch.site_name = site.into();
+            for camera in &mut batch.cameras {
+                camera.site_id = site.into();
+            }
+            state
+                .store
+                .upsert_fleet_identity(&batch, Utc::now())
+                .await
+                .unwrap();
+            state
+                .camera_batches
+                .write()
+                .await
+                .insert(gateway.to_string(), batch);
+        }
+
+        let (status, _) = send(
+            &state,
+            with_cookie(
+                post(
+                    "/api/v1/users",
+                    None,
+                    serde_json::json!({
+                        "email": "customer@example.test",
+                        "password": "a perfectly good passphrase",
+                        "role": "viewer",
+                        "customer_id": "cust-1",
+                    }),
+                ),
+                &owner,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let customer = cookie_for(
+            &state,
+            "customer@example.test",
+            "a perfectly good passphrase",
+        )
+        .await;
+
+        let (_, fleet) = send(&state, with_cookie(get("/api/v1/fleet"), &customer)).await;
+        let customers = fleet["customers"].as_array().unwrap();
+        assert_eq!(customers.len(), 1, "{fleet}");
+        assert_eq!(customers[0]["id"], "cust-1");
+
+        let (_, cameras) = send(&state, with_cookie(get("/api/v1/cameras"), &customer)).await;
+        let listed = cameras.as_array().unwrap();
+        assert_eq!(listed.len(), 1, "{cameras}");
+        assert_eq!(listed[0]["camera_id"], "cam-1");
+
+        let (_, gateways) = send(&state, with_cookie(get("/api/v1/gateways"), &customer)).await;
+        assert!(
+            gateways
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|view| view["gateway_id"] == "gw-1"),
+            "{gateways}"
+        );
+
+        // And the owner still sees both.
+        let (_, all) = send(&state, with_cookie(get("/api/v1/cameras"), &owner)).await;
+        assert_eq!(all.as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn another_customers_camera_is_not_found_rather_than_forbidden() {
+        let state = test_state().await;
+        seed_admin(&state).await;
+        let owner = login_cookie(&state).await;
+        let mut batch = typed_batch("gw-2", "cam-2", HealthStatus::Healthy, Utc::now(), None);
+        batch.customer_id = "cust-2".into();
+        state
+            .store
+            .upsert_fleet_identity(&batch, Utc::now())
+            .await
+            .unwrap();
+        let (status, _) = send(
+            &state,
+            with_cookie(
+                post(
+                    "/api/v1/users",
+                    None,
+                    serde_json::json!({
+                        "email": "elsewhere@example.test",
+                        "password": "a perfectly good passphrase",
+                        "role": "viewer",
+                        "customer_id": "cust-1",
+                    }),
+                ),
+                &owner,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let customer = cookie_for(
+            &state,
+            "elsewhere@example.test",
+            "a perfectly good passphrase",
+        )
+        .await;
+
+        for uri in [
+            "/api/v1/cameras/cam-2/health",
+            "/api/v1/cameras/cam-2/recordings",
+            "/api/v1/cameras/cam-2/recording-policy",
+        ] {
+            let (status, _) = send(&state, with_cookie(get(uri), &customer)).await;
+            assert_eq!(
+                status,
+                StatusCode::NOT_FOUND,
+                "{uri} told them the camera exists"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_scoped_login_that_could_change_things_is_refused() {
+        // Scoping covers reading. A scoped technician would be able to act on
+        // a fleet the scope was supposed to keep them out of.
+        let state = test_state().await;
+        seed_admin(&state).await;
+        let owner = login_cookie(&state).await;
+        let (status, _) = send(
+            &state,
+            with_cookie(
+                post(
+                    "/api/v1/users",
+                    None,
+                    serde_json::json!({
+                        "email": "scoped@example.test",
+                        "password": "a perfectly good passphrase",
+                        "role": "technician",
+                        "customer_id": "cust-1",
+                    }),
+                ),
+                &owner,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn a_viewer_may_look_and_may_not_touch() {
+        let state = test_state().await;
+        seed_admin(&state).await;
+        let viewer = user_cookie(&state, "viewer").await;
+
+        let (status, _) = send(&state, with_cookie(get("/api/v1/fleet"), &viewer)).await;
+        assert_eq!(status, StatusCode::OK, "a viewer reads");
+
+        for (method, uri) in [
+            ("POST", "/api/v1/enrollments"),
+            ("POST", "/api/v1/sources"),
+            ("POST", "/api/v1/cameras/cam-1/recording-policy"),
+            ("POST", "/api/v1/cameras/cam-1/clips"),
+            ("GET", "/api/v1/users"),
+            ("POST", "/api/v1/plugins/reload"),
+            ("GET", "/api/v1/audit"),
+        ] {
+            let (status, _) =
+                send(&state, with_cookie(protected_request(method, uri), &viewer)).await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "a viewer got through to {method} {uri}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_technician_runs_the_fleet_and_does_not_run_the_system() {
+        let state = test_state().await;
+        seed_admin(&state).await;
+        let technician = user_cookie(&state, "technician").await;
+
+        // Operating is allowed: whatever the handler answers, it is not a
+        // refusal by role.
+        for (method, uri) in [
+            ("POST", "/api/v1/enrollments"),
+            ("POST", "/api/v1/sources"),
+            ("POST", "/api/v1/cameras/cam-1/clips"),
+        ] {
+            let (status, _) = send(
+                &state,
+                with_cookie(protected_request(method, uri), &technician),
+            )
+            .await;
+            assert_ne!(
+                status,
+                StatusCode::FORBIDDEN,
+                "a technician was refused {method} {uri}"
+            );
+        }
+
+        for (method, uri) in [
+            ("GET", "/api/v1/users"),
+            ("POST", "/api/v1/users"),
+            ("POST", "/api/v1/plugins/reload"),
+            ("GET", "/api/v1/audit"),
+        ] {
+            let (status, _) = send(
+                &state,
+                with_cookie(protected_request(method, uri), &technician),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "a technician got through to {method} {uri}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_owner_makes_people_and_can_turn_them_off() {
+        let state = test_state().await;
+        seed_admin(&state).await;
+        let owner = login_cookie(&state).await;
+        let technician = user_cookie(&state, "technician").await;
+
+        let (status, users) = send(&state, with_cookie(get("/api/v1/users"), &owner)).await;
+        assert_eq!(status, StatusCode::OK);
+        let listed = users.as_array().unwrap();
+        assert_eq!(listed.len(), 2, "{users}");
+        let made = listed
+            .iter()
+            .find(|user| user["email"] == "technician@example.test")
+            .expect("the new user is listed");
+        assert_eq!(made["role"], "technician");
+
+        // Turning somebody off ends their session there and then.
+        let (status, _) = send(
+            &state,
+            with_cookie(
+                post(
+                    &format!("/api/v1/users/{}", made["id"].as_str().unwrap()),
+                    None,
+                    serde_json::json!({ "disabled": true }),
+                ),
+                &owner,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, _) = send(&state, with_cookie(get("/api/v1/fleet"), &technician)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn an_owner_cannot_lock_themselves_out() {
+        // Nobody can answer that support call.
+        let state = test_state().await;
+        seed_admin(&state).await;
+        let owner = login_cookie(&state).await;
+        let me = state.store.users().await.unwrap().remove(0);
+
+        for change in [
+            serde_json::json!({ "disabled": true }),
+            serde_json::json!({ "role": "viewer" }),
+        ] {
+            let (status, _) = send(
+                &state,
+                with_cookie(
+                    post(&format!("/api/v1/users/{}", me.id), None, change.clone()),
+                    &owner,
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CONFLICT, "allowed {change}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_weak_password_or_a_taken_email_is_refused_rather_than_stored() {
+        let state = test_state().await;
+        seed_admin(&state).await;
+        let owner = login_cookie(&state).await;
+
+        let (status, _) = send(
+            &state,
+            with_cookie(
+                post(
+                    "/api/v1/users",
+                    None,
+                    serde_json::json!({ "email": "weak@example.test", "password": "short",
+                                        "role": "viewer" }),
+                ),
+                &owner,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+        let (status, _) = send(
+            &state,
+            with_cookie(
+                post(
+                    "/api/v1/users",
+                    None,
+                    serde_json::json!({ "email": ADMIN_EMAIL, "password": "a fine long password",
+                                        "role": "owner" }),
+                ),
+                &owner,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "that email is taken");
+    }
+
+    #[tokio::test]
+    async fn the_old_single_password_becomes_an_owner_without_changing() {
+        let state = test_state().await;
+        // An install from before users: only the single credential exists.
+        crate::auth::seed_admin_credential_for_test(state.store.as_ref(), ADMIN_PASSWORD).await;
+        assert!(state.store.users().await.unwrap().is_empty());
+
+        crate::auth::seed_credentials(state.store.as_ref(), ADMIN_EMAIL, None, false)
+            .await
+            .expect("carrying the credential across needs no env password");
+
+        let users = state.store.users().await.unwrap();
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].email, ADMIN_EMAIL);
+        assert_eq!(users[0].role, vms_domain::Role::Owner);
+
+        let (status, _) = send(
+            &state,
+            post(
+                "/api/v1/auth/login",
+                None,
+                serde_json::json!({ "email": ADMIN_EMAIL, "password": ADMIN_PASSWORD }),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NO_CONTENT,
+            "the same password still works"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_email_is_matched_however_it_was_typed() {
+        let state = test_state().await;
+        seed_admin(&state).await;
+        for typed in ["ADMIN@LOCALHOST", " Admin@Localhost "] {
+            let (status, _) = send(
+                &state,
+                post(
+                    "/api/v1/auth/login",
+                    None,
+                    serde_json::json!({ "email": typed, "password": ADMIN_PASSWORD }),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NO_CONTENT, "refused {typed:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_disabled_account_cannot_log_in_and_its_sessions_stop_working() {
+        let state = test_state().await;
+        seed_admin(&state).await;
+        let cookie = login_cookie(&state).await;
+        let owner = state.store.users().await.unwrap().remove(0);
+
+        // The session works right up until the account is turned off.
+        let (status, _) = send(&state, with_cookie(get("/api/v1/fleet"), &cookie)).await;
+        assert_eq!(status, StatusCode::OK);
+        state
+            .store
+            .update_user(&owner.id, None, None, Some(true), None, Utc::now())
+            .await
+            .unwrap();
+
+        let (status, _) = send(&state, with_cookie(get("/api/v1/fleet"), &cookie)).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "a disabled account keeps no way in"
+        );
+        let (status, _) = send(
+            &state,
+            post(
+                "/api/v1/auth/login",
+                None,
+                serde_json::json!({ "email": ADMIN_EMAIL, "password": ADMIN_PASSWORD }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn the_audit_log_says_who_rather_than_admin() {
+        let state = test_state().await;
+        seed_admin(&state).await;
+        let _ = login_cookie(&state).await;
+        let entries = state.store.audit_entries(10).await.unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.action == "login.ok" && entry.actor == ADMIN_EMAIL),
+            "every row used to say admin: {entries:?}"
+        );
     }
 
     #[tokio::test]
@@ -4119,6 +4848,16 @@ mod tests {
         ("POST", "/api/v1/plugins/p-1/storage/delete"),
         ("POST", "/api/v1/auth/logout"),
         ("POST", "/api/v1/auth/password"),
+        ("GET", "/api/v1/users"),
+        ("POST", "/api/v1/users"),
+        ("POST", "/api/v1/users/u-1"),
+        ("GET", "/api/v1/health"),
+        ("GET", "/api/v1/cameras/cam-1/health"),
+        ("GET", "/api/v1/events"),
+        ("POST", "/api/v1/events/test"),
+        ("POST", "/api/v1/cameras/cam-1/clips"),
+        ("GET", "/api/v1/cameras/cam-1/recording-policy"),
+        ("POST", "/api/v1/cameras/cam-1/recording-policy"),
     ];
 
     fn protected_request(method: &str, uri: &str) -> Request<Body> {
@@ -4135,7 +4874,7 @@ mod tests {
             .oneshot(post(
                 "/api/v1/auth/login",
                 None,
-                serde_json::json!({ "password": ADMIN_PASSWORD }),
+                serde_json::json!({ "email": ADMIN_EMAIL, "password": ADMIN_PASSWORD }),
             ))
             .await
             .expect("router responds");
@@ -4321,7 +5060,7 @@ mod tests {
             post(
                 "/api/v1/auth/login",
                 None,
-                serde_json::json!({ "password": "wrong" }),
+                serde_json::json!({ "email": ADMIN_EMAIL, "password": "wrong" }),
             ),
         )
         .await;
@@ -4343,7 +5082,7 @@ mod tests {
                 post(
                     "/api/v1/auth/login",
                     None,
-                    serde_json::json!({ "password": "wrong" }),
+                    serde_json::json!({ "email": ADMIN_EMAIL, "password": "wrong" }),
                 ),
             )
             .await;
@@ -4510,7 +5249,7 @@ mod tests {
             post(
                 "/api/v1/auth/login",
                 None,
-                serde_json::json!({ "password": ADMIN_PASSWORD }),
+                serde_json::json!({ "email": ADMIN_EMAIL, "password": ADMIN_PASSWORD }),
             ),
         )
         .await;
@@ -4520,7 +5259,7 @@ mod tests {
             post(
                 "/api/v1/auth/login",
                 None,
-                serde_json::json!({ "password": "an entirely new passphrase" }),
+                serde_json::json!({ "email": ADMIN_EMAIL, "password": "an entirely new passphrase" }),
             ),
         )
         .await;
@@ -4561,7 +5300,7 @@ mod tests {
             post(
                 "/api/v1/auth/login",
                 None,
-                serde_json::json!({ "password": ADMIN_PASSWORD }),
+                serde_json::json!({ "email": ADMIN_EMAIL, "password": ADMIN_PASSWORD }),
             ),
         )
         .await;
@@ -4765,11 +5504,14 @@ mod tests {
     #[tokio::test]
     async fn the_retention_pass_sweeps_expired_sessions() {
         let state = test_state().await;
+        seed_admin(&state).await;
+        let owner = state.store.users().await.unwrap().remove(0).id;
         let now = Utc::now();
         state
             .store
             .create_session(
                 "expired",
+                &owner,
                 now - chrono::Duration::days(8),
                 now - chrono::Duration::days(1),
             )
@@ -4777,21 +5519,29 @@ mod tests {
             .unwrap();
         state
             .store
-            .create_session("alive", now, now + chrono::Duration::days(7))
+            .create_session("alive", &owner, now, now + chrono::Duration::days(7))
             .await
             .unwrap();
 
         retention_pass(&state).await;
 
         assert!(
-            !state
+            state
                 .store
-                .session_is_valid("expired", now - chrono::Duration::days(2))
+                .session_user("expired", now - chrono::Duration::days(2))
                 .await
-                .unwrap(),
+                .unwrap()
+                .is_none(),
             "the expired row should be gone even for a past `now`"
         );
-        assert!(state.store.session_is_valid("alive", now).await.unwrap());
+        assert!(
+            state
+                .store
+                .session_user("alive", now)
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     fn typed_batch(
@@ -5116,7 +5866,7 @@ mod tests {
             post(
                 "/api/v1/auth/login",
                 None,
-                serde_json::json!({ "password": "wrong" }),
+                serde_json::json!({ "email": ADMIN_EMAIL, "password": "wrong" }),
             ),
         )
         .await;
@@ -5183,8 +5933,9 @@ mod tests {
     async fn a_forced_password_reset_is_audited() {
         let state = test_state().await;
         seed_admin(&state).await;
-        crate::auth::seed_admin_credential(
+        crate::auth::seed_credentials(
             state.store.as_ref(),
+            ADMIN_EMAIL,
             Some("a replacement passphrase"),
             true,
         )

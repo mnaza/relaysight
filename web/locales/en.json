@@ -193,6 +193,7 @@
   "app.sources.confirmRemove": "Remove this source? The gateway stops carrying it; recordings already made stay.",
   "app.auth.title": "Sign in",
   "app.auth.subtitle": "This dashboard controls cameras. It needs to know who you are.",
+  "app.auth.email": "Email",
   "app.auth.password": "Password",
   "app.auth.signIn": "Sign in",
   "app.auth.failed": "That password was not accepted.",
@@ -238,5 +239,18 @@
   "app.stat.sub.uptime": "{covered}% of the week reported",
   "app.health.week": "{uptime}% up over 7 days · {reconnects} reconnects · {covered}% of the week reported",
   "app.health.none": "No history yet",
-  "app.health.loading": "Reading history…"
+  "app.health.loading": "Reading history…",
+  "app.users.title": "People",
+  "app.users.subtitle": "Who can get in, and what each of them may do.",
+  "app.users.email": "Email",
+  "app.users.password": "Password",
+  "app.users.role": "Role",
+  "app.users.customer": "Customer (optional)",
+  "app.users.add": "Add person",
+  "app.users.scopeNote": "A login scoped to a customer is a viewer: it sees that customer's fleet and nothing else.",
+  "app.users.scopedTo": "scoped to",
+  "app.users.disabled": "turned off",
+  "app.users.disable": "Turn off",
+  "app.users.enable": "Turn on",
+  "app.users.failed": "That change was refused"
 }

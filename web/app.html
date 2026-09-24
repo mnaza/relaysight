@@ -11,6 +11,7 @@
     <form id="login-form" class="modal login-modal">
       <h2 data-i18n="app.auth.title"></h2>
       <p data-i18n="app.auth.subtitle"></p>
+      <label class="field"><span data-i18n="app.auth.email"></span><input name="email" type="email" required autocomplete="username" /></label>
       <label class="field"><span data-i18n="app.auth.password"></span><input name="password" type="password" required autocomplete="current-password" /></label>
       <div id="login-error" class="form-error" hidden data-i18n="app.auth.failed"></div>
       <div class="modal-actions"><button class="button primary" type="submit" data-i18n="app.auth.signIn"></button></div>
@@ -122,6 +123,25 @@
           <div class="metric-sub" data-i18n="app.sources.passwordNote"></div>
           <div id="sources-list" class="plugins-grid"></div>
           <div id="sources-empty" class="metric-sub" hidden data-i18n="app.sources.empty"></div>
+        </section>
+
+        <section id="users" class="panel" hidden>
+          <div class="panel-head">
+            <div><strong data-i18n="app.users.title"></strong><div class="metric-sub" data-i18n="app.users.subtitle"></div></div>
+          </div>
+          <form id="user-form" class="field-row">
+            <label class="field"><span data-i18n="app.users.email"></span><input name="email" type="email" required /></label>
+            <label class="field"><span data-i18n="app.users.password"></span><input name="password" type="password" required minlength="12" /></label>
+            <label class="field"><span data-i18n="app.users.role"></span><select name="role">
+              <option value="viewer">viewer</option>
+              <option value="technician">technician</option>
+              <option value="owner">owner</option>
+            </select></label>
+            <label class="field"><span data-i18n="app.users.customer"></span><input name="customerId" placeholder="—" /></label>
+            <button class="button small" type="submit" data-i18n="app.users.add"></button>
+          </form>
+          <div class="metric-sub" data-i18n="app.users.scopeNote"></div>
+          <div id="users-list" class="plugins-grid"></div>
         </section>
 
         <section id="plugins" class="panel">

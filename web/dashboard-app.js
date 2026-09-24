@@ -67,6 +67,13 @@ export async function startDashboard({ brand, locale, dict }) {
     catch { return []; }
   }
 
+  // Who can get in. A 403 means this session is not an owner, and the panel
+  // stays away: showing it would be a promise the control plane then breaks.
+  async function loadUsers() {
+    try { return await tryJson('api/v1/users'); }
+    catch { return null; }
+  }
+
   async function loadHealth() {
     try { return await tryJson('api/v1/health?days=7'); }
     catch { return null; }
@@ -77,7 +84,7 @@ export async function startDashboard({ brand, locale, dict }) {
     catch { return []; }
   }
 
-  let [fleet, telemetry, edition, plugins, gateways, incidents, videoSources, alerts, health] = await Promise.all([loadFleet(), loadTelemetry(), loadEdition(), loadPlugins(), loadGateways(), loadIncidents(), loadSources(), loadEvents(), loadHealth()]);
+  let [fleet, telemetry, edition, plugins, gateways, incidents, videoSources, alerts, health, users] = await Promise.all([loadFleet(), loadTelemetry(), loadEdition(), loadPlugins(), loadGateways(), loadIncidents(), loadSources(), loadEvents(), loadHealth(), loadUsers()]);
   let telemetryById = new Map(telemetry.map(camera => [camera.camera_id, camera]));
   const isLive = fleet.source === 'live';
   const sourceTag = document.querySelector('#fleet-source');
@@ -187,6 +194,63 @@ export async function startDashboard({ brand, locale, dict }) {
     }
   }
   paintAlerts();
+
+  function paintUsers() {
+    const panel = document.querySelector('#users');
+    const list = document.querySelector('#users-list');
+    if (!panel || !list) return;
+    panel.hidden = !Array.isArray(users);
+    if (panel.hidden) return;
+    list.replaceChildren();
+    for (const user of users) {
+      const card = document.createElement('article');
+      card.className = 'plugin-card';
+      card.innerHTML = `
+        <div class="panel-head">
+          <div><strong class="user-email"></strong><div class="metric-sub user-scope"></div></div>
+          <span class="health-pill user-role"></span>
+        </div>`;
+      card.querySelector('.user-email').textContent = user.email;
+      card.querySelector('.user-role').textContent = user.role;
+      const scope = [];
+      if (user.customer_id) scope.push(`${t(dict, 'app.users.scopedTo')} ${user.customer_id}`);
+      if (user.disabled_at) scope.push(t(dict, 'app.users.disabled'));
+      card.querySelector('.user-scope').textContent = scope.join(' · ') || '—';
+
+      const toggle = document.createElement('button');
+      toggle.className = 'button small';
+      toggle.textContent = t(dict, user.disabled_at ? 'app.users.enable' : 'app.users.disable');
+      toggle.addEventListener('click', async () => {
+        const response = await fetch(`api/v1/users/${encodeURIComponent(user.id)}`, {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ disabled: !user.disabled_at }),
+        }).catch(() => null);
+        if (!response || !response.ok) alert(t(dict, 'app.users.failed'));
+        refresh();
+      });
+      card.appendChild(toggle);
+      list.appendChild(card);
+    }
+  }
+  paintUsers();
+
+  document.querySelector('#user-form')?.addEventListener('submit', async event => {
+    event.preventDefault();
+    const data = new FormData(event.target);
+    const customer = String(data.get('customerId') || '').trim();
+    const response = await fetch('api/v1/users', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        email: String(data.get('email') || '').trim(),
+        password: String(data.get('password') || ''),
+        role: String(data.get('role') || 'viewer'),
+        customer_id: customer || null,
+      }),
+    }).catch(() => null);
+    if (!response || !response.ok) { alert(t(dict, 'app.users.failed')); return; }
+    event.target.reset();
+    refresh();
+  });
 
   document.querySelector('#send-test-alert')?.addEventListener('click', async event => {
     const button = event.target;
@@ -709,17 +773,18 @@ export async function startDashboard({ brand, locale, dict }) {
     if (document.querySelector('.modal-backdrop.open')) return;
     let next;
     try {
-      next = await Promise.all([loadFleet(), loadTelemetry(), loadGateways(), loadIncidents(), loadSources(), loadEvents(), loadHealth()]);
+      next = await Promise.all([loadFleet(), loadTelemetry(), loadGateways(), loadIncidents(), loadSources(), loadEvents(), loadHealth(), loadUsers()]);
     } catch {
       return;
     }
-    [fleet, telemetry, gateways, incidents, videoSources, alerts, health] = next;
+    [fleet, telemetry, gateways, incidents, videoSources, alerts, health, users] = next;
     telemetryById = new Map(telemetry.map(camera => [camera.camera_id, camera]));
     rows = fleet.customers.flatMap(customer => customer.sites.map(site => ({ customer, site })));
     allCameras = rows.flatMap(row => row.site.cameras);
     paintStats();
     paintIncidents();
     paintAlerts();
+    paintUsers();
     render(currentFilter);
     renderGateways();
     renderSources();

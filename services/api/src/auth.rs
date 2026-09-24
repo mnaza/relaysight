@@ -76,52 +76,119 @@ impl LoginThrottle {
 
 /// Startup credential bootstrap. An API that cannot authenticate anyone must
 /// not serve, so the no-credential case is an error, same as a failed DB open.
-pub async fn seed_admin_credential(
+/// Make sure somebody can log in, and that nobody's password changed behind
+/// their back.
+///
+/// Three cases, and the third is the one worth being careful about:
+///
+/// - A fresh install seeds an owner from `ADMIN_PASSWORD`.
+/// - An install that already had the single admin credential carries that
+///   hash into an owner, so the password people know still works and only
+///   the login form gains a field.
+/// - `ADMIN_PASSWORD_RESET=true` sets the owner's password from the
+///   environment and revokes every session. Writing only to the old single
+///   row would now make a reset look like it worked and change nothing,
+///   because the login path reads users.
+pub async fn seed_credentials(
     store: &dyn Store,
+    email: &str,
     env_password: Option<&str>,
     force_reset: bool,
 ) -> anyhow::Result<()> {
-    let stored = store
-        .admin_password_hash()
-        .await
-        .map_err(|err| anyhow::anyhow!("reading admin credential: {err}"))?;
-    match (stored, env_password, force_reset) {
-        (Some(_), _, false) => Ok(()),
-        (Some(_), Some(password), true) => {
+    let email = email.trim().to_lowercase();
+    if email.is_empty() {
+        anyhow::bail!("ADMIN_EMAIL is empty; the owner needs a name to log in with");
+    }
+    let existing = store.users().await.map_err(seed_err)?;
+    let legacy = store.admin_password_hash().await.map_err(seed_err)?;
+    let now = chrono::Utc::now();
+
+    if force_reset {
+        let Some(password) = env_password else {
+            anyhow::bail!(
+                "ADMIN_PASSWORD_RESET=true but ADMIN_PASSWORD is not set; nothing to reset to"
+            );
+        };
+        ensure_seedable(password)?;
+        let phc = hash_password(password)?;
+        match existing.iter().find(|user| user.email == email) {
+            Some(user) => store
+                .update_user(&user.id, None, Some(&phc), Some(false), None, now)
+                .await
+                .map_err(seed_err)?,
+            None => store
+                .create_user(
+                    &uuid::Uuid::new_v4().to_string(),
+                    &email,
+                    &phc,
+                    vms_domain::Role::Owner,
+                    None,
+                    now,
+                )
+                .await
+                .map_err(seed_err)?,
+        }
+        store
+            .set_admin_password_hash(&phc, now)
+            .await
+            .map_err(seed_err)?;
+        store.delete_all_sessions().await.map_err(seed_err)?;
+        if let Err(err) = store
+            .record_audit(now, "system", "password.reset", &email, None)
+            .await
+        {
+            warn!(error = %err, "audit write failed for password.reset");
+        }
+        warn!(%email, "ADMIN_PASSWORD_RESET: owner password re-seeded from env, sessions revoked");
+        return Ok(());
+    }
+
+    if !existing.is_empty() {
+        // Somebody can already log in, and the environment does not get to
+        // change that on a restart.
+        return Ok(());
+    }
+
+    let phc = match (legacy, env_password) {
+        (Some(hash), _) => hash,
+        (None, Some(password)) => {
             ensure_seedable(password)?;
             let phc = hash_password(password)?;
             store
-                .set_admin_password_hash(&phc, chrono::Utc::now())
+                .set_admin_password_hash(&phc, now)
                 .await
                 .map_err(seed_err)?;
-            store.delete_all_sessions().await.map_err(seed_err)?;
-            if let Err(err) = store
-                .record_audit(chrono::Utc::now(), "system", "password.reset", "", None)
-                .await
-            {
-                warn!(error = %err, "audit write failed for password.reset");
-            }
-            warn!("ADMIN_PASSWORD_RESET: admin password re-seeded from env, all sessions revoked");
-            Ok(())
+            phc
         }
-        (Some(_), None, true) => anyhow::bail!(
-            "ADMIN_PASSWORD_RESET=true but ADMIN_PASSWORD is not set; nothing to reset to"
-        ),
-        (None, Some(password), _) => {
-            ensure_seedable(password)?;
-            let phc = hash_password(password)?;
-            store
-                .set_admin_password_hash(&phc, chrono::Utc::now())
-                .await
-                .map_err(seed_err)?;
-            info!("admin credential seeded from ADMIN_PASSWORD");
-            Ok(())
-        }
-        (None, None, _) => anyhow::bail!(
-            "no admin credential in the store and no ADMIN_PASSWORD in the environment; \
+        (None, None) => anyhow::bail!(
+            "no account in the store and no ADMIN_PASSWORD in the environment; \
              refusing to serve an unauthenticatable API"
         ),
-    }
+    };
+    store
+        .create_user(
+            &uuid::Uuid::new_v4().to_string(),
+            &email,
+            &phc,
+            vms_domain::Role::Owner,
+            None,
+            now,
+        )
+        .await
+        .map_err(seed_err)?;
+    info!(%email, "seeded the owner account");
+    Ok(())
+}
+
+/// Put only the pre-users credential in place, so a test can prove the
+/// carry-over path that a real upgrade takes.
+#[cfg(test)]
+pub async fn seed_admin_credential_for_test(store: &dyn Store, password: &str) {
+    let phc = hash_password(password).expect("hash");
+    store
+        .set_admin_password_hash(&phc, chrono::Utc::now())
+        .await
+        .expect("store the legacy credential");
 }
 
 fn seed_err(err: StoreError) -> anyhow::Error {
@@ -167,29 +234,70 @@ pub fn clear_cookie_value(secure: bool) -> String {
     format!("{SESSION_COOKIE}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0{secure}")
 }
 
-async fn session_alive(state: &AppState, headers: &HeaderMap) -> bool {
-    match session_cookie(headers) {
-        // A store failure answers 401, not 500: fail closed on the auth boundary.
-        Some(id) => state
-            .store
-            .session_is_valid(&id, Utc::now())
-            .await
-            .unwrap_or(false),
-        None => false,
-    }
+/// Who is asking, or nobody.
+pub async fn session_user(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Option<crate::store::SessionUser> {
+    let id = session_cookie(headers)?;
+    state
+        .store
+        .session_user(&id, Utc::now())
+        .await
+        .ok()
+        .flatten()
 }
 
-/// The one layer in front of every human-facing route.
-pub async fn require_session(
+async fn session_alive(state: &AppState, headers: &HeaderMap) -> bool {
+    // A store failure answers 401, not 500: fail closed on the auth boundary.
+    session_user(state, headers).await.is_some()
+}
+
+/// What a group of routes needs of whoever is asking.
+async fn require(
+    state: AppState,
+    request: Request,
+    next: Next,
+    allowed: fn(&vms_domain::Role) -> bool,
+) -> Response {
+    let Some(who) = session_user(&state, request.headers()).await else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    if !allowed(&who.role) {
+        // 403 rather than 404: the route exists, and pretending otherwise to
+        // somebody already logged in helps nobody.
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let mut request = request;
+    request.extensions_mut().insert(who);
+    next.run(request).await
+}
+
+/// Anyone logged in may read.
+pub async fn require_viewer(
     State(state): State<AppState>,
     request: Request,
     next: Next,
 ) -> Response {
-    if session_alive(&state, request.headers()).await {
-        next.run(request).await
-    } else {
-        StatusCode::UNAUTHORIZED.into_response()
-    }
+    require(state, request, next, |_| true).await
+}
+
+/// Running the fleet: gateways, sources, policies, recordings, live.
+pub async fn require_technician(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    require(state, request, next, vms_domain::Role::can_operate).await
+}
+
+/// Changing the system itself: people and plugins.
+pub async fn require_owner(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    require(state, request, next, vms_domain::Role::is_owner).await
 }
 
 /// Count one wrong password and say how long the run is, for the audit row.
@@ -210,6 +318,11 @@ async fn count_wrong_password(state: &AppState) -> (Duration, String) {
 
 #[derive(serde::Deserialize)]
 pub struct LoginRequest {
+    /// Missing is empty is "no such account": a request that forgot the field
+    /// gets the same 401 as a wrong one, rather than a 422 that says the
+    /// shape changed.
+    #[serde(default)]
+    pub email: String,
     pub password: String,
 }
 
@@ -217,28 +330,41 @@ pub async fn auth_login(
     State(state): State<AppState>,
     Json(request): Json<LoginRequest>,
 ) -> Response {
-    let stored = match state.store.admin_password_hash().await {
-        Ok(Some(phc)) => phc,
-        Ok(None) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    let email = request.email.trim().to_lowercase();
+    let user = match state.store.user_by_email(&email).await {
+        Ok(user) => user,
         Err(err) => return crate::store_status(err).into_response(),
     };
-    if !verify_password(&request.password, &stored) {
+    // A disabled account and a wrong password answer the same way, at the same
+    // speed: telling them apart is how a login page becomes a list of who
+    // works here.
+    let ok = user
+        .as_ref()
+        .filter(|user| !user.disabled)
+        .is_some_and(|user| verify_password(&request.password, &user.password_hash));
+    if !ok {
         let (delay, detail) = count_wrong_password(&state).await;
-        crate::audit(&state, "admin", "login.failed", "", Some(&detail)).await;
+        crate::audit(&state, &email, "login.failed", "", Some(&detail)).await;
         tokio::time::sleep(delay).await;
         return StatusCode::UNAUTHORIZED.into_response();
     }
+    let user = user.expect("verified above");
     state.login_throttle.lock().await.reset();
     let session_id = mint_session_id();
     let now = Utc::now();
     if let Err(err) = state
         .store
-        .create_session(&session_id, now, now + chrono::Duration::days(SESSION_DAYS))
+        .create_session(
+            &session_id,
+            &user.id,
+            now,
+            now + chrono::Duration::days(SESSION_DAYS),
+        )
         .await
     {
         return crate::store_status(err).into_response();
     }
-    crate::audit(&state, "admin", "login.ok", "", None).await;
+    crate::audit(&state, &user.email, "login.ok", user.role.as_str(), None).await;
     (
         StatusCode::NO_CONTENT,
         [(
@@ -277,15 +403,21 @@ pub struct ChangePasswordRequest {
     pub new_password: String,
 }
 
-const MIN_PASSWORD_LEN: usize = 12;
+pub const MIN_PASSWORD_LEN: usize = 12;
 
 pub async fn auth_change_password(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(request): Json<ChangePasswordRequest>,
 ) -> Response {
-    let stored = match state.store.admin_password_hash().await {
-        Ok(Some(phc)) => phc,
-        Ok(None) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    // Whoever is sitting in the session changes their own password, not the
+    // one shared password.
+    let Some(who) = session_user(&state, &headers).await else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let stored = match state.store.user_by_email(&who.email).await {
+        Ok(Some(user)) => user.password_hash,
+        Ok(None) => return StatusCode::UNAUTHORIZED.into_response(),
         Err(err) => return crate::store_status(err).into_response(),
     };
     if !verify_password(&request.current, &stored) {
@@ -294,7 +426,14 @@ pub async fn auth_change_password(
         // login does, and leaves a row of its own so the count a failed login
         // reports is not covering attempts nothing recorded.
         let (delay, detail) = count_wrong_password(&state).await;
-        crate::audit(&state, "admin", "password.change.failed", "", Some(&detail)).await;
+        crate::audit(
+            &state,
+            &who.email,
+            "password.change.failed",
+            "",
+            Some(&detail),
+        )
+        .await;
         tokio::time::sleep(delay).await;
         return StatusCode::FORBIDDEN.into_response();
     }
@@ -307,23 +446,33 @@ pub async fn auth_change_password(
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
     let now = Utc::now();
-    // Store the new hash, revoke everything, then re-mint for the caller so
-    // the dashboard they are sitting in does not log itself out.
-    if let Err(err) = state.store.set_admin_password_hash(&phc, now).await {
+    // Store the new hash, revoke this user's sessions, then re-mint for the
+    // caller so the dashboard they are sitting in does not log itself out.
+    // Other people's sessions are none of this change's business.
+    if let Err(err) = state
+        .store
+        .update_user(&who.id, None, Some(&phc), None, None, now)
+        .await
+    {
         return crate::store_status(err).into_response();
     }
-    if let Err(err) = state.store.delete_all_sessions().await {
+    if let Err(err) = state.store.delete_sessions_of(&who.id).await {
         return crate::store_status(err).into_response();
     }
     let session_id = mint_session_id();
     if let Err(err) = state
         .store
-        .create_session(&session_id, now, now + chrono::Duration::days(SESSION_DAYS))
+        .create_session(
+            &session_id,
+            &who.id,
+            now,
+            now + chrono::Duration::days(SESSION_DAYS),
+        )
         .await
     {
         return crate::store_status(err).into_response();
     }
-    crate::audit(&state, "admin", "password.changed", "", None).await;
+    crate::audit(&state, &who.email, "password.changed", "", None).await;
     (
         StatusCode::NO_CONTENT,
         [(
@@ -347,7 +496,9 @@ mod tests {
     async fn seeding_refuses_to_run_without_any_credential() {
         let store = store().await;
         assert!(
-            seed_admin_credential(&store, None, false).await.is_err(),
+            seed_credentials(&store, "admin@localhost", None, false)
+                .await
+                .is_err(),
             "no stored hash and no ADMIN_PASSWORD must refuse to start"
         );
     }
@@ -355,47 +506,86 @@ mod tests {
     #[tokio::test]
     async fn first_boot_seeds_from_env_and_later_boots_ignore_env() {
         let store = store().await;
-        seed_admin_credential(&store, Some("first boot password"), false)
-            .await
-            .unwrap();
+        seed_credentials(
+            &store,
+            "admin@localhost",
+            Some("first boot password"),
+            false,
+        )
+        .await
+        .unwrap();
         let seeded = store.admin_password_hash().await.unwrap().unwrap();
         assert!(verify_password("first boot password", &seeded));
 
         // A changed env var without the reset flag must not overwrite.
-        seed_admin_credential(&store, Some("attacker sets a new env"), false)
-            .await
-            .unwrap();
+        seed_credentials(
+            &store,
+            "admin@localhost",
+            Some("attacker sets a new env"),
+            false,
+        )
+        .await
+        .unwrap();
         let unchanged = store.admin_password_hash().await.unwrap().unwrap();
         assert_eq!(seeded, unchanged);
 
         // And a boot with no env at all is fine once a hash is stored.
-        seed_admin_credential(&store, None, false).await.unwrap();
+        seed_credentials(&store, "admin@localhost", None, false)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
     async fn forced_reset_reseeds_and_wipes_sessions() {
         let store = store().await;
         let now = chrono::Utc::now();
-        seed_admin_credential(&store, Some("original password!"), false)
+        seed_credentials(&store, "admin@localhost", Some("original password!"), false)
             .await
             .unwrap();
+        let owner = store.users().await.unwrap().remove(0);
         store
-            .create_session("old-session", now, now + chrono::Duration::days(7))
+            .create_session(
+                "old-session",
+                &owner.id,
+                now,
+                now + chrono::Duration::days(7),
+            )
             .await
             .unwrap();
 
-        seed_admin_credential(&store, Some("replacement password"), true)
+        seed_credentials(
+            &store,
+            "admin@localhost",
+            Some("replacement password"),
+            true,
+        )
+        .await
+        .unwrap();
+        // The login path reads users, so that is where a reset has to land.
+        let owner = store
+            .user_by_email("admin@localhost")
             .await
+            .unwrap()
             .unwrap();
-        let reseeded = store.admin_password_hash().await.unwrap().unwrap();
-        assert!(verify_password("replacement password", &reseeded));
+        assert!(verify_password(
+            "replacement password",
+            &owner.password_hash
+        ));
         assert!(
-            !store.session_is_valid("old-session", now).await.unwrap(),
+            store
+                .session_user("old-session", now)
+                .await
+                .unwrap()
+                .is_none(),
             "a forced reset must revoke every session"
         );
 
         // Reset without a password to reset to is a refusal, not a wipe.
-        assert!(seed_admin_credential(&store, None, true).await.is_err());
+        assert!(
+            seed_credentials(&store, "admin@localhost", None, true)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -404,41 +594,56 @@ mod tests {
         // must not be a back door around it.
         let store = store().await;
         assert!(
-            seed_admin_credential(&store, Some("short"), false)
+            seed_credentials(&store, "admin@localhost", Some("short"), false)
                 .await
                 .is_err(),
             "a first boot must not seed a weak credential"
         );
 
-        seed_admin_credential(&store, Some("a long enough password"), false)
+        seed_credentials(
+            &store,
+            "admin@localhost",
+            Some("a long enough password"),
+            false,
+        )
+        .await
+        .unwrap();
+        let owner = store
+            .user_by_email("admin@localhost")
             .await
+            .unwrap()
             .unwrap();
-        let before = store.admin_password_hash().await.unwrap().unwrap();
+        let before = owner.password_hash.clone();
         let now = chrono::Utc::now();
         store
-            .create_session("live", now, now + chrono::Duration::days(7))
+            .create_session("live", &owner.id, now, now + chrono::Duration::days(7))
             .await
             .unwrap();
 
         assert!(
-            seed_admin_credential(&store, Some("short"), true)
+            seed_credentials(&store, "admin@localhost", Some("short"), true)
                 .await
                 .is_err(),
             "a forced reset must not accept a weak credential either"
         );
         assert_eq!(
-            store.admin_password_hash().await.unwrap().unwrap(),
+            store
+                .user_by_email("admin@localhost")
+                .await
+                .unwrap()
+                .unwrap()
+                .password_hash,
             before,
             "a refused reset must leave the credential untouched"
         );
         assert!(
-            store.session_is_valid("live", now).await.unwrap(),
+            store.session_user("live", now).await.unwrap().is_some(),
             "a refused reset must not wipe sessions"
         );
 
         // A short env value on a normal boot with a stored credential is
         // ignored, not fatal — env is not consulted at all on that path.
-        seed_admin_credential(&store, Some("short"), false)
+        seed_credentials(&store, "admin@localhost", Some("short"), false)
             .await
             .unwrap();
     }

@@ -193,6 +193,7 @@
   "app.sources.confirmRemove": "¿Quitar esta fuente? La pasarela deja de llevarla; las grabaciones ya hechas se conservan.",
   "app.auth.title": "Iniciar sesión",
   "app.auth.subtitle": "Este panel controla cámaras. Necesita saber quién eres.",
+  "app.auth.email": "Correo",
   "app.auth.password": "Contraseña",
   "app.auth.signIn": "Iniciar sesión",
   "app.auth.failed": "Esa contraseña no fue aceptada.",
@@ -238,5 +239,18 @@
   "app.stat.sub.uptime": "{covered}% de la semana reportado",
   "app.health.week": "{uptime}% activa en 7 días · {reconnects} reconexiones · {covered}% de la semana reportado",
   "app.health.none": "Todavía sin historial",
-  "app.health.loading": "Leyendo el historial…"
+  "app.health.loading": "Leyendo el historial…",
+  "app.users.title": "Personas",
+  "app.users.subtitle": "Quién puede entrar y qué puede hacer.",
+  "app.users.email": "Correo",
+  "app.users.password": "Contraseña",
+  "app.users.role": "Rol",
+  "app.users.customer": "Cliente (opcional)",
+  "app.users.add": "Añadir persona",
+  "app.users.scopeNote": "Un acceso limitado a un cliente es de solo lectura: ve la flota de ese cliente y nada más.",
+  "app.users.scopedTo": "limitado a",
+  "app.users.disabled": "desactivado",
+  "app.users.disable": "Desactivar",
+  "app.users.enable": "Activar",
+  "app.users.failed": "El cambio fue rechazado"
 }
