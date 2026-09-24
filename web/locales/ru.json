@@ -258,5 +258,13 @@
   "app.plugins.tokenEnv": "Переменная с токеном (необязательно)",
   "app.plugins.customer": "Клиент (необязательно)",
   "app.plugins.connect": "Подключить плагин",
-  "app.plugins.connectFailed": "Плагин не ответил, ничего не сохранено"
+  "app.plugins.connectFailed": "Плагин не ответил, ничего не сохранено",
+  "app.audit.title": "Журнал аудита",
+  "app.audit.when": "Когда",
+  "app.audit.who": "Кто",
+  "app.audit.what": "Что",
+  "app.audit.subject": "Над чем",
+  "app.audit.export": "Выгрузить CSV",
+  "app.audit.intact": "проверено строк: {checked}, до появления цепочки: {unchained}",
+  "app.audit.broken": "Журнал правили: цепочка рвётся на {row}"
 }

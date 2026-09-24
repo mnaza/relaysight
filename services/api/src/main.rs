@@ -343,6 +343,8 @@ fn build_router(state: AppState) -> Router {
         ));
     let owned = Router::new()
         .route("/api/v1/audit", get(audit_entries))
+        .route("/api/v1/audit/verify", get(audit_verify))
+        .route("/api/v1/audit/export", get(audit_export))
         .route("/api/v1/users", get(list_users).post(create_user))
         .route("/api/v1/users/{user_id}", post(update_user))
         .route("/api/v1/plugins/reload", post(plugins_reload))
@@ -1695,6 +1697,72 @@ async fn visible_to(state: &AppState, who: &crate::store::SessionUser) -> Option
         }
     }
     Some(visible)
+}
+
+/// Has anybody edited the audit log?
+///
+/// The answer is a number and a place, not a yes: rows written before the
+/// chain existed cannot be checked, and saying they are sound would be the
+/// dishonest reading.
+async fn audit_verify(
+    State(state): State<AppState>,
+) -> Result<Json<crate::store::AuditIntegrity>, StatusCode> {
+    let integrity = state.store.verify_audit().await.map_err(store_status)?;
+    if let Some(broken) = &integrity.broken_at {
+        warn!(row = %broken, "the audit chain is broken; somebody changed the log");
+    }
+    // The head hash in the journal is what makes a wholesale rewrite of the
+    // table detectable: a rewritten chain verifies against itself and not
+    // against what was printed yesterday.
+    if let Some(head) = &integrity.head {
+        info!(head = %head, checked = integrity.checked, "audit chain verified");
+    }
+    Ok(Json(integrity))
+}
+
+/// The audit log as CSV, hashes included, so an auditor can check the chain
+/// outside this system rather than taking its word for it.
+async fn audit_export(
+    State(state): State<AppState>,
+) -> Result<axum::response::Response, StatusCode> {
+    let entries = state
+        .store
+        .audit_entries(100_000)
+        .await
+        .map_err(store_status)?;
+    let mut csv = String::from("at,actor,action,subject,detail\n");
+    for entry in entries.iter().rev() {
+        csv.push_str(&format!(
+            "{},{},{},{},{}\n",
+            csv_field(&entry.at.to_rfc3339()),
+            csv_field(&entry.actor),
+            csv_field(&entry.action),
+            csv_field(&entry.subject),
+            csv_field(entry.detail.as_deref().unwrap_or("")),
+        ));
+    }
+    use axum::response::IntoResponse as _;
+    Ok((
+        StatusCode::OK,
+        [
+            (axum::http::header::CONTENT_TYPE, "text/csv; charset=utf-8"),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                "attachment; filename=\"audit.csv\"",
+            ),
+        ],
+        csv,
+    )
+        .into_response())
+}
+
+/// A field a spreadsheet will read back as what it was.
+fn csv_field(value: &str) -> String {
+    if value.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_owned()
+    }
 }
 
 /// Everybody who can get in, and what they may do.
@@ -3564,6 +3632,108 @@ mod tests {
         );
     }
 
+    /// The audit log was a table, and a table is something anybody with
+    /// database access can edit without leaving a mark.
+    #[tokio::test]
+    async fn editing_the_audit_log_breaks_the_chain_and_says_where() {
+        let state = test_state().await;
+        seed_admin(&state).await;
+        let owner = login_cookie(&state).await;
+        for subject in ["one", "two", "three"] {
+            audit(&state, ADMIN_EMAIL, "test.event", subject, None).await;
+        }
+
+        let (status, integrity) =
+            send(&state, with_cookie(get("/api/v1/audit/verify"), &owner)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(integrity["checked"].as_i64().unwrap() >= 3, "{integrity}");
+        assert!(integrity["broken_at"].is_null(), "{integrity}");
+        let head = integrity["head"].as_str().expect("a head hash").to_owned();
+
+        // Somebody edits a row in place, the way somebody with the database
+        // would.
+        let entries = state.store.audit_entries(10).await.unwrap();
+        let tampered = entries
+            .iter()
+            .find(|entry| entry.subject == "two")
+            .expect("the row is there");
+        state
+            .store
+            .tamper_with_audit_for_test(&tampered.subject, "something else")
+            .await;
+
+        let (_, integrity) = send(&state, with_cookie(get("/api/v1/audit/verify"), &owner)).await;
+        assert!(
+            integrity["broken_at"].as_str().is_some(),
+            "an edited log must not verify: {integrity}"
+        );
+        assert_ne!(
+            integrity["head"].as_str().unwrap_or_default(),
+            head,
+            "and the head must not still be what it was"
+        );
+    }
+
+    #[tokio::test]
+    async fn rows_written_before_the_chain_are_not_claimed_to_be_sound() {
+        let state = test_state().await;
+        seed_admin(&state).await;
+        let owner = login_cookie(&state).await;
+        state.store.unchained_audit_row_for_test().await;
+        audit(&state, ADMIN_EMAIL, "test.event", "after", None).await;
+
+        let (_, integrity) = send(&state, with_cookie(get("/api/v1/audit/verify"), &owner)).await;
+        assert_eq!(integrity["unchained"], 1, "{integrity}");
+        assert!(integrity["broken_at"].is_null(), "old rows are not a break");
+    }
+
+    #[tokio::test]
+    async fn the_audit_export_is_csv_an_auditor_can_open() {
+        let state = test_state().await;
+        seed_admin(&state).await;
+        let owner = login_cookie(&state).await;
+        audit(
+            &state,
+            ADMIN_EMAIL,
+            "test.event",
+            "a subject, with a comma",
+            Some("a \"quoted\" detail"),
+        )
+        .await;
+
+        let response = build_router(state.clone())
+            .oneshot(with_cookie(get("/api/v1/audit/export"), &owner))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[axum::http::header::CONTENT_TYPE],
+            "text/csv; charset=utf-8"
+        );
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let csv = String::from_utf8(body.to_vec()).unwrap();
+        assert!(csv.starts_with("at,actor,action,subject,detail"), "{csv}");
+        assert!(csv.contains("\"a subject, with a comma\""), "{csv}");
+        assert!(csv.contains("\"a \"\"quoted\"\" detail\""), "{csv}");
+    }
+
+    #[tokio::test]
+    async fn the_audit_log_is_an_owners_to_read() {
+        let state = test_state().await;
+        seed_admin(&state).await;
+        let technician = user_cookie(&state, "technician").await;
+        for uri in [
+            "/api/v1/audit",
+            "/api/v1/audit/verify",
+            "/api/v1/audit/export",
+        ] {
+            let (status, _) = send(&state, with_cookie(get(uri), &technician)).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{uri}");
+        }
+    }
+
     #[tokio::test]
     async fn an_owner_can_connect_a_plugin_and_disconnect_it() {
         let (endpoint, _) = fake_sink("sink-1", true).await;
@@ -3708,6 +3878,8 @@ mod tests {
             ("POST", "/api/v1/plugins/registrations"),
             ("POST", "/api/v1/plugins/registrations/p-1/delete"),
             ("GET", "/api/v1/audit"),
+            ("GET", "/api/v1/audit/verify"),
+            ("GET", "/api/v1/audit/export"),
         ] {
             let (status, _) =
                 send(&state, with_cookie(protected_request(method, uri), &viewer)).await;

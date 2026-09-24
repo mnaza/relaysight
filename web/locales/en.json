@@ -258,5 +258,13 @@
   "app.plugins.tokenEnv": "Token env var (optional)",
   "app.plugins.customer": "Customer (optional)",
   "app.plugins.connect": "Connect plugin",
-  "app.plugins.connectFailed": "That plugin did not answer, so nothing was saved"
+  "app.plugins.connectFailed": "That plugin did not answer, so nothing was saved",
+  "app.audit.title": "Audit log",
+  "app.audit.when": "When",
+  "app.audit.who": "Who",
+  "app.audit.what": "What",
+  "app.audit.subject": "On what",
+  "app.audit.export": "Export CSV",
+  "app.audit.intact": "{checked} rows verified, {unchained} written before the chain existed",
+  "app.audit.broken": "The log has been edited: the chain breaks at {row}"
 }

@@ -102,7 +102,7 @@
 - [ ] Reseller hierarchy and multi-tenancy
 - [ ] Advanced white-label domains/apps
 - [ ] SSO/OIDC/SAML
-- [ ] Audit/compliance controls
+- [x] Audit controls — a hash chain over every row, verification that says where it breaks, and a CSV export an auditor can check outside this system (`docs/AUDIT.md`); tamper-evident rather than tamper-proof, and no compliance framework has been run against it
 - [ ] HA control plane and SLA tooling
 
 ## After first installer feedback

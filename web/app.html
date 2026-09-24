@@ -144,6 +144,19 @@
           <div id="users-list" class="plugins-grid"></div>
         </section>
 
+        <section id="audit" class="panel" hidden>
+          <div class="panel-head">
+            <div><strong data-i18n="app.audit.title"></strong><div class="metric-sub" id="audit-integrity"></div></div>
+            <a id="audit-export" class="button small" href="api/v1/audit/export" download="audit.csv" data-i18n="app.audit.export"></a>
+          </div>
+          <div style="overflow-x:auto">
+            <table class="fleet-table">
+              <thead><tr><th data-i18n="app.audit.when"></th><th data-i18n="app.audit.who"></th><th data-i18n="app.audit.what"></th><th data-i18n="app.audit.subject"></th></tr></thead>
+              <tbody id="audit-body"></tbody>
+            </table>
+          </div>
+        </section>
+
         <section id="plugins" class="panel">
           <div class="panel-head">
             <div><strong data-i18n="app.plugins.title"></strong><div class="metric-sub" data-i18n="app.plugins.subtitle"></div></div>

@@ -147,3 +147,55 @@ test('a viewer is not offered the plugin form either', async () => {
   await startDashboard({ brand, locale: 'en', dict });
   assert.ok(document.querySelector('#plugin-form').hidden);
 });
+
+test('an owner sees the audit log and whether it has been edited', async () => {
+  const entries = [
+    { at: new Date().toISOString(), actor: 'admin@localhost', action: 'login.ok',
+      subject: 'owner', detail: null },
+  ];
+  const integrity = { checked: 42, unchained: 0, broken_at: null, head: '9f3cabc' };
+  const inner = globalThis.fetch;
+  globalThis.fetch = async (url, options) => {
+    const path = String(url);
+    if (path === 'api/v1/audit') return { ok: true, status: 200, json: async () => entries };
+    if (path === 'api/v1/audit/verify') return { ok: true, status: 200, json: async () => integrity };
+    return inner(url, options);
+  };
+  await startDashboard({ brand, locale: 'en', dict });
+  const panel = document.querySelector('#audit');
+  assert.ok(!panel.hidden, 'an owner sees the audit panel');
+  assert.match(panel.textContent, /login\.ok/);
+  assert.match(panel.textContent, /admin@localhost/);
+  // The number that matters is whether anybody edited it.
+  assert.match(panel.textContent, /42/);
+  assert.match(panel.textContent, /rows verified/);
+  assert.match(panel.textContent, /written before the chain existed/);
+});
+
+test('a broken audit chain is said plainly', async () => {
+  const inner = globalThis.fetch;
+  globalThis.fetch = async (url, options) => {
+    const path = String(url);
+    if (path === 'api/v1/audit') return { ok: true, status: 200, json: async () => [] };
+    if (path === 'api/v1/audit/verify') {
+      return { ok: true, status: 200,
+               json: async () => ({ checked: 3, unchained: 0, broken_at: 'row-9', head: 'abc' }) };
+    }
+    return inner(url, options);
+  };
+  await startDashboard({ brand, locale: 'en', dict });
+  const panel = document.querySelector('#audit');
+  assert.match(panel.textContent, new RegExp(dict['app.audit.broken'].split('{')[0].trim()));
+  assert.match(panel.textContent, /row-9/);
+});
+
+test('a technician is not shown the audit panel', async () => {
+  const inner = globalThis.fetch;
+  globalThis.fetch = async (url, options) => {
+    const path = String(url);
+    if (path.startsWith('api/v1/audit')) return { ok: false, status: 403, json: async () => ({}) };
+    return inner(url, options);
+  };
+  await startDashboard({ brand, locale: 'en', dict });
+  assert.ok(document.querySelector('#audit').hidden);
+});

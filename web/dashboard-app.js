@@ -69,6 +69,18 @@ export async function startDashboard({ brand, locale, dict }) {
 
   // Who can get in. A 403 means this session is not an owner, and the panel
   // stays away: showing it would be a promise the control plane then breaks.
+  // The audit log, and whether anybody has edited it. A 403 means this
+  // session is not an owner and the panel stays away.
+  async function loadAudit() {
+    try {
+      const [entries, integrity] = await Promise.all([
+        tryJson('api/v1/audit'),
+        tryJson('api/v1/audit/verify'),
+      ]);
+      return { entries, integrity };
+    } catch { return null; }
+  }
+
   async function loadUsers() {
     try { return await tryJson('api/v1/users'); }
     catch { return null; }
@@ -84,7 +96,7 @@ export async function startDashboard({ brand, locale, dict }) {
     catch { return []; }
   }
 
-  let [fleet, telemetry, edition, plugins, gateways, incidents, videoSources, alerts, health, users] = await Promise.all([loadFleet(), loadTelemetry(), loadEdition(), loadPlugins(), loadGateways(), loadIncidents(), loadSources(), loadEvents(), loadHealth(), loadUsers()]);
+  let [fleet, telemetry, edition, plugins, gateways, incidents, videoSources, alerts, health, users, auditLog] = await Promise.all([loadFleet(), loadTelemetry(), loadEdition(), loadPlugins(), loadGateways(), loadIncidents(), loadSources(), loadEvents(), loadHealth(), loadUsers(), loadAudit()]);
   let telemetryById = new Map(telemetry.map(camera => [camera.camera_id, camera]));
   const isLive = fleet.source === 'live';
   const sourceTag = document.querySelector('#fleet-source');
@@ -233,6 +245,40 @@ export async function startDashboard({ brand, locale, dict }) {
     }
   }
   paintUsers();
+
+  function paintAudit() {
+    const panel = document.querySelector('#audit');
+    const body = document.querySelector('#audit-body');
+    if (!panel || !body) return;
+    panel.hidden = !auditLog;
+    if (panel.hidden) return;
+    const { entries = [], integrity } = auditLog;
+    // Whether the log has been edited is the only thing on this screen that
+    // is worth reading before the rows themselves.
+    const line = document.querySelector('#audit-integrity');
+    if (integrity?.broken_at) {
+      line.textContent = t(dict, 'app.audit.broken').replace('{row}', integrity.broken_at);
+      line.className = 'metric-sub alert-critical';
+    } else {
+      line.textContent = t(dict, 'app.audit.intact')
+        .replace('{checked}', integrity?.checked ?? 0)
+        .replace('{unchained}', integrity?.unchained ?? 0);
+      line.className = 'metric-sub';
+    }
+    body.replaceChildren();
+    const cell = text => { const td = document.createElement('td'); td.textContent = text; return td; };
+    for (const entry of entries) {
+      const row = document.createElement('tr');
+      row.append(
+        cell(new Date(entry.at).toLocaleString()),
+        cell(entry.actor),
+        cell(entry.action),
+        cell(entry.detail ? `${entry.subject} · ${entry.detail}` : entry.subject || '—'),
+      );
+      body.appendChild(row);
+    }
+  }
+  paintAudit();
 
   document.querySelector('#user-form')?.addEventListener('submit', async event => {
     event.preventDefault();
@@ -773,11 +819,11 @@ export async function startDashboard({ brand, locale, dict }) {
     if (document.querySelector('.modal-backdrop.open')) return;
     let next;
     try {
-      next = await Promise.all([loadFleet(), loadTelemetry(), loadGateways(), loadIncidents(), loadSources(), loadEvents(), loadHealth(), loadUsers()]);
+      next = await Promise.all([loadFleet(), loadTelemetry(), loadGateways(), loadIncidents(), loadSources(), loadEvents(), loadHealth(), loadUsers(), loadAudit()]);
     } catch {
       return;
     }
-    [fleet, telemetry, gateways, incidents, videoSources, alerts, health, users] = next;
+    [fleet, telemetry, gateways, incidents, videoSources, alerts, health, users, auditLog] = next;
     telemetryById = new Map(telemetry.map(camera => [camera.camera_id, camera]));
     rows = fleet.customers.flatMap(customer => customer.sites.map(site => ({ customer, site })));
     allCameras = rows.flatMap(row => row.site.cameras);
@@ -785,6 +831,7 @@ export async function startDashboard({ brand, locale, dict }) {
     paintIncidents();
     paintAlerts();
     paintUsers();
+    paintAudit();
     render(currentFilter);
     renderGateways();
     renderSources();

@@ -1,9 +1,11 @@
 //! SQLite implementation of the fleet store.
 
+use sha2::{Digest, Sha256};
+
 use crate::store::{
-    CameraRecord, DeliveryView, DueDelivery, EventView, HealthHour, OrganizationRecord,
-    SessionUser, SiteRecord, Store, StoreError, StoredRegistration, StoredUser, parse_ts,
-    token_hash, ts,
+    AuditIntegrity, CameraRecord, DeliveryView, DueDelivery, EventView, HealthHour,
+    OrganizationRecord, SessionUser, SiteRecord, Store, StoreError, StoredRegistration, StoredUser,
+    parse_ts, token_hash, ts,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -908,6 +910,71 @@ impl Store for SqliteStore {
         Ok(())
     }
 
+    #[cfg(test)]
+    async fn tamper_with_audit_for_test(&self, subject: &str, replacement: &str) {
+        sqlx::query("UPDATE audit_log SET subject = ?2 WHERE subject = ?1")
+            .bind(subject)
+            .bind(replacement)
+            .execute(&self.pool)
+            .await
+            .expect("tamper");
+    }
+
+    #[cfg(test)]
+    async fn unchained_audit_row_for_test(&self) {
+        sqlx::query(
+            "INSERT INTO audit_log (id, at, actor, action, subject, detail)
+             VALUES (?1, ?2, 'system', 'before.the.chain', '', NULL)",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(ts(&Utc::now()))
+        .execute(&self.pool)
+        .await
+        .expect("write an unchained row");
+    }
+
+    async fn verify_audit(&self) -> Result<AuditIntegrity, StoreError> {
+        let rows = sqlx::query("SELECT * FROM audit_log ORDER BY rowid")
+            .fetch_all(&self.pool)
+            .await?;
+        let mut integrity = AuditIntegrity {
+            checked: 0,
+            unchained: 0,
+            broken_at: None,
+            head: None,
+        };
+        let mut expected_prev: Option<String> = None;
+        for row in &rows {
+            let id: String = row.try_get("id")?;
+            let hash: Option<String> = row.try_get("hash")?;
+            let Some(hash) = hash else {
+                // Written before the chain existed. Not sound, not broken.
+                integrity.unchained += 1;
+                continue;
+            };
+            let prev_hash: Option<String> = row.try_get("prev_hash")?;
+            let recomputed = audit_hash(
+                prev_hash.as_deref(),
+                &id,
+                &row.try_get::<String, _>("at")?,
+                &row.try_get::<String, _>("actor")?,
+                &row.try_get::<String, _>("action")?,
+                &row.try_get::<String, _>("subject")?,
+                row.try_get::<Option<String>, _>("detail")?.as_deref(),
+            );
+            // Two ways to be wrong: the row was edited, or the row before it
+            // was removed and this one now follows something else.
+            if recomputed != hash || (expected_prev.is_some() && prev_hash != expected_prev) {
+                integrity.broken_at = Some(id);
+                return Ok(integrity);
+            }
+            integrity.checked += 1;
+            expected_prev = Some(hash.clone());
+            integrity.head = Some(hash);
+        }
+        Ok(integrity)
+    }
+
     async fn plugin_registrations(&self) -> Result<Vec<StoredRegistration>, StoreError> {
         let rows = sqlx::query("SELECT * FROM plugin_registrations ORDER BY plugin_id")
             .fetch_all(&self.pool)
@@ -1230,18 +1297,45 @@ impl Store for SqliteStore {
         subject: &str,
         detail: Option<&str>,
     ) -> Result<(), StoreError> {
-        sqlx::query(
-            "INSERT INTO audit_log (id, at, actor, action, subject, detail)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        let id = uuid::Uuid::new_v4().to_string();
+        let at = ts(&at);
+        // Reading the head and writing the next row in one transaction: two
+        // rows sharing a predecessor would break the chain by themselves.
+        let mut transaction = self.pool.begin().await?;
+        // The last real link, skipping rows written before the chain existed:
+        // a row that links to nothing would restart the chain, and a chain
+        // that restarts is a chain that proves nothing about what came
+        // before the restart.
+        let prev_hash: Option<String> = sqlx::query_scalar(
+            "SELECT hash FROM audit_log WHERE hash IS NOT NULL ORDER BY rowid DESC LIMIT 1",
         )
-        .bind(uuid::Uuid::new_v4().to_string())
-        .bind(ts(&at))
+        .fetch_optional(&mut *transaction)
+        .await?
+        .flatten();
+        let hash = audit_hash(
+            prev_hash.as_deref(),
+            &id,
+            &at,
+            actor,
+            action,
+            subject,
+            detail,
+        );
+        sqlx::query(
+            "INSERT INTO audit_log (id, at, actor, action, subject, detail, prev_hash, hash)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        )
+        .bind(&id)
+        .bind(&at)
         .bind(actor)
         .bind(action)
         .bind(subject)
         .bind(detail)
-        .execute(&self.pool)
+        .bind(&prev_hash)
+        .bind(&hash)
+        .execute(&mut *transaction)
         .await?;
+        transaction.commit().await?;
         Ok(())
     }
 
@@ -1273,6 +1367,36 @@ impl Store for SqliteStore {
             .await?;
         Ok(())
     }
+}
+
+/// One row's place in the chain: everything it says, and what came before.
+///
+/// Hashing the id as well means a row cannot be swapped for another with the
+/// same contents written at the same moment.
+fn audit_hash(
+    prev_hash: Option<&str>,
+    id: &str,
+    at: &str,
+    actor: &str,
+    action: &str,
+    subject: &str,
+    detail: Option<&str>,
+) -> String {
+    let mut hasher = Sha256::new();
+    // Length-prefixed, so "ab" + "c" cannot hash the same as "a" + "bc".
+    for field in [
+        prev_hash.unwrap_or(""),
+        id,
+        at,
+        actor,
+        action,
+        subject,
+        detail.unwrap_or(""),
+    ] {
+        hasher.update(field.len().to_le_bytes());
+        hasher.update(field.as_bytes());
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 fn health_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<HealthHour, StoreError> {

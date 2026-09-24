@@ -14,6 +14,22 @@ use vms_domain::{
 };
 use vms_plugin_sdk::FleetEvent;
 
+/// What walking the audit chain found.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct AuditIntegrity {
+    /// Rows whose hash was recomputed and matched.
+    pub checked: i64,
+    /// Rows written before the chain existed, which cannot be checked and
+    /// are not claimed to be sound.
+    pub unchained: i64,
+    /// The id of the first row whose hash does not match what it should be,
+    /// which is where somebody edited, removed or reordered something.
+    pub broken_at: Option<String>,
+    /// The last hash in the chain. Recorded somewhere outside this database,
+    /// it is what makes a wholesale rewrite detectable too.
+    pub head: Option<String>,
+}
+
 /// A plugin registration that lives in the store rather than on disk.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct StoredRegistration {
@@ -446,6 +462,19 @@ pub trait Store: Send + Sync {
     /// `NotFound` when there is nothing to remove — a file-based plugin, for
     /// instance, which is not this table's to delete.
     async fn delete_plugin_registration(&self, plugin_id: &str) -> Result<(), StoreError>;
+
+    /// Edit a row in place, the way somebody with the database would. Test
+    /// only: nothing in the product may change a row that has been written.
+    #[cfg(test)]
+    async fn tamper_with_audit_for_test(&self, subject: &str, replacement: &str);
+
+    /// Write a row with no hashes, as everything before the chain existed
+    /// has. Test only.
+    #[cfg(test)]
+    async fn unchained_audit_row_for_test(&self);
+
+    /// Walk the audit chain and say whether it holds.
+    async fn verify_audit(&self) -> Result<AuditIntegrity, StoreError>;
 
     /// One audit row. Callers treat failure as loggable, never fatal.
     async fn record_audit(
