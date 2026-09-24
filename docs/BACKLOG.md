@@ -83,7 +83,7 @@
 
 - [x] Persist plugin definitions in the store instead of only `plugins.d` — connected from the dashboard by an owner, stored rows winning over files (`docs/PLUGIN-SDK.md`)
 - [x] Per-organization plugin binding — a registration scoped to a customer serves that customer's cameras for recording, clipping and analysis, with the default behind it (`docs/PLUGIN-SDK.md`)
-- [ ] Vault-backed plugin connection secrets
+- [x] Plugin connection secrets from a file — `token_file` beside `token_env`, read on every call so a rotation takes effect without a restart; this is what Vault's agent, Kubernetes secrets and Docker secrets all present, so no secret-manager client lives in the core (`docs/PLUGIN-SDK.md`)
 - [x] mTLS / service identity for plugin calls — a client certificate and a private CA by path, fatal when configured badly, proven end to end by `make check-plugin-mtls`
 - [x] Plugin timeouts and a circuit breaker — per-kind timeouts and a breaker that trips after three consecutive failures and cools off, visible on the plugin card (`docs/PLUGIN-SDK.md`)
 - [x] Resource limits for plugin containers — memory, CPU and process caps on the compose plugin profile (`docs/PLUGIN-SDK.md`)

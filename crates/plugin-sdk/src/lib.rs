@@ -43,6 +43,12 @@ pub struct PluginRegistration {
     pub enabled: bool,
     /// Environment variable that contains a bearer token for the plugin.
     pub token_env: Option<String>,
+    /// A file holding the bearer token instead. Vault's agent, Kubernetes
+    /// secrets and Docker secrets all present a secret as a file, and a file
+    /// is not in the process environment, the compose file, or whatever
+    /// started the process.
+    #[serde(default)]
+    pub token_file: Option<String>,
     /// Optional embedded manifest lets the UI show the plugin even when it is temporarily offline.
     pub manifest: Option<PluginManifest>,
 }

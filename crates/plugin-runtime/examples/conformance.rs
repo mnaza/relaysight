@@ -36,6 +36,7 @@ async fn main() -> ExitCode {
         placement: PluginPlacement::ControlPlane,
         enabled: true,
         token_env: std::env::var("PLUGIN_TOKEN_ENV").ok(),
+        token_file: std::env::var("PLUGIN_TOKEN_FILE").ok(),
         manifest: None,
     };
 

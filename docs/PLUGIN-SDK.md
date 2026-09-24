@@ -161,6 +161,26 @@ webhooks get 256 MiB and half a CPU, because that is what they do. Nothing
 here stops a plugin reaching the network — that is a network policy, and it
 belongs to whatever runs the containers.
 
+## Where a plugin's token lives
+
+A registration names one of two places, and the file wins when both are set:
+
+| | |
+| --- | --- |
+| `token_env` | an environment variable of the control plane |
+| `token_file` | a file holding the token |
+
+An environment variable is in the process environment, in the compose file,
+and in whatever started the process. A file is what Vault's agent, a
+Kubernetes secret and a Docker secret all produce, so naming one is the whole
+of using any of them — the control plane needs no client for any particular
+secret manager.
+
+The file is read on every call rather than cached, so a rotated secret takes
+effect without a restart. A named file that cannot be read sends **no** token
+rather than falling back to an environment variable that may be a stale copy
+of the one that was just rotated away.
+
 ## Service identity
 
 A plugin call is an HTTP request to somebody else's service carrying a bearer

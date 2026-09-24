@@ -1215,6 +1215,7 @@ async fn reload_plugins(state: &AppState) -> Result<(), StatusCode> {
             },
             enabled: row.enabled,
             token_env: row.token_env,
+            token_file: row.token_file,
             manifest: None,
         })
         .collect();
@@ -1246,6 +1247,7 @@ async fn create_plugin_registration(
         placement: vms_plugin_sdk::PluginPlacement::ControlPlane,
         enabled: true,
         token_env: request.token_env.clone(),
+        token_file: request.token_file.clone(),
         manifest: None,
     };
     let manifest = state
@@ -1260,6 +1262,7 @@ async fn create_plugin_registration(
         placement: request.placement,
         enabled: true,
         token_env: request.token_env,
+        token_file: request.token_file,
         customer_id: request.customer_id,
     };
     state

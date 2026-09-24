@@ -46,6 +46,47 @@ impl Default for Timeouts {
     }
 }
 
+/// The bearer token for a plugin, from a file if one is named and from the
+/// environment otherwise.
+///
+/// A file wins: a deployment that mounted a secret meant to use it, and
+/// falling back to a stale environment variable would send the old token to a
+/// plugin that has been given a new one.
+///
+/// Read on every call rather than cached, so a secret that is rotated under
+/// the process — which is what Vault's agent and a Kubernetes secret both do
+/// — takes effect without a restart.
+fn plugin_token(registration: &PluginRegistration) -> Option<String> {
+    if let Some(path) = registration
+        .token_file
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+    {
+        return match std::fs::read_to_string(path) {
+            // Trailing newlines are what every secret file has and no
+            // Authorization header wants.
+            Ok(token) if !token.trim().is_empty() => Some(token.trim().to_owned()),
+            Ok(_) => {
+                warn!(
+                    path,
+                    "the plugin token file is empty; calling without a token"
+                );
+                None
+            }
+            Err(error) => {
+                warn!(path, %error, "cannot read the plugin token file; calling without a token");
+                None
+            }
+        };
+    }
+    registration
+        .token_env
+        .as_deref()
+        .and_then(|name| env::var(name).ok())
+        .filter(|token| !token.is_empty())
+}
+
 /// Build the HTTP client every plugin call goes through, with whatever
 /// service identity the deployment configured.
 ///
@@ -589,9 +630,7 @@ impl PluginRegistry {
     ) -> anyhow::Result<T> {
         let url = format!("{}{}", registration.endpoint.trim_end_matches('/'), path);
         let mut request = self.client.request(method, url).timeout(timeout);
-        if let Some(token_env) = &registration.token_env
-            && let Ok(token) = env::var(token_env)
-        {
+        if let Some(token) = plugin_token(registration) {
             request = request.bearer_auth(token);
         }
         if let Some(body) = body {
@@ -1055,6 +1094,83 @@ mod tests {
             }
         });
         (endpoint, calls)
+    }
+
+    fn registration(token_env: Option<&str>, token_file: Option<&str>) -> PluginRegistration {
+        PluginRegistration {
+            endpoint: DEAD_ENDPOINT.into(),
+            placement: Default::default(),
+            enabled: true,
+            token_env: token_env.map(str::to_owned),
+            token_file: token_file.map(str::to_owned),
+            manifest: None,
+        }
+    }
+
+    #[test]
+    fn a_token_file_is_read_and_trimmed() {
+        // Every secret file ends with a newline and no Authorization header
+        // wants one.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        std::fs::write(&path, "s3cr3t\n").unwrap();
+        let token = plugin_token(&registration(None, path.to_str()));
+        assert_eq!(token.as_deref(), Some("s3cr3t"));
+    }
+
+    #[test]
+    fn a_token_file_wins_over_the_environment() {
+        // A deployment that mounted a secret meant to use it; falling back to
+        // a stale variable would send yesterday's token.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        std::fs::write(&path, "from-the-file").unwrap();
+        unsafe { env::set_var("TEST_PLUGIN_TOKEN_FILE_WINS", "from-the-env") };
+        let token = plugin_token(&registration(
+            Some("TEST_PLUGIN_TOKEN_FILE_WINS"),
+            path.to_str(),
+        ));
+        unsafe { env::remove_var("TEST_PLUGIN_TOKEN_FILE_WINS") };
+        assert_eq!(token.as_deref(), Some("from-the-file"));
+    }
+
+    #[test]
+    fn a_token_file_that_is_not_there_sends_no_token_rather_than_a_stale_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("absent");
+        unsafe { env::set_var("TEST_PLUGIN_TOKEN_MISSING_FILE", "from-the-env") };
+        let token = plugin_token(&registration(
+            Some("TEST_PLUGIN_TOKEN_MISSING_FILE"),
+            missing.to_str(),
+        ));
+        unsafe { env::remove_var("TEST_PLUGIN_TOKEN_MISSING_FILE") };
+        assert!(
+            token.is_none(),
+            "the deployment said where the secret is; the environment is not a second guess"
+        );
+    }
+
+    #[test]
+    fn a_rotated_token_takes_effect_without_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        std::fs::write(&path, "first").unwrap();
+        assert_eq!(
+            plugin_token(&registration(None, path.to_str())).as_deref(),
+            Some("first")
+        );
+        std::fs::write(&path, "second").unwrap();
+        assert_eq!(
+            plugin_token(&registration(None, path.to_str())).as_deref(),
+            Some("second")
+        );
+    }
+
+    #[test]
+    fn no_token_anywhere_is_no_token() {
+        assert!(plugin_token(&registration(None, None)).is_none());
+        assert!(plugin_token(&registration(Some("TEST_PLUGIN_TOKEN_UNSET"), None)).is_none());
+        assert!(plugin_token(&registration(None, Some("   "))).is_none());
     }
 
     #[test]

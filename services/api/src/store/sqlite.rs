@@ -920,6 +920,7 @@ impl Store for SqliteStore {
                     placement: row.try_get("placement")?,
                     enabled: row.try_get::<i64, _>("enabled")? != 0,
                     token_env: row.try_get("token_env")?,
+                    token_file: row.try_get("token_file")?,
                     customer_id: row.try_get("customer_id")?,
                 })
             })
@@ -933,18 +934,20 @@ impl Store for SqliteStore {
     ) -> Result<(), StoreError> {
         sqlx::query(
             "INSERT INTO plugin_registrations
-                 (plugin_id, endpoint, placement, enabled, token_env, customer_id, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 (plugin_id, endpoint, placement, enabled, token_env, token_file,
+                  customer_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(plugin_id) DO UPDATE SET
                  endpoint = excluded.endpoint, placement = excluded.placement,
                  enabled = excluded.enabled, token_env = excluded.token_env,
-                 customer_id = excluded.customer_id",
+                 token_file = excluded.token_file, customer_id = excluded.customer_id",
         )
         .bind(&registration.plugin_id)
         .bind(&registration.endpoint)
         .bind(&registration.placement)
         .bind(i64::from(registration.enabled))
         .bind(&registration.token_env)
+        .bind(&registration.token_file)
         .bind(&registration.customer_id)
         .bind(ts(&now))
         .execute(&self.pool)

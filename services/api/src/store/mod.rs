@@ -22,6 +22,9 @@ pub struct StoredRegistration {
     pub placement: String,
     pub enabled: bool,
     pub token_env: Option<String>,
+    /// A file holding the token instead: what a secret manager mounts.
+    #[serde(default)]
+    pub token_file: Option<String>,
     /// Set: this plugin is offered to that customer only.
     pub customer_id: Option<String>,
 }
