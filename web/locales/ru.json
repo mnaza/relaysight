@@ -233,5 +233,10 @@
   "app.alerts.declined": "не для этого получателя",
   "app.alerts.retrying": "повтор",
   "app.alerts.gaveUp": "сдался",
-  "app.alerts.nosinks": "плагин event_sink не зарегистрирован"
+  "app.alerts.nosinks": "плагин event_sink не зарегистрирован",
+  "app.stat.uptime": "Доступность, 7 дней",
+  "app.stat.sub.uptime": "отчёты покрыли {covered}% недели",
+  "app.health.week": "{uptime}% за 7 дней · переподключений: {reconnects} · отчёты покрыли {covered}% недели",
+  "app.health.none": "Истории пока нет",
+  "app.health.loading": "Читаю историю…"
 }

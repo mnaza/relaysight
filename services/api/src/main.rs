@@ -1,4 +1,5 @@
 mod auth;
+mod health;
 mod store;
 mod turn;
 
@@ -22,7 +23,7 @@ use std::{
 
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, Method, StatusCode, header::AUTHORIZATION},
     routing::{get, post},
 };
@@ -76,6 +77,9 @@ struct AppState {
     /// restart every camera looks silent until its gateway re-reports.
     incident_grace: Duration,
     incident_retention_days: i64,
+    /// How long the hourly rollups are kept. Thirty days is two screens of
+    /// history and a few hundred rows per camera.
+    health_retention_days: i64,
     audit_retention_days: i64,
     up_since: std::time::Instant,
 }
@@ -162,6 +166,10 @@ async fn main() -> anyhow::Result<()> {
         login_throttle: Arc::new(tokio::sync::Mutex::new(auth::LoginThrottle::default())),
         cookie_secure: env::var("AUTH_COOKIE_SECURE").is_ok_and(|value| value == "true"),
         incident_grace: Duration::from_secs(stale_camera_seconds.max(0) as u64),
+        health_retention_days: env::var("HEALTH_RETENTION_DAYS")
+            .ok()
+            .and_then(|raw| raw.parse().ok())
+            .unwrap_or(30),
         incident_retention_days: env::var("INCIDENT_RETENTION_DAYS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -271,6 +279,8 @@ fn build_router(state: AppState) -> Router {
             "/api/v1/cameras/{camera_id}/recordings",
             post(create_recording).get(camera_timeline),
         )
+        .route("/api/v1/health", get(fleet_health))
+        .route("/api/v1/cameras/{camera_id}/health", get(camera_health))
         .route("/api/v1/events", get(fleet_events))
         .route("/api/v1/events/test", post(test_event))
         .route("/api/v1/cameras/{camera_id}/clips", post(create_clip))
@@ -366,11 +376,17 @@ async fn camera_telemetry(
     if let Err(err) = state.store.upsert_fleet_identity(&batch, Utc::now()).await {
         return store_status(err);
     }
-    state
-        .camera_batches
-        .write()
-        .await
-        .insert(batch.gateway_id.clone(), batch);
+    // History is the time between this report and the last one from the same
+    // gateway, so the fold happens before the new batch replaces the old.
+    let mut batches = state.camera_batches.write().await;
+    let folded = crate::health::samples(batches.get(&batch.gateway_id), &batch);
+    batches.insert(batch.gateway_id.clone(), batch);
+    drop(batches);
+    if let Err(err) = state.store.fold_health(&folded).await {
+        // Losing an hour of history is not worth refusing telemetry over: the
+        // fleet's current state is the more important half of this request.
+        warn!(error = %err, "health history was not folded in");
+    }
     StatusCode::NO_CONTENT
 }
 
@@ -1318,6 +1334,77 @@ async fn create_recording(
     ))
 }
 
+/// How long a window of history to answer with, in days.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct HealthWindow {
+    #[serde(default = "default_health_days")]
+    days: i64,
+}
+
+fn default_health_days() -> i64 {
+    7
+}
+
+/// One camera's history, hour by hour, with the summary the dashboard shows.
+async fn camera_health(
+    State(state): State<AppState>,
+    Path(camera_id): Path<String>,
+    Query(window): Query<HealthWindow>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let days = window.days.clamp(1, 90);
+    let since = Utc::now() - chrono::Duration::days(days);
+    let hours = state
+        .store
+        .camera_health(&camera_id, since)
+        .await
+        .map_err(store_status)?;
+    Ok(Json(health_answer(days, hours)))
+}
+
+/// The same across every camera, which is what the overview needs.
+async fn fleet_health(
+    State(state): State<AppState>,
+    Query(window): Query<HealthWindow>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let days = window.days.clamp(1, 90);
+    let since = Utc::now() - chrono::Duration::days(days);
+    let hours = state
+        .store
+        .fleet_health(since)
+        .await
+        .map_err(store_status)?;
+    Ok(Json(health_answer(days, hours)))
+}
+
+/// The summary and the hours behind it.
+///
+/// `uptime_percent` is over time that was actually reported, and
+/// `covered_percent` says how much of the window that was. A camera nobody
+/// heard from for six days is not 100% up; it is 100% of a day, and the
+/// second number is what stops the first from lying.
+fn health_answer(days: i64, hours: Vec<crate::store::HealthHour>) -> serde_json::Value {
+    let counted: i64 = hours.iter().map(|hour| hour.counted_seconds()).sum();
+    let healthy: i64 = hours.iter().map(|hour| hour.healthy_seconds).sum();
+    let offline: i64 = hours.iter().map(|hour| hour.offline_seconds).sum();
+    let warning: i64 = hours.iter().map(|hour| hour.warning_seconds).sum();
+    let reconnects: i64 = hours.iter().map(|hour| hour.reconnects).sum();
+    let window = days * 24 * 3_600;
+    serde_json::json!({
+        "days": days,
+        "healthy_seconds": healthy,
+        "warning_seconds": warning,
+        "offline_seconds": offline,
+        "counted_seconds": counted,
+        "reconnects": reconnects,
+        "uptime_percent": (counted > 0).then(|| {
+            (healthy as f64 * 1_000.0 / counted as f64).round() / 10.0
+        }),
+        "covered_percent": (window > 0)
+            .then(|| (counted as f64 * 1_000.0 / window as f64).round() / 10.0),
+        "hours": hours,
+    })
+}
+
 /// What has been raised lately and whether each sink took it. An alert
 /// nobody delivered is exactly what an operator needs to see, so the failure
 /// travels with the event rather than staying in a log.
@@ -1879,6 +1966,14 @@ async fn retention_pass(state: &AppState) {
     {
         warn!(error = %err, "retention could not prune closed incidents");
     }
+    if state.health_retention_days > 0
+        && let Err(err) = state
+            .store
+            .delete_health_before(Utc::now() - chrono::Duration::days(state.health_retention_days))
+            .await
+    {
+        warn!(error = %err, "retention could not prune health history");
+    }
     // Events age out with incidents: they are the same outages, said out
     // loud, and keeping the shouting longer than the record would be odd.
     if state.incident_retention_days > 0
@@ -2261,6 +2356,7 @@ mod tests {
             )),
             cookie_secure: false,
             incident_grace: Duration::ZERO,
+            health_retention_days: 30,
             incident_retention_days: 90,
             audit_retention_days: 0,
             up_since: std::time::Instant::now(),
@@ -2646,6 +2742,92 @@ mod tests {
             assert!(pair[1].unwrap() > pair[0].unwrap(), "{waits:?}");
         }
         assert_eq!(retry_after(4), None, "four refusals is enough");
+    }
+
+    /// Two reports twenty seconds apart are twenty seconds of history, and
+    /// the numbers on the way back out are computed from them rather than
+    /// guessed.
+    #[tokio::test]
+    async fn telemetry_becomes_a_history_somebody_can_read() {
+        let state = test_state().await;
+        seed_admin(&state).await;
+        let cookie = login_cookie(&state).await;
+
+        let first = Utc::now() - chrono::Duration::seconds(40);
+        let second = first + chrono::Duration::seconds(20);
+        let third = second + chrono::Duration::seconds(20);
+        for (at, status) in [
+            (first, HealthStatus::Healthy),
+            (second, HealthStatus::Healthy),
+            (third, HealthStatus::Offline),
+        ] {
+            let (code, _) = send(
+                &state,
+                post(
+                    "/api/v1/cameras/telemetry",
+                    Some(SHARED_TOKEN),
+                    serde_json::to_value(typed_batch("gw-1", "cam-1", status, at, None)).unwrap(),
+                ),
+            )
+            .await;
+            assert_eq!(code, StatusCode::NO_CONTENT);
+        }
+
+        let (code, health) = send(
+            &state,
+            with_cookie(get("/api/v1/cameras/cam-1/health?days=7"), &cookie),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(
+            health["healthy_seconds"], 20,
+            "the first report has nothing behind it: {health}"
+        );
+        assert_eq!(health["offline_seconds"], 20);
+        assert_eq!(health["counted_seconds"], 40);
+        assert_eq!(health["uptime_percent"], 50.0);
+        assert!(
+            health["covered_percent"].as_f64().is_some_and(|c| c < 1.0),
+            "forty seconds is not a week: {health}"
+        );
+        assert!(!health["hours"].as_array().unwrap().is_empty());
+
+        // The fleet answer is the same history, summed.
+        let (code, fleet) = send(&state, with_cookie(get("/api/v1/health?days=7"), &cookie)).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(fleet["counted_seconds"], 40);
+        assert_eq!(fleet["uptime_percent"], 50.0);
+    }
+
+    #[tokio::test]
+    async fn a_camera_nobody_has_heard_from_has_no_history_rather_than_perfect_uptime() {
+        let state = test_state().await;
+        seed_admin(&state).await;
+        let cookie = login_cookie(&state).await;
+        let (code, health) = send(
+            &state,
+            with_cookie(get("/api/v1/cameras/ghost/health"), &cookie),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(health["counted_seconds"], 0);
+        assert!(
+            health["uptime_percent"].is_null(),
+            "nothing is known, and saying 100% would be a lie: {health}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_window_longer_than_the_store_keeps_is_clamped() {
+        let state = test_state().await;
+        seed_admin(&state).await;
+        let cookie = login_cookie(&state).await;
+        let (_, health) = send(
+            &state,
+            with_cookie(get("/api/v1/cameras/cam-1/health?days=9000"), &cookie),
+        )
+        .await;
+        assert_eq!(health["days"], 90);
     }
 
     #[tokio::test]

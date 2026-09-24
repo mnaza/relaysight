@@ -233,5 +233,10 @@
   "app.alerts.declined": "no es para este destino",
   "app.alerts.retrying": "reintentando",
   "app.alerts.gaveUp": "se dio por vencido",
-  "app.alerts.nosinks": "ningún plugin event_sink registrado"
+  "app.alerts.nosinks": "ningún plugin event_sink registrado",
+  "app.stat.uptime": "Disponibilidad, 7 días",
+  "app.stat.sub.uptime": "{covered}% de la semana reportado",
+  "app.health.week": "{uptime}% activa en 7 días · {reconnects} reconexiones · {covered}% de la semana reportado",
+  "app.health.none": "Todavía sin historial",
+  "app.health.loading": "Leyendo el historial…"
 }

@@ -1,8 +1,8 @@
 //! SQLite implementation of the fleet store.
 
 use crate::store::{
-    CameraRecord, DeliveryView, DueDelivery, EventView, OrganizationRecord, SiteRecord, Store,
-    StoreError, parse_ts, token_hash, ts,
+    CameraRecord, DeliveryView, DueDelivery, EventView, HealthHour, OrganizationRecord, SiteRecord,
+    Store, StoreError, parse_ts, token_hash, ts,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -670,6 +670,95 @@ impl Store for SqliteStore {
         rows.iter().map(policy_from_row).collect()
     }
 
+    async fn fold_health(&self, samples: &[crate::health::HealthSample]) -> Result<(), StoreError> {
+        if samples.is_empty() {
+            return Ok(());
+        }
+        let mut transaction = self.pool.begin().await?;
+        for sample in samples {
+            let (healthy, warning, offline) = match sample.status {
+                vms_domain::HealthStatus::Healthy => (sample.seconds, 0, 0),
+                vms_domain::HealthStatus::Warning => (0, sample.seconds, 0),
+                vms_domain::HealthStatus::Offline => (0, 0, sample.seconds),
+            };
+            // An average needs a count, and a camera that reports no rate
+            // must not drag one down: only a sample that carried a number is
+            // counted towards it.
+            let rated = i64::from(sample.fps.is_some() || sample.bitrate_kbps.is_some());
+            sqlx::query(
+                "INSERT INTO camera_health_hours
+                     (camera_id, hour, healthy_seconds, warning_seconds, offline_seconds,
+                      reconnects, fps_total, bitrate_total, samples, worst_loss)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT(camera_id, hour) DO UPDATE SET
+                     healthy_seconds = healthy_seconds + excluded.healthy_seconds,
+                     warning_seconds = warning_seconds + excluded.warning_seconds,
+                     offline_seconds = offline_seconds + excluded.offline_seconds,
+                     reconnects = reconnects + excluded.reconnects,
+                     fps_total = fps_total + excluded.fps_total,
+                     bitrate_total = bitrate_total + excluded.bitrate_total,
+                     samples = samples + excluded.samples,
+                     worst_loss = MAX(worst_loss, excluded.worst_loss)",
+            )
+            .bind(&sample.camera_id)
+            .bind(ts(&sample.hour))
+            .bind(healthy)
+            .bind(warning)
+            .bind(offline)
+            .bind(sample.reconnects)
+            .bind(f64::from(sample.fps.unwrap_or(0.0)))
+            .bind(f64::from(sample.bitrate_kbps.unwrap_or(0)))
+            .bind(rated)
+            .bind(i64::try_from(sample.packet_loss).unwrap_or(i64::MAX))
+            .execute(&mut *transaction)
+            .await?;
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    async fn camera_health(
+        &self,
+        camera_id: &str,
+        since: DateTime<Utc>,
+    ) -> Result<Vec<HealthHour>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT * FROM camera_health_hours WHERE camera_id = ?1 AND hour >= ?2 ORDER BY hour",
+        )
+        .bind(camera_id)
+        .bind(ts(&since))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(health_from_row).collect()
+    }
+
+    async fn fleet_health(&self, since: DateTime<Utc>) -> Result<Vec<HealthHour>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT hour,
+                    SUM(healthy_seconds) AS healthy_seconds,
+                    SUM(warning_seconds) AS warning_seconds,
+                    SUM(offline_seconds) AS offline_seconds,
+                    SUM(reconnects) AS reconnects,
+                    SUM(fps_total) AS fps_total,
+                    SUM(bitrate_total) AS bitrate_total,
+                    SUM(samples) AS samples,
+                    MAX(worst_loss) AS worst_loss
+             FROM camera_health_hours WHERE hour >= ?1 GROUP BY hour ORDER BY hour",
+        )
+        .bind(ts(&since))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(health_from_row).collect()
+    }
+
+    async fn delete_health_before(&self, cutoff: DateTime<Utc>) -> Result<(), StoreError> {
+        sqlx::query("DELETE FROM camera_health_hours WHERE hour < ?1")
+            .bind(ts(&cutoff))
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     async fn record_event(
         &self,
         event: &FleetEvent,
@@ -977,6 +1066,23 @@ impl Store for SqliteStore {
             .await?;
         Ok(())
     }
+}
+
+fn health_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<HealthHour, StoreError> {
+    let samples: i64 = row.try_get("samples")?;
+    let fps_total: f64 = row.try_get("fps_total")?;
+    let bitrate_total: f64 = row.try_get("bitrate_total")?;
+    Ok(HealthHour {
+        hour: parse_ts(row.try_get("hour")?)?,
+        healthy_seconds: row.try_get("healthy_seconds")?,
+        warning_seconds: row.try_get("warning_seconds")?,
+        offline_seconds: row.try_get("offline_seconds")?,
+        reconnects: row.try_get("reconnects")?,
+        average_fps: (samples > 0).then(|| (fps_total / samples as f64) as f32),
+        average_bitrate_kbps: (samples > 0)
+            .then(|| (bitrate_total / samples as f64).round() as u32),
+        worst_loss: row.try_get("worst_loss")?,
+    })
 }
 
 fn event_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<FleetEvent, StoreError> {

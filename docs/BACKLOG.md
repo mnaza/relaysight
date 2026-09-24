@@ -109,7 +109,7 @@
 - [ ] Customer login
 - [x] Email/webhook alerts — the control plane raises fleet events and an `event_sink` plugin delivers them, with an outbox that retries and a panel showing where each one got to (`docs/ALERTS.md`, spec: `docs/superpowers/specs/2026-09-23-alerts-design.md`); no real chat service has received one yet
 - [ ] Remote NVR access tunnel
-- [ ] 7/30-day health history
+- [x] 7/30-day health history — hourly rollups folded from the telemetry the fleet already sends, with uptime and how much of the window was actually reported (`docs/HEALTH.md`); nothing has run for a month yet
 - [x] On-demand cloud recording / archive pipeline through storage plugins
 - [x] Continuous/event recording policies and rolling archive — a ring buffer on the gateway inside a byte budget, kept by schedule, by an operator saving the last minutes, by a source going quiet or by an AI plugin (`docs/RECORDING.md`, spec: `docs/superpowers/specs/2026-09-23-recording-policies-design.md`); no site has filled a disk with it yet
 - [ ] Mobile/PWA packaging if demanded by pilots

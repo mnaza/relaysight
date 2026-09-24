@@ -14,6 +14,28 @@ use vms_domain::{
 };
 use vms_plugin_sdk::FleetEvent;
 
+/// One hour of a camera's life, or of a fleet's.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct HealthHour {
+    pub hour: DateTime<Utc>,
+    pub healthy_seconds: i64,
+    pub warning_seconds: i64,
+    pub offline_seconds: i64,
+    pub reconnects: i64,
+    /// `None` when nothing reported a rate in that hour.
+    pub average_fps: Option<f32>,
+    pub average_bitrate_kbps: Option<u32>,
+    pub worst_loss: i64,
+}
+
+impl HealthHour {
+    /// Time anything was actually known about. An hour with none of it is a
+    /// gap, and a gap is not uptime.
+    pub fn counted_seconds(&self) -> i64 {
+        self.healthy_seconds + self.warning_seconds + self.offline_seconds
+    }
+}
+
 /// An event waiting for one sink.
 #[derive(Debug, Clone)]
 pub struct DueDelivery {
@@ -325,6 +347,23 @@ pub trait Store: Send + Sync {
 
     /// Drop events older than the cutoff, deliveries and all.
     async fn delete_events_before(&self, cutoff: DateTime<Utc>) -> Result<(), StoreError>;
+
+    /// Fold time into the hourly rollups. Called on every telemetry batch, so
+    /// it has to be one round trip rather than one per camera.
+    async fn fold_health(&self, samples: &[crate::health::HealthSample]) -> Result<(), StoreError>;
+
+    /// One camera's hours, oldest first, from `since`.
+    async fn camera_health(
+        &self,
+        camera_id: &str,
+        since: DateTime<Utc>,
+    ) -> Result<Vec<HealthHour>, StoreError>;
+
+    /// The fleet's hours, summed across cameras — what the overview needs.
+    async fn fleet_health(&self, since: DateTime<Utc>) -> Result<Vec<HealthHour>, StoreError>;
+
+    /// Drop rollups older than the cutoff.
+    async fn delete_health_before(&self, cutoff: DateTime<Utc>) -> Result<(), StoreError>;
 
     /// One audit row. Callers treat failure as loggable, never fatal.
     async fn record_audit(

@@ -233,5 +233,10 @@
   "app.alerts.declined": "not for this sink",
   "app.alerts.retrying": "retrying",
   "app.alerts.gaveUp": "gave up",
-  "app.alerts.nosinks": "no event_sink plugin registered"
+  "app.alerts.nosinks": "no event_sink plugin registered",
+  "app.stat.uptime": "Uptime, 7 days",
+  "app.stat.sub.uptime": "{covered}% of the week reported",
+  "app.health.week": "{uptime}% up over 7 days · {reconnects} reconnects · {covered}% of the week reported",
+  "app.health.none": "No history yet",
+  "app.health.loading": "Reading history…"
 }

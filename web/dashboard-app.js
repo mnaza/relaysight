@@ -67,12 +67,17 @@ export async function startDashboard({ brand, locale, dict }) {
     catch { return []; }
   }
 
+  async function loadHealth() {
+    try { return await tryJson('api/v1/health?days=7'); }
+    catch { return null; }
+  }
+
   async function loadEvents() {
     try { return await tryJson('api/v1/events'); }
     catch { return []; }
   }
 
-  let [fleet, telemetry, edition, plugins, gateways, incidents, videoSources, alerts] = await Promise.all([loadFleet(), loadTelemetry(), loadEdition(), loadPlugins(), loadGateways(), loadIncidents(), loadSources(), loadEvents()]);
+  let [fleet, telemetry, edition, plugins, gateways, incidents, videoSources, alerts, health] = await Promise.all([loadFleet(), loadTelemetry(), loadEdition(), loadPlugins(), loadGateways(), loadIncidents(), loadSources(), loadEvents(), loadHealth()]);
   let telemetryById = new Map(telemetry.map(camera => [camera.camera_id, camera]));
   const isLive = fleet.source === 'live';
   const sourceTag = document.querySelector('#fleet-source');
@@ -104,6 +109,18 @@ export async function startDashboard({ brand, locale, dict }) {
     fill('#sub-alerts', 'app.stat.sub.alerts', { warning, offline });
     fill('#sub-sites', 'app.stat.sub.sites', { customers: fleet.customers.length });
     fill('#sub-throughput', 'app.stat.sub.throughput', { cameras: allCameras.length });
+    // Uptime over the week, from the rollups the fleet wrote. Every number on
+    // this screen is computed; a plausible-looking constant here would be the
+    // easiest lie in the product.
+    const uptime = document.querySelector('#stat-uptime');
+    if (uptime) {
+      const percent = health?.uptime_percent;
+      uptime.textContent = percent == null ? '—' : `${percent}%`;
+      const covered = health?.covered_percent;
+      document.querySelector('#sub-uptime').textContent = covered == null
+        ? t(dict, 'app.health.none')
+        : t(dict, 'app.stat.sub.uptime').replace('{covered}', covered);
+    }
   }
   paintStats();
 
@@ -548,6 +565,7 @@ export async function startDashboard({ brand, locale, dict }) {
         <button class="button small" type="submit">${escapeHtml(t(dict,'app.policy.save'))}</button>
         <span class="metric-sub" data-policy-status></span>
       </form>
+      <div class="metric-sub" data-camera-health></div>
       <div class="recording-status" data-record-status></div>
       <div class="ai-result" data-ai-result hidden></div>
       <div class="timeline" data-timeline></div>`;
@@ -607,6 +625,21 @@ export async function startDashboard({ brand, locale, dict }) {
           } finally { recordButton.disabled = false; }
         });
       }
+      // How this camera's week went, out of the same rollups the overview
+      // uses. A camera nobody heard from says so rather than showing 100%.
+      const healthNode = item.querySelector('[data-camera-health]');
+      healthNode.textContent = t(dict, 'app.health.loading');
+      tryJson(`api/v1/cameras/${encodeURIComponent(cameraId)}/health?days=7`, 4000)
+        .then(week => {
+          healthNode.textContent = week?.uptime_percent == null
+            ? t(dict, 'app.health.none')
+            : t(dict, 'app.health.week')
+                .replace('{uptime}', week.uptime_percent)
+                .replace('{reconnects}', week.reconnects ?? 0)
+                .replace('{covered}', week.covered_percent ?? 0);
+        })
+        .catch(() => { healthNode.textContent = t(dict, 'app.health.none'); });
+
       const policyForm = item.querySelector('[data-policy-form]');
       const policyStatus = item.querySelector('[data-policy-status]');
       loadPolicy(cameraId, policyForm, policyStatus);
@@ -676,11 +709,11 @@ export async function startDashboard({ brand, locale, dict }) {
     if (document.querySelector('.modal-backdrop.open')) return;
     let next;
     try {
-      next = await Promise.all([loadFleet(), loadTelemetry(), loadGateways(), loadIncidents(), loadSources(), loadEvents()]);
+      next = await Promise.all([loadFleet(), loadTelemetry(), loadGateways(), loadIncidents(), loadSources(), loadEvents(), loadHealth()]);
     } catch {
       return;
     }
-    [fleet, telemetry, gateways, incidents, videoSources, alerts] = next;
+    [fleet, telemetry, gateways, incidents, videoSources, alerts, health] = next;
     telemetryById = new Map(telemetry.map(camera => [camera.camera_id, camera]));
     rows = fleet.customers.flatMap(customer => customer.sites.map(site => ({ customer, site })));
     allCameras = rows.flatMap(row => row.site.cameras);
