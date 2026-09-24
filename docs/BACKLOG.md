@@ -69,7 +69,7 @@
 - [x] Encrypted persistent gateway token / identity
 - [x] Per-camera credential store encrypted at rest on edge — `vms-gateway credentials`, keyed by address, with `CAMERA_USERNAME`/`CAMERA_PASSWORD` as the fallback (spec: `docs/superpowers/specs/2026-09-21-per-camera-credentials-design.md`)
 - [x] Video sources that are not discovered cameras — an address the gateway pulls or a stream pushed to it over RTMP/SRT, added from the dashboard, with no password in the control plane (`docs/VIDEO-SOURCES.md`, spec: `docs/superpowers/specs/2026-09-22-video-sources-design.md`); no encoder has pushed to either listener yet, and SRT is behind `--features srt`
-- [ ] Hikvision/Dahua compatibility fixtures and device test matrix
+- [x] Device matrix and fixtures for documented camera behaviour — `docs/DEVICE-MATRIX.md` separates what has met a real device from what is only handled on paper; SOAP faults with HTTP 200 and stream URIs naming an unreachable address are now handled and pinned
 - [x] Gateway installer package / update channel — `install.sh` onto a hardened systemd service, signed releases, daily self-update with rollback, image on ghcr (`docs/INSTALL-GATEWAY.md`, `make check-installer`); the first real release waits on the release key
 - [x] Gateway revocation and audit log
 - [x] Camera decommission flow — retire a revoked gateway's cameras from the roster, as a `retired_at` tombstone a reporting gateway can undo (spec: `docs/superpowers/specs/2026-09-21-camera-decommission-design.md`)
@@ -82,11 +82,12 @@
 ## Plugin productionization
 
 - [x] Persist plugin definitions in the store instead of only `plugins.d` — connected from the dashboard by an owner, stored rows winning over files (`docs/PLUGIN-SDK.md`)
-- [ ] Per-organization plugin binding — the scope is stored and shown; routing a customer's calls to their own plugin is not done
+- [x] Per-organization plugin binding — a registration scoped to a customer serves that customer's cameras for recording, clipping and analysis, with the default behind it (`docs/PLUGIN-SDK.md`)
 - [ ] Vault-backed plugin connection secrets
-- [ ] mTLS/service identity for plugin calls
+- [x] mTLS / service identity for plugin calls — a client certificate and a private CA by path, fatal when configured badly, proven end to end by `make check-plugin-mtls`
 - [x] Plugin timeouts and a circuit breaker — per-kind timeouts and a breaker that trips after three consecutive failures and cools off, visible on the plugin card (`docs/PLUGIN-SDK.md`)
-- [ ] Network policies / resource limits for plugin containers
+- [x] Resource limits for plugin containers — memory, CPU and process caps on the compose plugin profile (`docs/PLUGIN-SDK.md`)
+- [ ] Network policies for plugin containers — belongs to whatever runs them; nothing here restricts a plugin's egress
 - [x] AI snapshot/frame scheduler — a recording policy can say "ask this plugin every N seconds", paced so a paid plugin is not called more often than asked; snapshot-based, and only for cameras that advertise one (`docs/RECORDING.md`)
 - [x] Event-sink capability implementation — contract, runtime call, and a reference webhook sink in `relaysight-plugins`
 - [x] Storage lifecycle / archive index integration (prototype/in-memory)

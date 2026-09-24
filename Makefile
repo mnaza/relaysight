@@ -1,4 +1,4 @@
-.PHONY: web community plugins edge demo demo-community demo-commercial demo-fleet gateway-image check-web check-relay check-gateway-relay check-editions check-installer check-ingest check-plugin
+.PHONY: web community plugins edge demo demo-community demo-commercial demo-fleet gateway-image check-web check-relay check-gateway-relay check-editions check-installer check-ingest check-plugin check-plugin-mtls
 
 # Which plan the stand-in entitlement service hands out: hosted-free or pro.
 PLAN ?= hosted-free
@@ -64,6 +64,9 @@ check-ingest:
 	./scripts/check-ingest.sh
 
 # Does a plugin speak the protocol? make check-plugin ENDPOINT=http://localhost:9002
+check-plugin-mtls:
+	./scripts/check-plugin-mtls.sh
+
 check-plugin:
 	@test -n "$(ENDPOINT)" || (echo "set ENDPOINT, e.g. make check-plugin ENDPOINT=http://localhost:9002" && false)
 	cargo run -q -p vms-plugin-runtime --example conformance -- "$(ENDPOINT)"

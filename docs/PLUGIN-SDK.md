@@ -47,10 +47,14 @@ Two places, and the second is new:
 A stored registration wins over a file with the same id: somebody typed it
 more recently. Removing it brings the file's version back on the next reload.
 
-A registration can name a customer. Today that scope is recorded and shown; it
-does not yet route a customer's storage or inference to their own plugin,
-which is a deeper change across every call site and is not pretended
-otherwise.
+A registration can name a customer. That customer's cameras then use that
+plugin — their bucket, their model — for recording, clipping and analysis,
+and everybody else keeps the default. A scoped plugin that does not provide
+the capability being asked for is skipped rather than handed storage work
+because it happened to be theirs.
+
+An explicit `storage_plugin_id` in a request still wins over both: somebody
+naming a plugin means it.
 
 ## Checking your plugin
 
@@ -140,6 +144,44 @@ Event kinds today: `camera_offline`, `camera_recovered`, `gateway_offline`,
 `gateway_recovered`, and `test` for the dashboard's "send a test event". A
 sink must ignore kinds it does not know: more will be added without a protocol
 bump.
+
+## Running a plugin beside the control plane
+
+A plugin is somebody else's code in the same deployment. The compose plugin
+profile gives each one a memory limit, a CPU share and a process cap, so a
+model that leaks or a sink that spins costs its own container rather than the
+box:
+
+```bash
+PLUGIN_MEM_LIMIT=2g PLUGIN_CPU_LIMIT=4 docker compose --profile plugins up -d
+```
+
+Inference gets 1 GiB and two CPUs by default; signing URLs and posting
+webhooks get 256 MiB and half a CPU, because that is what they do. Nothing
+here stops a plugin reaching the network — that is a network policy, and it
+belongs to whatever runs the containers.
+
+## Service identity
+
+A plugin call is an HTTP request to somebody else's service carrying a bearer
+token. On a shared network that is one leaked token away from being replayed
+by anything that can reach the endpoint, so a deployment can present a client
+certificate and trust its own CA:
+
+| | |
+| --- | --- |
+| `PLUGIN_CLIENT_IDENTITY` | a PEM holding the client certificate chain and its private key |
+| `PLUGIN_CA_BUNDLE` | a PEM of roots to trust, beside the system ones |
+
+Either being set and unreadable, not a PEM, or — for the bundle — holding no
+certificates at all stops the control plane starting. A control plane that
+cannot read its client certificate and carries on without one has mTLS in the
+documentation and not on the wire. An empty CA file is the quiet version of
+the same thing: it parses, trusts nothing new, and says nothing.
+
+`make check-plugin-mtls` proves the certificate reaches the far end: it runs a
+plugin that demands client auth and checks both that a call with a certificate
+gets in and that one without is refused.
 
 ## Timeouts and what happens when a plugin is down
 

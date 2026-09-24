@@ -337,13 +337,19 @@ pub async fn resolve_camera(
             "live view will use the substream"
         );
     }
-    let rtsp_uri = stream_uri(client, &media_service, credentials, &profile.token).await?;
+    // Where the camera answered, which is where its video is, whatever the
+    // camera believes its own address to be.
+    let reached_at = xaddr_authority(&device_service).unwrap_or_default();
+    let rtsp_uri = point_at(
+        &stream_uri(client, &media_service, credentials, &profile.token).await?,
+        &reached_at,
+    );
     // Same token means the camera offers no usable substream; do not ask twice.
     let live_rtsp_uri = if live_profile.token == profile.token {
         rtsp_uri.clone()
     } else {
         match stream_uri(client, &media_service, credentials, &live_profile.token).await {
-            Ok(uri) => uri,
+            Ok(uri) => point_at(&uri, &reached_at),
             Err(error) => {
                 // A camera that lists a substream but will not hand out its URI is
                 // not a reason to have no live view at all.
@@ -367,7 +373,7 @@ pub async fn resolve_camera(
     )
     .await
     {
-        Ok(xml) => parse_first_text(&xml, "Uri"),
+        Ok(xml) => parse_first_text(&xml, "Uri").map(|uri| point_at(&uri, &reached_at)),
         Err(error) => {
             debug!(%error, "camera did not provide an ONVIF snapshot URI");
             None
@@ -428,7 +434,66 @@ async fn soap_post(
             parse_first_text(&text, "Text").unwrap_or_else(|| text.chars().take(220).collect());
         return Err(anyhow!("ONVIF SOAP HTTP {status}: {detail}"));
     }
+    // Plenty of cameras answer a refusal with 200 and a fault in the body.
+    // Without this the caller gets "no RTSP Uri" and never learns that the
+    // camera said "the password is wrong".
+    if let Some(fault) = soap_fault(&text) {
+        return Err(anyhow!("ONVIF {operation} refused: {fault}"));
+    }
     Ok(text)
+}
+
+/// The camera's own words, when it answered with a fault rather than an
+/// answer. `None` when this is an ordinary response.
+fn soap_fault(xml: &str) -> Option<String> {
+    if !xml.contains(":Fault") && !xml.contains("<Fault") {
+        return None;
+    }
+    // A fault carries a human reason and a machine code, and cameras disagree
+    // about which they fill in. Prefer the reason; fall back to the code;
+    // fall back again to saying only that it was a fault, which is still more
+    // than the parse error this used to become.
+    let reason = parse_first_text(xml, "Text")
+        .or_else(|| parse_first_text(xml, "faultstring"))
+        .or_else(|| parse_first_text(xml, "Value"))
+        .map(|reason| reason.trim().to_owned())
+        .filter(|reason| !reason.is_empty());
+    Some(reason.unwrap_or_else(|| "the camera returned a SOAP fault".to_owned()))
+}
+
+/// Point a stream URI at the address the camera actually answered on.
+///
+/// A camera behind NAT, or one reached through `ONVIF_HOSTS` on a routed
+/// network, commonly returns a URI naming its own internal address. Dialling
+/// that reaches nothing, or — worse on a flat network — reaches a different
+/// camera. The path, the port and any embedded credentials are the camera's
+/// to choose; where it lives is not.
+fn point_at(uri: &str, reached_at: &str) -> String {
+    let Ok(mut parsed) = url::Url::parse(uri) else {
+        return uri.to_owned();
+    };
+    let Some(host) = reached_at
+        .trim()
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .split('/')
+        .next()
+        .map(|authority| {
+            authority
+                .rsplit_once(':')
+                .map_or(authority, |(host, _)| host)
+        })
+        .filter(|host| !host.is_empty())
+    else {
+        return uri.to_owned();
+    };
+    if parsed.host_str() == Some(host) {
+        return uri.to_owned();
+    }
+    if parsed.set_host(Some(host)).is_err() {
+        return uri.to_owned();
+    }
+    parsed.to_string()
 }
 
 fn wsse_header(credentials: &Credentials) -> String {
@@ -639,7 +704,8 @@ fn xml_escape(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        OnvifProfile, parse_media_xaddr, parse_probe_match, parse_profiles, select_profiles,
+        OnvifProfile, parse_media_xaddr, parse_probe_match, parse_profiles, point_at,
+        select_profiles, soap_fault,
     };
 
     fn profile(token: &str, w: u32, h: u32, encoding: Option<&str>) -> OnvifProfile {
@@ -650,6 +716,69 @@ mod tests {
             encoding: encoding.map(Into::into),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn a_camera_that_refuses_with_a_fault_is_quoted_rather_than_guessed_at() {
+        // Plenty of cameras answer a refusal with HTTP 200 and a fault in the
+        // body. Without reading it the caller gets "no RTSP Uri" and never
+        // learns the camera said the password was wrong.
+        let xml = r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope">
+          <s:Body><s:Fault><s:Code><s:Value>s:Sender</s:Value></s:Code>
+          <s:Reason><s:Text xml:lang="en">Sender not Authorized</s:Text></s:Reason>
+          </s:Fault></s:Body></s:Envelope>"#;
+        assert_eq!(soap_fault(xml).as_deref(), Some("Sender not Authorized"));
+    }
+
+    #[test]
+    fn a_fault_with_nothing_readable_in_it_still_reads_as_a_fault() {
+        let xml = "<s:Envelope><s:Body><s:Fault></s:Fault></s:Body></s:Envelope>";
+        assert!(soap_fault(xml).is_some_and(|fault| fault.contains("fault")));
+        // An ordinary answer is not a fault, whatever else it contains.
+        assert!(soap_fault("<Envelope><Body><GetProfilesResponse/></Body></Envelope>").is_none());
+    }
+
+    #[test]
+    fn a_stream_uri_is_pointed_at_the_address_the_camera_answered_on() {
+        // A camera behind NAT names its own internal address. Dialling that
+        // reaches nothing, or on a flat network reaches a different camera.
+        assert_eq!(
+            point_at(
+                "rtsp://192.168.1.64:554/Streaming/Channels/101",
+                "203.0.113.7:8000"
+            ),
+            "rtsp://203.0.113.7:554/Streaming/Channels/101"
+        );
+        // The port, the path and the query are the camera's to choose.
+        assert_eq!(
+            point_at(
+                "rtsp://192.168.1.64:8554/cam/realmonitor?channel=1",
+                "10.0.0.5"
+            ),
+            "rtsp://10.0.0.5:8554/cam/realmonitor?channel=1"
+        );
+        // Credentials the camera embedded survive the move.
+        assert_eq!(
+            point_at("rtsp://admin:secret@192.168.1.64/stream", "10.0.0.5"),
+            "rtsp://admin:secret@10.0.0.5/stream"
+        );
+    }
+
+    #[test]
+    fn a_stream_uri_already_naming_the_right_host_is_left_alone() {
+        let uri = "rtsp://10.0.0.5:554/Streaming/Channels/101";
+        assert_eq!(point_at(uri, "10.0.0.5:80"), uri);
+        assert_eq!(point_at(uri, "http://10.0.0.5/onvif/device_service"), uri);
+    }
+
+    #[test]
+    fn a_stream_uri_that_cannot_be_parsed_is_left_alone() {
+        // Better a URI the gateway cannot improve than one it mangles.
+        assert_eq!(point_at("not a url", "10.0.0.5"), "not a url");
+        assert_eq!(
+            point_at("rtsp://10.0.0.9/stream", ""),
+            "rtsp://10.0.0.9/stream"
+        );
     }
 
     #[test]

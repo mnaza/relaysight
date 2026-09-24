@@ -121,6 +121,14 @@ services:
       SIMULATED_AI: ${SIMULATED_AI:-true}
     ports:
       - "9001:9001"
+    # A plugin is somebody else's code in the same deployment. A model that
+    # leaks memory, or a sink that spins, should cost its own container and
+    # not the control plane's box.
+    mem_limit: ${PLUGIN_MEM_LIMIT:-1g}
+    cpus: ${PLUGIN_CPU_LIMIT:-2}
+    pids_limit: 256
+    restart: unless-stopped
+
 
   webhook-sink:
     profiles: ["plugins"]
@@ -136,6 +144,14 @@ services:
       MIN_SEVERITY: ${WEBHOOK_MIN_SEVERITY:-info}
     ports:
       - "9003:9003"
+    # A plugin is somebody else's code in the same deployment. A model that
+    # leaks memory, or a sink that spins, should cost its own container and
+    # not the control plane's box.
+    mem_limit: ${PLUGIN_MEM_LIMIT:-256m}
+    cpus: ${PLUGIN_CPU_LIMIT:-0.5}
+    pids_limit: 256
+    restart: unless-stopped
+
 
   minio:
     profiles: ["plugins"]
@@ -181,6 +197,12 @@ services:
       S3_ADDRESSING_STYLE: path
     ports:
       - "9002:9002"
+    # A plugin is somebody else's code in the same deployment. Signing URLs
+    # needs very little; anything more is a runaway rather than a workload.
+    mem_limit: ${PLUGIN_MEM_LIMIT:-256m}
+    cpus: ${PLUGIN_CPU_LIMIT:-0.5}
+    pids_limit: 256
+    restart: unless-stopped
 
 volumes:
   minio-data:

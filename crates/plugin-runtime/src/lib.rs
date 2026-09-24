@@ -46,6 +46,67 @@ impl Default for Timeouts {
     }
 }
 
+/// Build the HTTP client every plugin call goes through, with whatever
+/// service identity the deployment configured.
+///
+/// A plugin call is a request to somebody else's service carrying a bearer
+/// token. On a shared network that is one leaked token away from being
+/// replayed by anything that can reach the endpoint, so a deployment can
+/// present a client certificate and trust a private CA instead.
+///
+/// Misconfiguration is fatal on purpose. A control plane that cannot read its
+/// client certificate and carries on without one has mTLS in the
+/// documentation and not on the wire.
+fn build_client(identity: Option<&Path>, ca_bundle: Option<&Path>) -> anyhow::Result<Client> {
+    let mut builder = Client::builder();
+    if let Some(path) = identity {
+        let pem = std::fs::read(path)
+            .with_context(|| format!("read the plugin client identity at {}", path.display()))?;
+        let identity = reqwest::Identity::from_pem(&pem).with_context(|| {
+            format!(
+                "{} is not a PEM holding a certificate chain and its private key",
+                path.display()
+            )
+        })?;
+        builder = builder.identity(identity);
+    }
+    if let Some(path) = ca_bundle {
+        let pem = std::fs::read(path)
+            .with_context(|| format!("read the plugin CA bundle at {}", path.display()))?;
+        // One file, possibly several roots: a deployment rotating its CA has
+        // both in there for a while.
+        let certificates = reqwest::Certificate::from_pem_bundle(&pem)
+            .with_context(|| format!("{} is not a PEM bundle of certificates", path.display()))?;
+        // A file with nothing in it parses happily and trusts nothing, which
+        // is the quiet version of the failure this refuses to have.
+        if certificates.is_empty() {
+            anyhow::bail!(
+                "{} holds no certificates, so it is not a CA bundle",
+                path.display()
+            );
+        }
+        for certificate in certificates {
+            builder = builder.add_root_certificate(certificate);
+        }
+    }
+    Ok(builder.build()?)
+}
+
+/// A path from the environment, ignoring a variable that is set to nothing:
+/// an empty setting is not a configuration.
+fn path_from_env(name: &str) -> Option<std::path::PathBuf> {
+    let raw = env::var(name).ok()?;
+    let trimmed = raw.trim();
+    (!trimmed.is_empty()).then(|| std::path::PathBuf::from(trimmed))
+}
+
+fn client_from_env() -> anyhow::Result<Client> {
+    build_client(
+        path_from_env("PLUGIN_CLIENT_IDENTITY").as_deref(),
+        path_from_env("PLUGIN_CA_BUNDLE").as_deref(),
+    )
+}
+
 /// How many consecutive failures mean a plugin is down rather than unlucky.
 const TRIP_AFTER: u32 = 3;
 /// The first cooling period, doubled on each further failure up to the cap.
@@ -82,7 +143,7 @@ struct PluginEntry {
 impl PluginRegistry {
     pub async fn load_dir(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         // No client-wide timeout: each call says how long it may take.
-        let client = Client::builder().build()?;
+        let client = client_from_env()?;
         let registry = Self {
             client,
             timeouts: Timeouts::default(),
@@ -99,7 +160,7 @@ impl PluginRegistry {
         registrations: Vec<PluginRegistration>,
     ) -> anyhow::Result<Self> {
         let registry = Self {
-            client: Client::builder().build()?,
+            client: client_from_env()?,
             timeouts: Timeouts::default(),
             plugins: Arc::new(RwLock::new(BTreeMap::new())),
             breakers: Arc::new(RwLock::new(BTreeMap::new())),
@@ -994,6 +1055,56 @@ mod tests {
             }
         });
         (endpoint, calls)
+    }
+
+    #[test]
+    fn a_client_identity_that_cannot_be_read_is_fatal() {
+        // Carrying on without the certificate would leave mTLS in the
+        // documentation and not on the wire.
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("absent.pem");
+        let error = build_client(Some(&missing), None)
+            .map(|_| ())
+            .expect_err("a missing identity must not be shrugged off");
+        let error = format!("{error:#}");
+        assert!(error.contains("client identity"), "{error}");
+    }
+
+    #[test]
+    fn a_client_identity_that_is_not_a_pem_is_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.pem");
+        std::fs::write(&path, b"this is not a certificate").unwrap();
+        let error = build_client(Some(&path), None)
+            .map(|_| ())
+            .expect_err("that file is not a PEM");
+        let error = format!("{error:#}");
+        assert!(error.contains("private key"), "{error}");
+    }
+
+    #[test]
+    fn a_ca_bundle_that_is_not_certificates_is_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ca.pem");
+        std::fs::write(&path, b"nope").unwrap();
+        let error = build_client(None, Some(&path))
+            .map(|_| ())
+            .expect_err("that file is not a bundle");
+        let error = format!("{error:#}");
+        assert!(error.contains("no certificates"), "{error}");
+    }
+
+    #[test]
+    fn nothing_configured_builds_the_ordinary_client() {
+        assert!(build_client(None, None).is_ok());
+    }
+
+    #[test]
+    fn a_variable_set_to_nothing_is_not_a_configuration() {
+        unsafe { env::set_var("PLUGIN_CA_BUNDLE_TEST_EMPTY", "   ") };
+        assert!(path_from_env("PLUGIN_CA_BUNDLE_TEST_EMPTY").is_none());
+        unsafe { env::remove_var("PLUGIN_CA_BUNDLE_TEST_EMPTY") };
+        assert!(path_from_env("PLUGIN_CA_BUNDLE_TEST_ABSENT").is_none());
     }
 
     #[tokio::test]

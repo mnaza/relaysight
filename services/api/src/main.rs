@@ -847,7 +847,13 @@ async fn set_camera_recording_policy(
         keep: request.keep,
         // Ten years is not a retention policy, it is a mistake.
         retention_days: request.retention_days.min(3650),
-        storage_plugin_id: state.default_storage_plugin.to_string(),
+        storage_plugin_id: plugin_for(
+            &state,
+            &camera_id,
+            vms_plugin_sdk::PluginCapability::StorageBlob,
+            &state.default_storage_plugin,
+        )
+        .await,
         updated_at: Utc::now(),
     };
     state
@@ -1445,12 +1451,30 @@ async fn create_camera_analysis(
 ) -> Result<(StatusCode, Json<CommandAccepted>), StatusCode> {
     let gateway_id = gateway_for_camera(&state, &camera_id).await?;
     let now = Utc::now();
-    let ai_plugin_id = request
-        .ai_plugin_id
-        .unwrap_or_else(|| state.default_ai_plugin.to_string());
-    let storage_plugin_id = request
-        .storage_plugin_id
-        .unwrap_or_else(|| state.default_storage_plugin.to_string());
+    let ai_plugin_id = match request.ai_plugin_id {
+        Some(chosen) => chosen,
+        None => {
+            plugin_for(
+                &state,
+                &camera_id,
+                vms_plugin_sdk::PluginCapability::AiAnalyze,
+                &state.default_ai_plugin,
+            )
+            .await
+        }
+    };
+    let storage_plugin_id = match request.storage_plugin_id {
+        Some(chosen) => chosen,
+        None => {
+            plugin_for(
+                &state,
+                &camera_id,
+                vms_plugin_sdk::PluginCapability::StorageBlob,
+                &state.default_storage_plugin,
+            )
+            .await
+        }
+    };
     let tasks = if request.tasks.is_empty() {
         vec!["person".into(), "vehicle".into()]
     } else {
@@ -1481,9 +1505,18 @@ async fn create_recording(
 ) -> Result<(StatusCode, Json<CommandAccepted>), StatusCode> {
     let duration_seconds = request.duration_seconds.clamp(2, 3600);
     let segment_seconds = request.segment_seconds.clamp(1, 30).min(duration_seconds);
-    let storage_plugin_id = request
-        .storage_plugin_id
-        .unwrap_or_else(|| state.default_storage_plugin.to_string());
+    let storage_plugin_id = match request.storage_plugin_id {
+        Some(chosen) => chosen,
+        None => {
+            plugin_for(
+                &state,
+                &camera_id,
+                vms_plugin_sdk::PluginCapability::StorageBlob,
+                &state.default_storage_plugin,
+            )
+            .await
+        }
+    };
 
     let gateway_id = gateway_for_camera(&state, &camera_id).await?;
 
@@ -1576,6 +1609,57 @@ fn health_answer(days: i64, hours: Vec<crate::store::HealthHour>) -> serde_json:
         "covered_percent": (window > 0)
             .then(|| (counted as f64 * 1_000.0 / window as f64).round() / 10.0),
         "hours": hours,
+    })
+}
+
+/// Which plugin should serve this camera.
+///
+/// A registration can name a customer, and that scope has until now been
+/// recorded and shown and nothing else. A camera belonging to that customer
+/// uses their plugin — their bucket, their model — and everybody else uses
+/// the default.
+async fn plugin_for(
+    state: &AppState,
+    camera_id: &str,
+    capability: vms_plugin_sdk::PluginCapability,
+    default: &str,
+) -> String {
+    let Some(customer_id) = customer_of_camera(state, camera_id).await else {
+        return default.to_owned();
+    };
+    let scoped: Vec<String> = state
+        .store
+        .plugin_registrations()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|row| row.enabled && row.customer_id.as_deref() == Some(customer_id.as_str()))
+        .map(|row| row.plugin_id)
+        .collect();
+    if scoped.is_empty() {
+        return default.to_owned();
+    }
+    // Registered for that customer, and actually able to do the thing: a
+    // customer's own storage plugin is not their inference plugin.
+    for plugin in state.plugins.list().await {
+        if scoped.contains(&plugin.manifest.id)
+            && plugin.manifest.capabilities.contains(&capability)
+        {
+            return plugin.manifest.id;
+        }
+    }
+    default.to_owned()
+}
+
+/// Which customer a camera belongs to, by way of its site.
+async fn customer_of_camera(state: &AppState, camera_id: &str) -> Option<String> {
+    let organizations = state.store.fleet_identity().await.ok()?;
+    organizations.into_iter().find_map(|organization| {
+        organization
+            .sites
+            .iter()
+            .any(|site| site.cameras.iter().any(|camera| camera.id == camera_id))
+            .then_some(organization.id)
     })
 }
 
@@ -1798,9 +1882,18 @@ async fn create_clip(
     Json(request): Json<ClipRequest>,
 ) -> Result<(StatusCode, Json<CommandAccepted>), StatusCode> {
     let seconds = request.seconds.clamp(5, 3600);
-    let storage_plugin_id = request
-        .storage_plugin_id
-        .unwrap_or_else(|| state.default_storage_plugin.to_string());
+    let storage_plugin_id = match request.storage_plugin_id {
+        Some(chosen) => chosen,
+        None => {
+            plugin_for(
+                &state,
+                &camera_id,
+                vms_plugin_sdk::PluginCapability::StorageBlob,
+                &state.default_storage_plugin,
+            )
+            .await
+        }
+    };
     let gateway_id = gateway_for_camera(&state, &camera_id).await?;
 
     let now = Utc::now();
@@ -3396,6 +3489,78 @@ mod tests {
 
     /// Connecting a plugin from the dashboard, which until now meant a shell
     /// on the box and a file in plugins.d.
+    /// A registration scoped to a customer is now more than a label: their
+    /// cameras use their plugin, and everybody else keeps the default.
+    #[tokio::test]
+    async fn a_customers_camera_uses_that_customers_plugin() {
+        let (endpoint, _) = fake_sink("sink-1", true).await;
+        let state = test_state().await;
+        seed_admin(&state).await;
+        let owner = login_cookie(&state).await;
+
+        let mut batch = typed_batch("gw-1", "cam-1", HealthStatus::Healthy, Utc::now(), None);
+        batch.customer_id = "cust-1".into();
+        state
+            .store
+            .upsert_fleet_identity(&batch, Utc::now())
+            .await
+            .unwrap();
+
+        // The fake sink declares event_sink, so it stands in for "a plugin
+        // this customer has" without pretending to sign anything.
+        let (status, _) = send(
+            &state,
+            with_cookie(
+                post(
+                    "/api/v1/plugins/registrations",
+                    None,
+                    serde_json::json!({
+                        "plugin_id": "", "endpoint": endpoint, "placement": "control_plane",
+                        "enabled": true, "token_env": null, "customer_id": "cust-1",
+                    }),
+                ),
+                &owner,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Their camera gets their plugin for the capability it provides.
+        assert_eq!(
+            plugin_for(
+                &state,
+                "cam-1",
+                vms_plugin_sdk::PluginCapability::EventSink,
+                "the-default",
+            )
+            .await,
+            "sink-1"
+        );
+        // A capability that plugin does not provide falls back rather than
+        // sending storage work to an event sink.
+        assert_eq!(
+            plugin_for(
+                &state,
+                "cam-1",
+                vms_plugin_sdk::PluginCapability::StorageBlob,
+                "the-default",
+            )
+            .await,
+            "the-default"
+        );
+        // And a camera nobody has scoped keeps the default.
+        assert_eq!(
+            plugin_for(
+                &state,
+                "cam-unknown",
+                vms_plugin_sdk::PluginCapability::EventSink,
+                "the-default",
+            )
+            .await,
+            "the-default"
+        );
+    }
+
     #[tokio::test]
     async fn an_owner_can_connect_a_plugin_and_disconnect_it() {
         let (endpoint, _) = fake_sink("sink-1", true).await;
