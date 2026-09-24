@@ -52,6 +52,21 @@ does not yet route a customer's storage or inference to their own plugin,
 which is a deeper change across every call site and is not pretended
 otherwise.
 
+## Checking your plugin
+
+```bash
+make check-plugin ENDPOINT=http://localhost:9002
+PLUGIN_TOKEN_ENV=STORAGE_PLUGIN_TOKEN make check-plugin ENDPOINT=…
+```
+
+It asks the endpoint what it is, checks the protocol version, calls health,
+and then exercises every capability the manifest declares — a one-pixel image
+for `ai_analyze`, a signing round trip for `storage_blob`, a `test` event for
+`event_sink`. It signs and asks; it never uploads bytes, and it does not
+exercise storage delete, which would delete something.
+
+A sink answering `delivered: false` passes: declining is a correct answer.
+
 ## Common endpoints
 
 - `GET /v1/plugin/manifest`

@@ -62,7 +62,7 @@
 
 ## Next — make the demo sellable on real sites
 
-- [ ] On-demand RTSP → WebRTC live session
+- [x] On-demand RTSP → WebRTC live session — H.264 passthrough to a browser peer, tested end to end against a fake camera and a fake browser, including a session relayed over a TLS bridge (`docs/LIVE.md`)
 - [x] Camera disconnect/recovery incident timeline
 - [x] Persistent model for organizations, sites, gateways and cameras — done as SQLite behind a `Store` trait (spec: `docs/superpowers/specs/2026-09-06-persistent-fleet-store-design.md`); Postgres becomes a second `Store` implementation when hosted scale calls for it
 - [x] Production auth for installer dashboard
@@ -87,11 +87,11 @@
 - [ ] mTLS/service identity for plugin calls
 - [x] Plugin timeouts and a circuit breaker — per-kind timeouts and a breaker that trips after three consecutive failures and cools off, visible on the plugin card (`docs/PLUGIN-SDK.md`)
 - [ ] Network policies / resource limits for plugin containers
-- [ ] AI snapshot/frame scheduler
+- [x] AI snapshot/frame scheduler — a recording policy can say "ask this plugin every N seconds", paced so a paid plugin is not called more often than asked; snapshot-based, and only for cameras that advertise one (`docs/RECORDING.md`)
 - [x] Event-sink capability implementation — contract, runtime call, and a reference webhook sink in `relaysight-plugins`
 - [x] Storage lifecycle / archive index integration (prototype/in-memory)
-- [ ] Persist archive index and lifecycle policies in Postgres
-- [ ] Plugin protocol compatibility tests / SDK examples for Python and Go
+- [x] Persist archive index and lifecycle policies — recordings, their manifests and `delete_after` live in the store, and the retention pass deletes through the storage plugin; SQLite today, Postgres is a second `Store` implementation when hosted scale calls for it
+- [x] Plugin protocol conformance check and skeletons for Python and Go — `make check-plugin ENDPOINT=…` exercises every capability a plugin declares, and `skeletons/` in `relaysight-plugins` has the same minimal plugin in both languages, each verified against that check
 
 ## Commercial productionization
 

@@ -16,3 +16,4 @@ vms-plugin-sdk = { path = "../plugin-sdk" }
 [dev-dependencies]
 chrono.workspace = true
 tempfile = "3"
+uuid.workspace = true

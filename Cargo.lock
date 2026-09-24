@@ -3995,6 +3995,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "uuid",
  "vms-plugin-sdk",
 ]
 

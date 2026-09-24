@@ -93,6 +93,25 @@ impl PluginRegistry {
         Ok(registry)
     }
 
+    /// A registry holding exactly these registrations and nothing on disk.
+    /// What a conformance check wants: one plugin, asked directly.
+    pub async fn from_registrations(
+        registrations: Vec<PluginRegistration>,
+    ) -> anyhow::Result<Self> {
+        let registry = Self {
+            client: Client::builder().build()?,
+            timeouts: Timeouts::default(),
+            plugins: Arc::new(RwLock::new(BTreeMap::new())),
+            breakers: Arc::new(RwLock::new(BTreeMap::new())),
+        };
+        for registration in registrations {
+            if let Some((id, entry)) = registry.entry_for(&registration).await {
+                registry.plugins.write().await.insert(id, entry);
+            }
+        }
+        Ok(registry)
+    }
+
     /// Reload from disk, then from whatever else the caller keeps
     /// registrations in.
     ///
