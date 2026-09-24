@@ -149,6 +149,12 @@
             <div><strong data-i18n="app.plugins.title"></strong><div class="metric-sub" data-i18n="app.plugins.subtitle"></div></div>
             <button id="reload-plugins" class="button small" data-i18n="app.plugins.reload"></button>
           </div>
+          <form id="plugin-form" class="field-row" hidden>
+            <label class="field field-wide"><span data-i18n="app.plugins.endpoint"></span><input name="endpoint" required placeholder="http://storage-plugin:9002" /></label>
+            <label class="field"><span data-i18n="app.plugins.tokenEnv"></span><input name="tokenEnv" placeholder="STORAGE_PLUGIN_TOKEN" /></label>
+            <label class="field"><span data-i18n="app.plugins.customer"></span><input name="customerId" placeholder="—" /></label>
+            <button class="button small" type="submit" data-i18n="app.plugins.connect"></button>
+          </form>
           <div id="plugins-grid" class="plugins-grid"></div>
         </section>
       </div>

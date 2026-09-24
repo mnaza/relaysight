@@ -59,6 +59,11 @@ pub struct RegisteredPlugin {
     pub reachable: bool,
     pub manifest: PluginManifest,
     pub last_error: Option<String>,
+    /// Set while the control plane is deliberately leaving this plugin alone
+    /// after a run of failures. The plugin never sends this; it is what the
+    /// core thinks of it.
+    #[serde(default)]
+    pub cooling_off_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

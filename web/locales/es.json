@@ -252,5 +252,11 @@
   "app.users.disabled": "desactivado",
   "app.users.disable": "Desactivar",
   "app.users.enable": "Activar",
-  "app.users.failed": "El cambio fue rechazado"
+  "app.users.failed": "El cambio fue rechazado",
+  "app.plugins.cooling": "No responde · en pausa {seconds}s",
+  "app.plugins.endpoint": "Endpoint del plugin",
+  "app.plugins.tokenEnv": "Variable de token (opcional)",
+  "app.plugins.customer": "Cliente (opcional)",
+  "app.plugins.connect": "Conectar plugin",
+  "app.plugins.connectFailed": "El plugin no respondió, no se guardó nada"
 }

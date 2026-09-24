@@ -252,5 +252,11 @@
   "app.users.disabled": "отключён",
   "app.users.disable": "Отключить",
   "app.users.enable": "Включить",
-  "app.users.failed": "Изменение отклонено"
+  "app.users.failed": "Изменение отклонено",
+  "app.plugins.cooling": "Не отвечает · пауза {seconds}с",
+  "app.plugins.endpoint": "Адрес плагина",
+  "app.plugins.tokenEnv": "Переменная с токеном (необязательно)",
+  "app.plugins.customer": "Клиент (необязательно)",
+  "app.plugins.connect": "Подключить плагин",
+  "app.plugins.connectFailed": "Плагин не ответил, ничего не сохранено"
 }

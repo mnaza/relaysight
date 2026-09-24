@@ -14,6 +14,18 @@ use vms_domain::{
 };
 use vms_plugin_sdk::FleetEvent;
 
+/// A plugin registration that lives in the store rather than on disk.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct StoredRegistration {
+    pub plugin_id: String,
+    pub endpoint: String,
+    pub placement: String,
+    pub enabled: bool,
+    pub token_env: Option<String>,
+    /// Set: this plugin is offered to that customer only.
+    pub customer_id: Option<String>,
+}
+
 /// Who is asking, resolved from a session.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionUser {
@@ -417,6 +429,20 @@ pub trait Store: Send + Sync {
 
     /// Drop rollups older than the cutoff.
     async fn delete_health_before(&self, cutoff: DateTime<Utc>) -> Result<(), StoreError>;
+
+    /// Plugins an owner connected, as opposed to ones on disk.
+    async fn plugin_registrations(&self) -> Result<Vec<StoredRegistration>, StoreError>;
+
+    /// Add or replace one. The id is the plugin's own, from its manifest.
+    async fn save_plugin_registration(
+        &self,
+        registration: &StoredRegistration,
+        now: DateTime<Utc>,
+    ) -> Result<(), StoreError>;
+
+    /// `NotFound` when there is nothing to remove — a file-based plugin, for
+    /// instance, which is not this table's to delete.
+    async fn delete_plugin_registration(&self, plugin_id: &str) -> Result<(), StoreError>;
 
     /// One audit row. Callers treat failure as loggable, never fatal.
     async fn record_audit(

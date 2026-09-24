@@ -1,4 +1,10 @@
-use std::{collections::BTreeMap, env, path::Path, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    env,
+    path::Path,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, anyhow};
 use reqwest::Client;
@@ -11,10 +17,58 @@ use vms_plugin_sdk::{
     StorageDownloadRequest, StorageUploadRequest,
 };
 
+/// How long each kind of call may take. Inference is not a health check: one
+/// number for both means either a model gets cut off or a dead plugin holds a
+/// request open for half a minute.
+#[derive(Debug, Clone, Copy)]
+pub struct Timeouts {
+    /// Manifest, health, and anything else that should answer at once.
+    pub quick: Duration,
+    /// Signing a URL, delivering an event: a round trip to somebody else's
+    /// service.
+    pub normal: Duration,
+    /// Running a model.
+    pub inference: Duration,
+}
+
+impl Default for Timeouts {
+    fn default() -> Self {
+        Self {
+            quick: Duration::from_secs(3),
+            normal: Duration::from_secs(8),
+            inference: Duration::from_secs(
+                env::var("PLUGIN_AI_TIMEOUT_SECONDS")
+                    .ok()
+                    .and_then(|raw| raw.parse().ok())
+                    .unwrap_or(30),
+            ),
+        }
+    }
+}
+
+/// How many consecutive failures mean a plugin is down rather than unlucky.
+const TRIP_AFTER: u32 = 3;
+/// The first cooling period, doubled on each further failure up to the cap.
+const FIRST_COOLDOWN: Duration = Duration::from_secs(15);
+const MAX_COOLDOWN: Duration = Duration::from_secs(300);
+
+/// What this registry remembers about a plugin that has been failing.
+#[derive(Debug, Clone, Default)]
+struct Breaker {
+    consecutive_failures: u32,
+    open_until: Option<Instant>,
+    cooldown: Option<Duration>,
+}
+
 #[derive(Clone)]
 pub struct PluginRegistry {
     client: Client,
+    timeouts: Timeouts,
     plugins: Arc<RwLock<BTreeMap<String, PluginEntry>>>,
+    /// Keyed by plugin id, and deliberately not inside `PluginEntry`: a
+    /// reload replaces registrations, and a plugin that was down a second ago
+    /// is still down after somebody edits a manifest.
+    breakers: Arc<RwLock<BTreeMap<String, Breaker>>>,
 }
 
 #[derive(Clone)]
@@ -27,15 +81,43 @@ struct PluginEntry {
 
 impl PluginRegistry {
     pub async fn load_dir(path: impl AsRef<Path>) -> anyhow::Result<Self> {
-        let client = Client::builder()
-            .timeout(std::time::Duration::from_secs(3))
-            .build()?;
+        // No client-wide timeout: each call says how long it may take.
+        let client = Client::builder().build()?;
         let registry = Self {
             client,
+            timeouts: Timeouts::default(),
             plugins: Arc::new(RwLock::new(BTreeMap::new())),
+            breakers: Arc::new(RwLock::new(BTreeMap::new())),
         };
         registry.reload(path).await?;
         Ok(registry)
+    }
+
+    /// Reload from disk, then from whatever else the caller keeps
+    /// registrations in.
+    ///
+    /// Files are the bootstrap: a control plane whose database is having a
+    /// bad day still comes up with the plugins the box was installed with.
+    /// A registration from the caller wins over a file with the same id,
+    /// because somebody typed it more recently.
+    pub async fn reload_with(
+        &self,
+        path: impl AsRef<Path>,
+        extra: Vec<PluginRegistration>,
+    ) -> anyhow::Result<()> {
+        self.reload(path).await?;
+        for registration in extra {
+            match self.entry_for(&registration).await {
+                Some((id, entry)) => {
+                    self.plugins.write().await.insert(id, entry);
+                }
+                None => warn!(
+                    endpoint = %registration.endpoint,
+                    "a stored plugin registration could not be read and was skipped"
+                ),
+            }
+        }
+        Ok(())
     }
 
     pub async fn reload(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
@@ -73,41 +155,77 @@ impl PluginRegistry {
                     continue;
                 }
             };
-            if !registration.enabled {
-                continue;
-            }
-
-            let fallback = registration.manifest.clone();
-            let fetched = self.fetch_manifest(&registration).await;
-            let (manifest, reachable, last_error) = match fetched {
-                Ok(manifest) => (manifest, true, None),
-                Err(error) => {
-                    let Some(manifest) = fallback else {
-                        warn!(file = %file.display(), %error, "plugin unavailable and no embedded manifest");
-                        continue;
-                    };
-                    (manifest, false, Some(error.to_string()))
+            match self.entry_for(&registration).await {
+                Some((id, entry)) => {
+                    loaded.insert(id, entry);
                 }
-            };
-            if manifest.protocol_version != PLUGIN_PROTOCOL_VERSION {
-                warn!(plugin = %manifest.id, protocol = manifest.protocol_version, "unsupported plugin protocol");
-                continue;
+                None => {
+                    warn!(file = %file.display(), "this plugin could not be registered; skipping it")
+                }
             }
-            loaded.insert(
-                manifest.id.clone(),
-                PluginEntry {
-                    registration,
-                    manifest,
-                    reachable,
-                    last_error,
-                },
-            );
         }
         *self.plugins.write().await = loaded;
         Ok(())
     }
 
+    /// Ask a plugin what it is, without registering it. What a control plane
+    /// does before writing down a registration somebody typed.
+    pub async fn describe(
+        &self,
+        registration: &PluginRegistration,
+    ) -> anyhow::Result<PluginManifest> {
+        let manifest = self.fetch_manifest(registration).await?;
+        if manifest.protocol_version != PLUGIN_PROTOCOL_VERSION {
+            return Err(anyhow!(
+                "plugin {} speaks protocol {}, this build speaks {}",
+                manifest.id,
+                manifest.protocol_version,
+                PLUGIN_PROTOCOL_VERSION
+            ));
+        }
+        Ok(manifest)
+    }
+
+    /// Turn a registration into a registry entry: ask the plugin what it is,
+    /// fall back to the manifest it was registered with, and refuse a
+    /// protocol this build does not speak.
+    ///
+    /// The same path for a file and for a row: one of them being newer is no
+    /// reason for it to be loaded differently.
+    async fn entry_for(&self, registration: &PluginRegistration) -> Option<(String, PluginEntry)> {
+        if !registration.enabled {
+            return None;
+        }
+        let fallback = registration.manifest.clone();
+        let (manifest, reachable, last_error) = match self.fetch_manifest(registration).await {
+            Ok(manifest) => (manifest, true, None),
+            Err(error) => {
+                let manifest = fallback?;
+                (manifest, false, Some(error.to_string()))
+            }
+        };
+        if manifest.protocol_version != PLUGIN_PROTOCOL_VERSION {
+            warn!(
+                plugin = %manifest.id,
+                protocol = manifest.protocol_version,
+                "unsupported plugin protocol"
+            );
+            return None;
+        }
+        Some((
+            manifest.id.clone(),
+            PluginEntry {
+                registration: registration.clone(),
+                manifest,
+                reachable,
+                last_error,
+            },
+        ))
+    }
+
     pub async fn list(&self) -> Vec<RegisteredPlugin> {
+        let now = Instant::now();
+        let breakers = self.breakers.read().await.clone();
         self.plugins
             .read()
             .await
@@ -117,6 +235,11 @@ impl PluginRegistry {
                 placement: entry.registration.placement.clone(),
                 enabled: entry.registration.enabled,
                 reachable: entry.reachable,
+                cooling_off_seconds: breakers
+                    .get(&entry.manifest.id)
+                    .and_then(|breaker| breaker.open_until)
+                    .and_then(|until| until.checked_duration_since(now))
+                    .map(|left| left.as_secs() + 1),
                 manifest: entry.manifest.clone(),
                 last_error: entry.last_error.clone(),
             })
@@ -130,6 +253,7 @@ impl PluginRegistry {
             reqwest::Method::GET,
             "/v1/plugin/health",
             None::<&()>,
+            self.timeouts.quick,
         )
         .await
     }
@@ -142,8 +266,17 @@ impl PluginRegistry {
         let entry = self
             .entry_with_capability(id, PluginCapability::AiAnalyze)
             .await?;
-        self.request(&entry, reqwest::Method::POST, "/v1/ai/analyze", Some(body))
-            .await
+        self.guarded(
+            id,
+            self.request(
+                &entry,
+                reqwest::Method::POST,
+                "/v1/ai/analyze",
+                Some(body),
+                self.timeouts.inference,
+            ),
+        )
+        .await
     }
 
     pub async fn storage_upload(
@@ -154,11 +287,15 @@ impl PluginRegistry {
         let entry = self
             .entry_with_capability(id, PluginCapability::StorageBlob)
             .await?;
-        self.request(
-            &entry,
-            reqwest::Method::POST,
-            "/v1/storage/uploads",
-            Some(body),
+        self.guarded(
+            id,
+            self.request(
+                &entry,
+                reqwest::Method::POST,
+                "/v1/storage/uploads",
+                Some(body),
+                self.timeouts.normal,
+            ),
         )
         .await
     }
@@ -174,8 +311,17 @@ impl PluginRegistry {
         let entry = self
             .entry_with_capability(id, PluginCapability::EventSink)
             .await?;
-        self.request(&entry, reqwest::Method::POST, "/v1/events", Some(body))
-            .await
+        self.guarded(
+            id,
+            self.request(
+                &entry,
+                reqwest::Method::POST,
+                "/v1/events",
+                Some(body),
+                self.timeouts.normal,
+            ),
+        )
+        .await
     }
 
     /// Every plugin that is enabled, reachable and says it takes events.
@@ -203,11 +349,15 @@ impl PluginRegistry {
         let entry = self
             .entry_with_capability(id, PluginCapability::StorageBlob)
             .await?;
-        self.request(
-            &entry,
-            reqwest::Method::POST,
-            "/v1/storage/downloads",
-            Some(body),
+        self.guarded(
+            id,
+            self.request(
+                &entry,
+                reqwest::Method::POST,
+                "/v1/storage/downloads",
+                Some(body),
+                self.timeouts.normal,
+            ),
         )
         .await
     }
@@ -220,11 +370,15 @@ impl PluginRegistry {
         let entry = self
             .entry_with_capability(id, PluginCapability::StorageBlob)
             .await?;
-        self.request(
-            &entry,
-            reqwest::Method::POST,
-            "/v1/storage/delete",
-            Some(body),
+        self.guarded(
+            id,
+            self.request(
+                &entry,
+                reqwest::Method::POST,
+                "/v1/storage/delete",
+                Some(body),
+                self.timeouts.normal,
+            ),
         )
         .await
     }
@@ -269,6 +423,7 @@ impl PluginRegistry {
             reqwest::Method::GET,
             "/v1/plugin/manifest",
             None::<&()>,
+            self.timeouts.quick,
         )
         .await
     }
@@ -279,9 +434,69 @@ impl PluginRegistry {
         method: reqwest::Method,
         path: &str,
         body: Option<&B>,
+        timeout: Duration,
     ) -> anyhow::Result<T> {
-        self.request_registration(&entry.registration, method, path, body)
+        self.request_registration(&entry.registration, method, path, body, timeout)
             .await
+    }
+
+    /// Run a call unless this plugin is known to be down, and remember how it
+    /// went.
+    ///
+    /// A plugin that is not answering costs every caller the full timeout,
+    /// one after another, for as long as it stays down. After a few failures
+    /// in a row this stops trying until a cooling period has passed, so the
+    /// cost of a dead plugin is one slow call rather than all of them.
+    async fn guarded<T>(
+        &self,
+        id: &str,
+        call: impl std::future::Future<Output = anyhow::Result<T>>,
+    ) -> anyhow::Result<T> {
+        if let Some(open_until) = self
+            .breakers
+            .read()
+            .await
+            .get(id)
+            .and_then(|b| b.open_until)
+            && open_until > Instant::now()
+        {
+            return Err(anyhow!(
+                "plugin {id} is not answering; not tried again for another {} seconds",
+                (open_until - Instant::now()).as_secs() + 1
+            ));
+        }
+        let outcome = call.await;
+        let mut breakers = self.breakers.write().await;
+        let breaker = breakers.entry(id.to_owned()).or_default();
+        match &outcome {
+            Ok(_) => *breaker = Breaker::default(),
+            Err(_) => {
+                breaker.consecutive_failures += 1;
+                if breaker.consecutive_failures >= TRIP_AFTER {
+                    // Each further failure waits longer, up to the cap: a
+                    // plugin that is gone for the afternoon should not be
+                    // dialled every fifteen seconds all afternoon.
+                    let cooldown = breaker
+                        .cooldown
+                        .map(|last| (last * 2).min(MAX_COOLDOWN))
+                        .unwrap_or(FIRST_COOLDOWN);
+                    breaker.cooldown = Some(cooldown);
+                    breaker.open_until = Some(Instant::now() + cooldown);
+                    warn!(
+                        plugin_id = id,
+                        seconds = cooldown.as_secs(),
+                        "a plugin stopped answering; leaving it alone for a while"
+                    );
+                }
+            }
+        }
+        outcome
+    }
+
+    /// Whether this plugin is currently being left alone, and for how long.
+    pub async fn cooling_off(&self, id: &str) -> Option<Duration> {
+        let open_until = self.breakers.read().await.get(id)?.open_until?;
+        open_until.checked_duration_since(Instant::now())
     }
 
     async fn request_registration<T: serde::de::DeserializeOwned, B: serde::Serialize + ?Sized>(
@@ -290,9 +505,10 @@ impl PluginRegistry {
         method: reqwest::Method,
         path: &str,
         body: Option<&B>,
+        timeout: Duration,
     ) -> anyhow::Result<T> {
         let url = format!("{}{}", registration.endpoint.trim_end_matches('/'), path);
-        let mut request = self.client.request(method, url);
+        let mut request = self.client.request(method, url).timeout(timeout);
         if let Some(token_env) = &registration.token_env
             && let Ok(token) = env::var(token_env)
         {
@@ -720,6 +936,195 @@ mod tests {
             detail: Some("RTSP probe failed".into()),
             metadata: serde_json::json!({"reconnects": 3}),
         }
+    }
+
+    /// A sink that counts how many times it was actually dialled, so a test
+    /// can tell "refused" from "never asked".
+    async fn counting_sink(id: &'static str) -> (String, Arc<RwLock<u32>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let calls: Arc<RwLock<u32>> = Arc::new(RwLock::new(0));
+        let counter = Arc::clone(&calls);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let counter = Arc::clone(&counter);
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let Ok(read) = socket.read(&mut buf).await else {
+                        return;
+                    };
+                    let request = String::from_utf8_lossy(&buf[..read]).to_string();
+                    let body = if request.contains("/v1/plugin/manifest") {
+                        Some(manifest(id, &["event_sink"], PLUGIN_PROTOCOL_VERSION).to_string())
+                    } else {
+                        *counter.write().await += 1;
+                        None
+                    };
+                    let response = match body {
+                        Some(body) => format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                            body.len()
+                        ),
+                        None => "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_owned(),
+                    };
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        (endpoint, calls)
+    }
+
+    #[tokio::test]
+    async fn a_stored_registration_wins_over_a_file_with_the_same_id() {
+        // Files are the bootstrap; a row is what somebody typed more
+        // recently, and the two disagreeing is normal during a migration.
+        let (endpoint, _) = fake_sink("sink-1", true).await;
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "sink.json", &offline("sink-1", &["event_sink"]));
+        let registry = PluginRegistry::load_dir(dir.path()).await.unwrap();
+        assert!(
+            !registry.list().await[0].reachable,
+            "the file's dead endpoint"
+        );
+
+        registry
+            .reload_with(
+                dir.path(),
+                vec![
+                    serde_json::from_value(serde_json::json!({
+                        "endpoint": endpoint, "enabled": true, "manifest": null,
+                    }))
+                    .unwrap(),
+                ],
+            )
+            .await
+            .unwrap();
+        let listed = registry.list().await;
+        assert_eq!(listed.len(), 1, "one plugin, not two: {listed:?}");
+        assert!(listed[0].reachable, "the stored endpoint is the live one");
+    }
+
+    #[tokio::test]
+    async fn a_stored_registration_that_answers_nothing_is_skipped_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "ai.json", &offline("ai-1", &["ai_analyze"]));
+        let registry = PluginRegistry::load_dir(dir.path()).await.unwrap();
+        registry
+            .reload_with(
+                dir.path(),
+                vec![
+                    serde_json::from_value(serde_json::json!({
+                        "endpoint": DEAD_ENDPOINT, "enabled": true, "manifest": null,
+                    }))
+                    .unwrap(),
+                ],
+            )
+            .await
+            .expect("one bad row must not take the rest down");
+        let listed = registry.list().await;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].manifest.id, "ai-1");
+    }
+
+    #[tokio::test]
+    async fn a_plugin_that_keeps_failing_is_left_alone_for_a_while() {
+        // A plugin that is down costs every caller the full timeout, one
+        // after another, for as long as it stays down. After a few failures
+        // the cost should be one slow call rather than all of them.
+        let (endpoint, calls) = counting_sink("sink-flaky").await;
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "sink.json",
+            &serde_json::json!({"endpoint": endpoint, "enabled": true, "manifest": null}),
+        );
+        let registry = PluginRegistry::load_dir(dir.path()).await.unwrap();
+        let request = EventDeliveryRequest {
+            context: Default::default(),
+            event: event(),
+        };
+
+        for attempt in 1..=TRIP_AFTER {
+            assert!(
+                registry
+                    .deliver_event("sink-flaky", &request)
+                    .await
+                    .is_err(),
+                "attempt {attempt} should have failed"
+            );
+        }
+        assert_eq!(*calls.read().await, TRIP_AFTER, "each attempt was tried");
+        assert!(
+            registry.cooling_off("sink-flaky").await.is_some(),
+            "the breaker should be open"
+        );
+
+        let error = registry
+            .deliver_event("sink-flaky", &request)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not answering"), "{error}");
+        assert!(error.contains("seconds"), "it says how long: {error}");
+        assert_eq!(
+            *calls.read().await,
+            TRIP_AFTER,
+            "a call while the breaker is open must not reach the plugin"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_plugin_that_answers_again_is_forgiven() {
+        let (endpoint, _) = fake_sink("sink-ok", true).await;
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "sink.json",
+            &serde_json::json!({"endpoint": endpoint, "enabled": true, "manifest": null}),
+        );
+        let registry = PluginRegistry::load_dir(dir.path()).await.unwrap();
+        let request = EventDeliveryRequest {
+            context: Default::default(),
+            event: event(),
+        };
+        assert!(registry.deliver_event("sink-ok", &request).await.is_ok());
+        assert!(
+            registry.cooling_off("sink-ok").await.is_none(),
+            "nothing to forgive, nothing held against it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reload_does_not_forget_that_a_plugin_is_down() {
+        // Editing a manifest is not evidence that the plugin came back.
+        let (endpoint, calls) = counting_sink("sink-edited").await;
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "sink.json",
+            &serde_json::json!({"endpoint": endpoint, "enabled": true, "manifest": null}),
+        );
+        let registry = PluginRegistry::load_dir(dir.path()).await.unwrap();
+        let request = EventDeliveryRequest {
+            context: Default::default(),
+            event: event(),
+        };
+        for _ in 0..TRIP_AFTER {
+            let _ = registry.deliver_event("sink-edited", &request).await;
+        }
+        let before = *calls.read().await;
+
+        registry.reload(dir.path()).await.unwrap();
+        assert!(
+            registry
+                .deliver_event("sink-edited", &request)
+                .await
+                .is_err()
+        );
+        assert_eq!(*calls.read().await, before, "the reload re-opened the tap");
     }
 
     #[tokio::test]

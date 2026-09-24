@@ -32,6 +32,26 @@ The API reads `PLUGIN_DIR` (default `plugins.d`). Each `*.json` file is a `Plugi
 
 At reload/start the registry attempts `GET /v1/plugin/manifest`. The embedded manifest is a fallback so an offline plugin is still visible in operations UI.
 
+## Registering a plugin
+
+Two places, and the second is new:
+
+- **`plugins.d/*.json` on the box.** The bootstrap. A control plane whose
+  database is having a bad day still comes up with the plugins it was
+  installed with.
+- **Connected from the dashboard**, by an owner. The control plane asks the
+  endpoint what it is before writing anything down, so a registration for
+  something that never answered is not a row nobody can explain a month later.
+  The id comes from the plugin's own manifest, not from the form.
+
+A stored registration wins over a file with the same id: somebody typed it
+more recently. Removing it brings the file's version back on the next reload.
+
+A registration can name a customer. Today that scope is recorded and shown; it
+does not yet route a customer's storage or inference to their own plugin,
+which is a deeper change across every call site and is not pretended
+otherwise.
+
 ## Common endpoints
 
 - `GET /v1/plugin/manifest`
@@ -105,6 +125,23 @@ Event kinds today: `camera_offline`, `camera_recovered`, `gateway_offline`,
 `gateway_recovered`, and `test` for the dashboard's "send a test event". A
 sink must ignore kinds it does not know: more will be added without a protocol
 bump.
+
+## Timeouts and what happens when a plugin is down
+
+Calls are given the time their kind deserves rather than one flat number:
+three seconds for a manifest or a health check, eight for signing a URL or
+delivering an event, and thirty — `PLUGIN_AI_TIMEOUT_SECONDS` — for running a
+model. One number for all of them means either a model gets cut off or a dead
+plugin holds a request open for half a minute.
+
+After three failures in a row the control plane stops calling that plugin for
+a cooling period: fifteen seconds, doubling to at most five minutes. While it
+is cooling off, calls fail at once with a message saying how long is left, and
+the dashboard's plugin card says the same. A success clears it.
+
+A plugin that is down otherwise costs every caller the full timeout, one after
+another, for as long as it stays down. Reloading `plugins.d` does not clear
+the state: editing a manifest is not evidence that the plugin came back.
 
 ## Versioning
 

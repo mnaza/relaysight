@@ -2,7 +2,8 @@
 
 use crate::store::{
     CameraRecord, DeliveryView, DueDelivery, EventView, HealthHour, OrganizationRecord,
-    SessionUser, SiteRecord, Store, StoreError, StoredUser, parse_ts, token_hash, ts,
+    SessionUser, SiteRecord, Store, StoreError, StoredRegistration, StoredUser, parse_ts,
+    token_hash, ts,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -904,6 +905,61 @@ impl Store for SqliteStore {
             .bind(ts(&cutoff))
             .execute(&self.pool)
             .await?;
+        Ok(())
+    }
+
+    async fn plugin_registrations(&self) -> Result<Vec<StoredRegistration>, StoreError> {
+        let rows = sqlx::query("SELECT * FROM plugin_registrations ORDER BY plugin_id")
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter()
+            .map(|row| {
+                Ok(StoredRegistration {
+                    plugin_id: row.try_get("plugin_id")?,
+                    endpoint: row.try_get("endpoint")?,
+                    placement: row.try_get("placement")?,
+                    enabled: row.try_get::<i64, _>("enabled")? != 0,
+                    token_env: row.try_get("token_env")?,
+                    customer_id: row.try_get("customer_id")?,
+                })
+            })
+            .collect()
+    }
+
+    async fn save_plugin_registration(
+        &self,
+        registration: &StoredRegistration,
+        now: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO plugin_registrations
+                 (plugin_id, endpoint, placement, enabled, token_env, customer_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(plugin_id) DO UPDATE SET
+                 endpoint = excluded.endpoint, placement = excluded.placement,
+                 enabled = excluded.enabled, token_env = excluded.token_env,
+                 customer_id = excluded.customer_id",
+        )
+        .bind(&registration.plugin_id)
+        .bind(&registration.endpoint)
+        .bind(&registration.placement)
+        .bind(i64::from(registration.enabled))
+        .bind(&registration.token_env)
+        .bind(&registration.customer_id)
+        .bind(ts(&now))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn delete_plugin_registration(&self, plugin_id: &str) -> Result<(), StoreError> {
+        let removed = sqlx::query("DELETE FROM plugin_registrations WHERE plugin_id = ?1")
+            .bind(plugin_id)
+            .execute(&self.pool)
+            .await?;
+        if removed.rows_affected() == 0 {
+            return Err(StoreError::NotFound);
+        }
         Ok(())
     }
 

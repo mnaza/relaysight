@@ -81,11 +81,12 @@
 
 ## Plugin productionization
 
-- [ ] Persist plugin definitions/bindings in Postgres instead of only `plugins.d`
-- [ ] Per-organization plugin binding UI
+- [x] Persist plugin definitions in the store instead of only `plugins.d` — connected from the dashboard by an owner, stored rows winning over files (`docs/PLUGIN-SDK.md`)
+- [ ] Per-organization plugin binding — the scope is stored and shown; routing a customer's calls to their own plugin is not done
 - [ ] Vault-backed plugin connection secrets
 - [ ] mTLS/service identity for plugin calls
-- [ ] Network policies / resource limits / plugin timeouts and circuit breaker metrics
+- [x] Plugin timeouts and a circuit breaker — per-kind timeouts and a breaker that trips after three consecutive failures and cools off, visible on the plugin card (`docs/PLUGIN-SDK.md`)
+- [ ] Network policies / resource limits for plugin containers
 - [ ] AI snapshot/frame scheduler
 - [x] Event-sink capability implementation — contract, runtime call, and a reference webhook sink in `relaysight-plugins`
 - [x] Storage lifecycle / archive index integration (prototype/in-memory)

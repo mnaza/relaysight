@@ -103,3 +103,47 @@ test('a viewer is not shown a panel they cannot use', async () => {
   await startDashboard({ brand, locale: 'en', dict });
   assert.ok(document.querySelector('#users').hidden, 'the users panel stayed up for a viewer');
 });
+
+test('a plugin the core is leaving alone says so on its card', async () => {
+  // "Offline" and "we stopped trying for two minutes" are different facts,
+  // and the second one explains why nothing is being retried.
+  const plugins = [{
+    endpoint: 'http://sink:9003', placement: 'control_plane', enabled: true,
+    reachable: false, cooling_off_seconds: 120, last_error: 'connection refused',
+    manifest: { id: 'webhook-sink', name: 'Webhook', version: '0.1.0', protocol_version: 1,
+                vendor: 'example', description: '', capabilities: ['event_sink'] },
+  }];
+  const inner = globalThis.fetch;
+  globalThis.fetch = async (url, options) => {
+    if (String(url).startsWith('api/v1/plugins')) {
+      return { ok: true, status: 200, json: async () => plugins };
+    }
+    return inner(url, options);
+  };
+  await startDashboard({ brand, locale: 'en', dict });
+  const card = document.querySelector('#plugins-grid .plugin-card');
+  assert.match(card.textContent, /120/);
+  assert.match(card.textContent, new RegExp(dict['app.plugins.cooling'].split('{')[0].trim()));
+});
+
+test('an owner can connect a plugin from the dashboard', async () => {
+  await startDashboard({ brand, locale: 'en', dict });
+  const form = document.querySelector('#plugin-form');
+  assert.ok(!form.hidden, 'an owner sees the form');
+  form.querySelector('[name="endpoint"]').value = 'http://storage:9002';
+  form.querySelector('[name="tokenEnv"]').value = 'STORAGE_PLUGIN_TOKEN';
+  form.dispatchEvent(new Event('submit', { cancelable: true, bubbles: true }));
+  await new Promise(resolve => setTimeout(resolve, 10));
+
+  const sent = posted.find(entry => entry.path === 'api/v1/plugins/registrations');
+  assert.ok(sent, JSON.stringify(posted));
+  assert.equal(sent.body.endpoint, 'http://storage:9002');
+  assert.equal(sent.body.token_env, 'STORAGE_PLUGIN_TOKEN');
+  assert.equal(sent.body.customer_id, null);
+});
+
+test('a viewer is not offered the plugin form either', async () => {
+  stubFetch({ usersStatus: 403 });
+  await startDashboard({ brand, locale: 'en', dict });
+  assert.ok(document.querySelector('#plugin-form').hidden);
+});

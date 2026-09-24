@@ -146,6 +146,7 @@ async fn main() -> anyhow::Result<()> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(75);
+
     let state = AppState {
         gateways: Arc::new(RwLock::new(HashMap::new())),
         camera_batches: Arc::new(RwLock::new(HashMap::new())),
@@ -188,6 +189,10 @@ async fn main() -> anyhow::Result<()> {
         up_since: std::time::Instant::now(),
     };
 
+    // Plugins somebody connected from the dashboard, beside the ones on disk.
+    if reload_plugins(&state).await.is_err() {
+        warn!("stored plugin registrations could not be loaded; plugins.d only");
+    }
     let app = build_router(state.clone());
 
     tokio::spawn(retention_loop(state.clone()));
@@ -341,6 +346,14 @@ fn build_router(state: AppState) -> Router {
         .route("/api/v1/users", get(list_users).post(create_user))
         .route("/api/v1/users/{user_id}", post(update_user))
         .route("/api/v1/plugins/reload", post(plugins_reload))
+        .route(
+            "/api/v1/plugins/registrations",
+            post(create_plugin_registration),
+        )
+        .route(
+            "/api/v1/plugins/registrations/{plugin_id}/delete",
+            post(delete_plugin_registration),
+        )
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             crate::auth::require_owner,
@@ -1174,11 +1187,99 @@ async fn plugins_list(State(state): State<AppState>) -> Json<Vec<RegisteredPlugi
 async fn plugins_reload(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<RegisteredPlugin>>, StatusCode> {
+    reload_plugins(&state).await?;
+    Ok(Json(state.plugins.list().await))
+}
+
+/// Load the plugins on disk, then the ones somebody connected from the
+/// dashboard. A row wins over a file with the same id.
+async fn reload_plugins(state: &AppState) -> Result<(), StatusCode> {
+    let stored = state
+        .store
+        .plugin_registrations()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|row| vms_plugin_sdk::PluginRegistration {
+            endpoint: row.endpoint,
+            placement: match row.placement.as_str() {
+                "edge" => vms_plugin_sdk::PluginPlacement::Edge,
+                "either" => vms_plugin_sdk::PluginPlacement::Either,
+                _ => vms_plugin_sdk::PluginPlacement::ControlPlane,
+            },
+            enabled: row.enabled,
+            token_env: row.token_env,
+            manifest: None,
+        })
+        .collect();
     state
         .plugins
-        .reload(state.plugin_dir.as_ref())
+        .reload_with(state.plugin_dir.as_ref(), stored)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+/// Connect a plugin: the control plane asks it what it is, and keeps the
+/// registration if it answers something this build can speak to.
+async fn create_plugin_registration(
+    State(state): State<AppState>,
+    Extension(who): Extension<crate::store::SessionUser>,
+    Json(request): Json<crate::store::StoredRegistration>,
+) -> Result<Json<Vec<RegisteredPlugin>>, (StatusCode, String)> {
+    let endpoint = request.endpoint.trim().to_owned();
+    if !endpoint.starts_with("http://") && !endpoint.starts_with("https://") {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a plugin endpoint is an http or https URL".into(),
+        ));
+    }
+    // Ask it who it is before writing anything down: a registration for a
+    // plugin that never answers is a row nobody can explain later.
+    let probe = vms_plugin_sdk::PluginRegistration {
+        endpoint: endpoint.clone(),
+        placement: vms_plugin_sdk::PluginPlacement::ControlPlane,
+        enabled: true,
+        token_env: request.token_env.clone(),
+        manifest: None,
+    };
+    let manifest = state
+        .plugins
+        .describe(&probe)
+        .await
+        .map_err(|error| (StatusCode::BAD_GATEWAY, error.to_string()))?;
+
+    let row = crate::store::StoredRegistration {
+        plugin_id: manifest.id.clone(),
+        endpoint,
+        placement: request.placement,
+        enabled: true,
+        token_env: request.token_env,
+        customer_id: request.customer_id,
+    };
+    state
+        .store
+        .save_plugin_registration(&row, Utc::now())
+        .await
+        .map_err(|err| (store_status(err), String::new()))?;
+    audit(&state, &who.email, "plugin.connected", &row.plugin_id, None).await;
+    reload_plugins(&state)
+        .await
+        .map_err(|status| (status, String::new()))?;
+    Ok(Json(state.plugins.list().await))
+}
+
+async fn delete_plugin_registration(
+    State(state): State<AppState>,
+    Path(plugin_id): Path<String>,
+    Extension(who): Extension<crate::store::SessionUser>,
+) -> Result<Json<Vec<RegisteredPlugin>>, StatusCode> {
+    state
+        .store
+        .delete_plugin_registration(&plugin_id)
+        .await
+        .map_err(store_status)?;
+    audit(&state, &who.email, "plugin.disconnected", &plugin_id, None).await;
+    reload_plugins(&state).await?;
     Ok(Json(state.plugins.list().await))
 }
 
@@ -3293,6 +3394,133 @@ mod tests {
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     }
 
+    /// Connecting a plugin from the dashboard, which until now meant a shell
+    /// on the box and a file in plugins.d.
+    #[tokio::test]
+    async fn an_owner_can_connect_a_plugin_and_disconnect_it() {
+        let (endpoint, _) = fake_sink("sink-1", true).await;
+        let state = test_state().await;
+        seed_admin(&state).await;
+        let owner = login_cookie(&state).await;
+
+        let (status, listed) = send(
+            &state,
+            with_cookie(
+                post(
+                    "/api/v1/plugins/registrations",
+                    None,
+                    serde_json::json!({
+                        "plugin_id": "", "endpoint": endpoint,
+                        "placement": "control_plane", "enabled": true,
+                        "token_env": null, "customer_id": null,
+                    }),
+                ),
+                &owner,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{listed}");
+        assert!(
+            listed
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|plugin| plugin["manifest"]["id"] == "sink-1"),
+            "the plugin should be live immediately: {listed}"
+        );
+        // The id came from the plugin's own manifest, not from the form.
+        let stored = state.store.plugin_registrations().await.unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].plugin_id, "sink-1");
+
+        let (status, listed) = send(
+            &state,
+            with_cookie(
+                post(
+                    "/api/v1/plugins/registrations/sink-1/delete",
+                    None,
+                    serde_json::json!({}),
+                ),
+                &owner,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(listed.as_array().unwrap().is_empty(), "{listed}");
+        assert!(state.store.plugin_registrations().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_plugin_that_does_not_answer_is_not_written_down() {
+        // A registration for something that never answered is a row nobody
+        // can explain a month later.
+        let state = test_state().await;
+        seed_admin(&state).await;
+        let owner = login_cookie(&state).await;
+        let (status, _) = send(
+            &state,
+            with_cookie(
+                post(
+                    "/api/v1/plugins/registrations",
+                    None,
+                    serde_json::json!({
+                        "plugin_id": "", "endpoint": "http://127.0.0.1:1",
+                        "placement": "control_plane", "enabled": true,
+                        "token_env": null, "customer_id": null,
+                    }),
+                ),
+                &owner,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(state.store.plugin_registrations().await.unwrap().is_empty());
+
+        // And something that is not a URL is refused before anything is
+        // dialled at all.
+        let (status, _) = send(
+            &state,
+            with_cookie(
+                post(
+                    "/api/v1/plugins/registrations",
+                    None,
+                    serde_json::json!({
+                        "plugin_id": "", "endpoint": "sink:9003",
+                        "placement": "control_plane", "enabled": true,
+                        "token_env": null, "customer_id": null,
+                    }),
+                ),
+                &owner,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn connecting_a_plugin_is_an_owners_job() {
+        let state = test_state().await;
+        seed_admin(&state).await;
+        let technician = user_cookie(&state, "technician").await;
+        let (status, _) = send(
+            &state,
+            with_cookie(
+                post(
+                    "/api/v1/plugins/registrations",
+                    None,
+                    serde_json::json!({
+                        "plugin_id": "", "endpoint": "http://127.0.0.1:1",
+                        "placement": "control_plane", "enabled": true,
+                        "token_env": null, "customer_id": null,
+                    }),
+                ),
+                &technician,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
     #[tokio::test]
     async fn a_viewer_may_look_and_may_not_touch() {
         let state = test_state().await;
@@ -3309,6 +3537,8 @@ mod tests {
             ("POST", "/api/v1/cameras/cam-1/clips"),
             ("GET", "/api/v1/users"),
             ("POST", "/api/v1/plugins/reload"),
+            ("POST", "/api/v1/plugins/registrations"),
+            ("POST", "/api/v1/plugins/registrations/p-1/delete"),
             ("GET", "/api/v1/audit"),
         ] {
             let (status, _) =

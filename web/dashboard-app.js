@@ -1015,7 +1015,9 @@ export async function startDashboard({ brand, locale, dict }) {
       </div>
       <div class="plugin-description">${escapeHtml(manifest.description || '')}</div>
       <div class="capability-row">${caps}</div>
-      <div class="plugin-actions"><small>${escapeHtml(plugin.reachable ? t(dict,'app.plugins.online') : t(dict,'app.plugins.offline'))}</small><button class="button small" data-plugin-test>${escapeHtml(t(dict,'app.plugins.test'))}</button></div>`;
+      <div class="plugin-actions"><small>${escapeHtml(plugin.cooling_off_seconds
+        ? t(dict,'app.plugins.cooling').replace('{seconds}', plugin.cooling_off_seconds)
+        : plugin.reachable ? t(dict,'app.plugins.online') : t(dict,'app.plugins.offline'))}</small><button class="button small" data-plugin-test>${escapeHtml(t(dict,'app.plugins.test'))}</button></div>`;
       const button = card.querySelector('[data-plugin-test]');
       button.addEventListener('click', async () => {
         button.disabled = true; button.textContent = t(dict,'app.plugins.testing');
@@ -1029,6 +1031,33 @@ export async function startDashboard({ brand, locale, dict }) {
     }
   }
   renderPlugins();
+
+  // Connecting a plugin used to mean a shell on the box and a file in
+  // plugins.d. Owner-only, like the people panel: the API refuses anybody
+  // else, and offering the form would be a promise it then breaks.
+  const pluginForm = document.querySelector('#plugin-form');
+  if (pluginForm) {
+    pluginForm.hidden = !Array.isArray(users);
+    pluginForm.addEventListener('submit', async event => {
+      event.preventDefault();
+      const data = new FormData(pluginForm);
+      const response = await fetch('api/v1/plugins/registrations', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          plugin_id: '',
+          endpoint: String(data.get('endpoint') || '').trim(),
+          placement: 'control_plane',
+          enabled: true,
+          token_env: String(data.get('tokenEnv') || '').trim() || null,
+          customer_id: String(data.get('customerId') || '').trim() || null,
+        }),
+      }).catch(() => null);
+      if (!response || !response.ok) { alert(t(dict, 'app.plugins.connectFailed')); return; }
+      pluginForm.reset();
+      plugins = await loadPlugins();
+      renderPlugins();
+    });
+  }
   document.querySelector('#plugins-link').addEventListener('click', () => setTimeout(() => document.querySelector('#plugins')?.scrollIntoView({behavior:'smooth'}), 0));
   document.querySelector('#reload-plugins').addEventListener('click', async event => {
     const button = event.currentTarget; button.disabled = true;

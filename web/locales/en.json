@@ -252,5 +252,11 @@
   "app.users.disabled": "turned off",
   "app.users.disable": "Turn off",
   "app.users.enable": "Turn on",
-  "app.users.failed": "That change was refused"
+  "app.users.failed": "That change was refused",
+  "app.plugins.cooling": "Not answering · left alone for {seconds}s",
+  "app.plugins.endpoint": "Plugin endpoint",
+  "app.plugins.tokenEnv": "Token env var (optional)",
+  "app.plugins.customer": "Customer (optional)",
+  "app.plugins.connect": "Connect plugin",
+  "app.plugins.connectFailed": "That plugin did not answer, so nothing was saved"
 }
