@@ -26,8 +26,11 @@ argon2 = { version = "0.6", features = ["getrandom"] }
 vms-domain = { path = "../../crates/domain" }
 vms-plugin-sdk = { path = "../../crates/plugin-sdk" }
 vms-plugin-runtime = { path = "../../crates/plugin-runtime" }
+jsonwebtoken = "9"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 tempfile = "3"
+rsa = { version = "0.9", features = ["pem"] }
+vms-fake-oidc = { path = "../../crates/fake-oidc" }

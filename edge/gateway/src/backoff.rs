@@ -78,6 +78,15 @@ impl Backoff {
         self.state.remove(camera_id);
     }
 
+    /// Why this camera is considered unreachable, and how many dials say so.
+    /// `skip_reason` only answers inside the wait window; this one answers for
+    /// as long as the camera has not come back, which is what somebody asking
+    /// to watch it needs to know.
+    pub fn offline_reason(&self, camera_id: &str) -> Option<(u32, String)> {
+        let entry = self.state.get(camera_id)?;
+        (entry.failures > 0).then(|| (entry.failures, entry.last_error.clone()))
+    }
+
     /// How many consecutive failures this camera has. Zero once it answers.
     pub fn failures(&self, camera_id: &str) -> u32 {
         self.state.get(camera_id).map_or(0, |e| e.failures)

@@ -1,0 +1,103 @@
+<!doctype html>
+<!--
+  The browser half of `make check-live`. Served from a temporary directory by
+  the check's own proxy, never from web/ — it logs in, so it has no business in
+  the dashboard. @PASSWORD@ is replaced with the run's generated password.
+-->
+<meta charset="utf-8">
+<title>check-live</title>
+<video id="video" autoplay muted playsinline></video>
+<script type="module">
+const say = message => { try { dump('CHECKLIVE ' + message + '\n'); } catch (error) {} };
+const json = async (path, init) => (await fetch(path, init)).json();
+const post = (path, body) => fetch(path, {
+  method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+});
+
+try {
+  const login = await post('/api/v1/auth/login', { email: 'admin@localhost', password: '@PASSWORD@' });
+  say('login=' + login.status);
+  if (login.status !== 204) throw new Error('could not log in');
+
+  const cameras = await json('/api/v1/cameras');
+  const camera = cameras.find(one => one.status === 'healthy') || cameras[0];
+  say(`camera=${camera.name} status=${camera.status} codec=${camera.codec || '-'}`);
+
+  const rtc = await json('/api/v1/rtc/config');
+  const peer = new RTCPeerConnection({
+    iceServers: (rtc.ice_servers || []).map(server => ({
+      urls: server.urls,
+      username: server.username || undefined,
+      credential: server.credential || undefined,
+    })),
+  });
+  const track = new Promise(resolve => {
+    peer.ontrack = event => {
+      document.getElementById('video').srcObject = event.streams[0];
+      resolve(event.track);
+    };
+  });
+  peer.addTransceiver('video', { direction: 'recvonly' });
+  await peer.setLocalDescription(await peer.createOffer());
+  // Not trickle: the gateway answers once, so the offer has to carry every
+  // candidate this browser is going to find.
+  await new Promise(resolve => {
+    if (peer.iceGatheringState === 'complete') return resolve();
+    const settled = () => {
+      if (peer.iceGatheringState !== 'complete') return;
+      peer.removeEventListener('icegatheringstatechange', settled);
+      resolve();
+    };
+    peer.addEventListener('icegatheringstatechange', settled);
+    setTimeout(resolve, 10000);
+  });
+  const sdp = peer.localDescription.sdp;
+  const candidates = (sdp.match(/a=candidate/g) || []).length;
+  say(`offer candidates=${candidates} h264=${sdp.includes('H264') ? 'yes' : 'NO'}`);
+  if (!sdp.includes('H264')) throw new Error('this browser offered no H.264; OpenH264 is off');
+
+  const started = await (await post(`/api/v1/cameras/${camera.camera_id}/live`, {
+    offer_sdp: sdp, offer_type: 'offer', session_seconds: 60,
+  })).json();
+  say('live command=' + started.command_id);
+
+  let answer = null;
+  for (let attempt = 0; attempt < 40 && !answer; attempt += 1) {
+    const view = await json('/api/v1/commands/' + started.command_id);
+    if (view.status === 'succeeded') answer = view.result.live;
+    else if (view.status === 'failed') throw new Error('refused: ' + (view.result?.error || '?'));
+    else await new Promise(resolve => setTimeout(resolve, 500));
+  }
+  if (!answer) throw new Error('the gateway never answered the offer');
+  await peer.setRemoteDescription({ type: answer.sdp_type, sdp: answer.sdp });
+  say('answer codec=' + answer.codec);
+
+  await Promise.race([track, new Promise(resolve => setTimeout(resolve, 15000))]);
+  for (let second = 0; second < 30; second += 1) {
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    let decoded = 0, bytes = 0, width = 0, height = 0, packets = 0, dropped = 0;
+    (await peer.getStats()).forEach(report => {
+      if (report.type === 'inbound-rtp' && report.kind === 'video') {
+        decoded = report.framesDecoded || 0;
+        bytes = report.bytesReceived || 0;
+        width = report.frameWidth || 0;
+        height = report.frameHeight || 0;
+        packets = report.packetsReceived || 0;
+        dropped = report.packetsLost || 0;
+      }
+    });
+    if (second === 5) say(`packets=${packets} lost=${dropped}`);
+    if (decoded > 0) {
+      say(`ice=${peer.iceConnectionState} decoded=${decoded} bytes=${bytes} size=${width}x${height}`);
+      break;
+    }
+    if (second % 5 === 0) {
+      say(`ice=${peer.iceConnectionState} decoded=0 bytes=${bytes} waiting=${second}s`);
+    }
+  }
+} catch (error) {
+  say('ERROR ' + error);
+}
+say('done');
+window.close();
+</script>

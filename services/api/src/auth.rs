@@ -207,7 +207,7 @@ fn ensure_seedable(password: &str) -> anyhow::Result<()> {
 }
 
 pub const SESSION_COOKIE: &str = "vms_session";
-const SESSION_DAYS: i64 = 7;
+pub(crate) const SESSION_DAYS: i64 = 7;
 
 /// The session id out of the Cookie header, if any.
 pub fn session_cookie(headers: &HeaderMap) -> Option<String> {

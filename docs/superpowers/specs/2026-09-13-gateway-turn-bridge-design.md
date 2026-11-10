@@ -100,9 +100,13 @@ Per stream URL: a UDP socket bound to `127.0.0.1:0`, and the URL replaced by
 `turn:127.0.0.1:<port>?transport=udp` with the entry's username and credential.
 A task per bridge:
 
-*(Superseded 2026-09-20 by `relaysight-vms-ocy`: a bridge carries the first
-source that speaks and ignores any other, since webrtc-rs gives it one socket.
-Everything else below still holds.)*
+*(Amended 2026-09-20 and corrected 2026-09-25: a bridge carries at most
+`MAX_PEERS` local sockets rather than one per address it has ever seen. The
+2026-09-20 version carried exactly one, on the belief that webrtc-rs gives a
+bridge a single socket. It does not — gathering one relayed candidate against
+a real relay arrived from seven local ports — and everything past the first
+was dropped, so `make check-gateway-relay` gathered nothing at all for five
+days. Everything else below still holds.)*
 
 - **Outbound.** For each datagram from a source address, write it unchanged to
   that source's connection to the relay (`turns:` → TLS, `turn:…?transport=tcp`

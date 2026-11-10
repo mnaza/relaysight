@@ -12,6 +12,7 @@ const dict = JSON.parse(read('locales/en.json'));
 
 let requireSession, installUnauthorizedTrap;
 let responses; // path suffix -> status
+let payloads; // path suffix -> what a GET of it answers with
 let bodies; // path suffix -> the body that was posted to it
 
 function stubFetch() {
@@ -26,7 +27,7 @@ function stubFetch() {
     return {
       ok: status >= 200 && status < 300,
       status,
-      json: async () => ({}),
+      json: async () => (match ? payloads[match[0]] ?? {} : {}),
       _options: options,
     };
   };
@@ -45,6 +46,7 @@ function loadPage() {
 beforeEach(async () => {
   loadPage();
   responses = {};
+  payloads = {};
   bodies = {};
   stubFetch();
   ({ requireSession, installUnauthorizedTrap } = await import('../auth.js'));
@@ -134,4 +136,38 @@ test('a rejected password change shows the error, not the success line', async (
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.equal(document.querySelector('#password-error').hidden, false);
   assert.equal(document.querySelector('#password-done').hidden, true);
+});
+
+test('no identity provider means no button offering one', async () => {
+  responses['api/v1/auth/session'] = 401;
+  responses['api/v1/auth/methods'] = 200;
+  payloads['api/v1/auth/methods'] = { password: true, sso: false, sso_label: null };
+  requireSession(dict);
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(document.querySelector('#sso-row').hidden, true,
+    'a button that goes nowhere is worse than no button');
+});
+
+test('an API that cannot be asked about providers offers none', async () => {
+  // An older API answers 404 for the methods endpoint; the form still works.
+  responses['api/v1/auth/session'] = 401;
+  requireSession(dict);
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(document.querySelector('#sso-row').hidden, true);
+  assert.ok(document.querySelector('#login-view').classList.contains('open'));
+});
+
+test('a configured provider gets a button that says whose it is', async () => {
+  responses['api/v1/auth/session'] = 401;
+  responses['api/v1/auth/methods'] = 200;
+  payloads['api/v1/auth/methods'] = { password: true, sso: true, sso_label: 'id.example.test' };
+  requireSession(dict);
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(document.querySelector('#sso-row').hidden, false);
+  const button = document.querySelector('#sso-button');
+  assert.match(button.textContent, /id\.example\.test/);
+  assert.match(button.getAttribute('href'), /auth\/oidc\/start/);
+  // And the password form is still there: somebody has to be able to get in
+  // when the provider is down.
+  assert.ok(document.querySelector('#login-form input[name=password]'));
 });

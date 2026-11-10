@@ -89,15 +89,23 @@ impl Ingest {
         self.lock().allowed.contains(key)
     }
 
-    /// Frames from a publisher on this key, if one has published. The source
-    /// ends when the publisher does.
+    /// Frames from a publisher on this key, as they arrive: AVCC, which is
+    /// what fMP4 stores. The source ends when the publisher does.
     pub fn subscribe(&self, key: &str) -> Option<PushedSource> {
+        self.subscribe_as(key, crate::frames::Framing::Avcc)
+    }
+
+    /// The same, framed the way a consumer needs it. A browser needs Annex B
+    /// with the parameter sets in band; FLV carries neither, so for
+    /// `Framing::AnnexB` each frame is converted as it is read.
+    pub fn subscribe_as(&self, key: &str, framing: crate::frames::Framing) -> Option<PushedSource> {
         let inner = self.lock();
         let stream = inner.streams.get(key)?;
         Some(PushedSource {
             frames: stream.frames.subscribe(),
             state: Arc::clone(&stream.state),
             key: key.to_owned(),
+            framing,
         })
     }
 
@@ -154,6 +162,35 @@ pub struct PushedSource {
     frames: broadcast::Receiver<Frame>,
     state: Arc<Mutex<StreamState>>,
     key: String,
+    framing: crate::frames::Framing,
+}
+
+impl PushedSource {
+    /// AVCC in, Annex B out, with SPS and PPS in front of every key frame.
+    /// Without this a browser receives the stream and decodes none of it.
+    fn framed(&self, frame: Frame) -> Frame {
+        if self.framing == crate::frames::Framing::Avcc {
+            return frame;
+        }
+        let (sets, length_size) = {
+            let state = lock(&self.state);
+            match state.avcc.as_ref() {
+                Some(avcc) => (
+                    crate::rtmp::flv::parameter_sets(avcc).unwrap_or_default(),
+                    crate::rtmp::flv::nalu_length_size(avcc),
+                ),
+                // Nothing has described the stream yet. Convert the framing
+                // anyway: a decoder that is handed start codes can at least
+                // wait for the parameter sets to arrive.
+                None => (Vec::new(), 4),
+            }
+        };
+        Frame {
+            data: crate::rtmp::flv::to_annex_b(&frame.data, length_size, &sets, frame.keyframe)
+                .into(),
+            ..frame
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -161,7 +198,7 @@ impl FrameSource for PushedSource {
     async fn next_frame(&mut self) -> anyhow::Result<Option<Frame>> {
         loop {
             match self.frames.recv().await {
-                Ok(frame) => return Ok(Some(frame)),
+                Ok(frame) => return Ok(Some(self.framed(frame))),
                 // This consumer fell behind the publisher. Skipping ahead beats
                 // ending the recording, and the next keyframe repairs it.
                 Err(broadcast::error::RecvError::Lagged(frames)) => {

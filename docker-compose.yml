@@ -24,6 +24,13 @@ services:
       RTC_TURN_URLS: ${RTC_TURN_URLS:-}
       RTC_TURN_SECRET: ${RTC_TURN_SECRET:-}
       RTC_TURN_TTL_SECS: ${RTC_TURN_TTL_SECS:-600}
+      # Single sign-on. An empty issuer means none, and the login form is
+      # exactly what it was. See docs/SSO.md.
+      OIDC_ISSUER: ${OIDC_ISSUER:-}
+      OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:-}
+      OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:-}
+      OIDC_REDIRECT_URL: ${OIDC_REDIRECT_URL:-}
+      OIDC_AUTOCREATE_ROLE: ${OIDC_AUTOCREATE_ROLE:-}
       AI_PLUGIN_TOKEN: ${AI_PLUGIN_TOKEN:-demo-ai-plugin-token}
       STORAGE_PLUGIN_TOKEN: ${STORAGE_PLUGIN_TOKEN:-demo-storage-plugin-token}
       WEBHOOK_PLUGIN_TOKEN: ${WEBHOOK_PLUGIN_TOKEN:-demo-webhook-plugin-token}

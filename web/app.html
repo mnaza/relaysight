@@ -15,6 +15,7 @@
       <label class="field"><span data-i18n="app.auth.password"></span><input name="password" type="password" required autocomplete="current-password" /></label>
       <div id="login-error" class="form-error" hidden data-i18n="app.auth.failed"></div>
       <div class="modal-actions"><button class="button primary" type="submit" data-i18n="app.auth.signIn"></button></div>
+      <div id="sso-row" class="login-sso" hidden><a id="sso-button" class="button" href="api/v1/auth/oidc/start"></a></div>
     </form>
   </div>
   <div class="app-shell">
@@ -27,6 +28,7 @@
         <a class="sidebar-link" href="#fleet"><span class="nav-icon">◉</span><span data-i18n="app.cameras"></span></a>
         <a class="sidebar-link" href="#incidents"><span class="nav-icon">△</span><span data-i18n="app.events"></span></a>
         <a class="sidebar-link" href="#gateways"><span class="nav-icon">⇄</span><span data-i18n="app.gateways"></span></a>
+        <a id="wall-link" class="sidebar-link" href="#wall"><span class="nav-icon">▦</span><span data-i18n="app.wall.nav"></span></a>
         <a id="plugins-link" class="sidebar-link" href="#plugins"><span class="nav-icon">✦</span><span data-i18n="app.plugins"></span></a>
         <a id="brand-settings-link" class="sidebar-link" href="#branding"><span class="nav-icon">⚙</span><span data-i18n="app.settings"></span></a>
       </nav>
@@ -171,6 +173,36 @@
           <div id="plugins-grid" class="plugins-grid"></div>
         </section>
       </div>
+      <section id="wall-view" class="wall-view" hidden>
+        <header class="wall-bar">
+          <div class="wall-bar-title">
+            <strong data-i18n="app.wall.title"></strong>
+            <div class="metric-sub" data-i18n="app.wall.subtitle"></div>
+          </div>
+          <label class="field"><span data-i18n="app.wall.layout"></span><select id="wall-layout">
+            <option value="auto" data-i18n="app.wall.layoutAuto"></option>
+            <option value="2">2 &times; 2</option>
+            <option value="3">3 &times; 3</option>
+            <option value="4">4 &times; 4</option>
+          </select></label>
+          <label class="field"><span data-i18n="app.wall.cap"></span><select id="wall-cap">
+            <option value="1">1</option>
+            <option value="2">2</option>
+            <option value="4">4</option>
+            <option value="8">8</option>
+            <option value="0" data-i18n="app.wall.capAll"></option>
+          </select></label>
+          <div class="wall-actions">
+            <button id="wall-watch-all" class="button primary small" data-i18n="app.wall.watchAll"></button>
+            <button id="wall-stop-all" class="button small" data-i18n="app.wall.stopAll"></button>
+            <button id="wall-record-all" class="button small" data-i18n="app.wall.recordAll"></button>
+            <button id="wall-clip-all" class="button small" data-i18n="app.wall.clipAll"></button>
+            <button id="wall-close" class="button small" data-i18n="app.close"></button>
+          </div>
+        </header>
+        <div id="wall-note" class="wall-note"></div>
+        <div id="wall-grid" class="wall-grid"></div>
+      </section>
     </main>
   </div>
 

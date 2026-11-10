@@ -130,16 +130,15 @@ through the API.
 - signed upload of `init.mp4` and `.m4s` via the plugin
 - recording index, timeline, MediaSource playback
 - automatic archive retention
+- users and roles, and single sign-on through OIDC
 - EN, ES, RU dictionaries
-- 95 Rust tests, 55 web tests
+- 430 Rust tests, 103 web tests
 
 ## What does not
 
-- continuous recording policies; archive is on-demand
 - archive audio muxing
 - Postgres for commands and manifests
-- production auth and RBAC
-- SSO, HA, reseller hierarchy
+- SAML, HA, reseller hierarchy
 - AI frame scheduling beyond snapshot-on-demand
 
 Prototype. It runs, it is tested, it has not been through a
@@ -163,7 +162,8 @@ It is not needed to run this. Nothing here links to it unless
 `docs/ARCHIVE.md`, `docs/LIVE.md`, `docs/AI.md`,
 `docs/VIDEO-SOURCES.md`, `docs/RECORDING.md`, `docs/ALERTS.md`,
 `docs/HEALTH.md`, `docs/USERS.md`, `docs/DEVICE-MATRIX.md`,
-`docs/AUDIT.md`, `docs/TUNNEL.md`.
+`docs/AUDIT.md`, `docs/TUNNEL.md`, `docs/SSO.md`,
+`docs/OPERATIONS.md`.
 
 `docs/TURN-COSTS.md` is the one to read if you are pricing
 relay bandwidth. The finding is that a flat-rate box makes

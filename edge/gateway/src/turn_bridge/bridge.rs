@@ -82,21 +82,34 @@ impl Bridge {
     }
 }
 
+/// How many local sockets one bridge will carry.
+///
+/// Seven is what gathering a single relayed candidate took on the machine
+/// this was measured on — one per interface webrtc-rs was willing to try — so
+/// the cap is that with room, and far short of "a session for anything that
+/// finds the port".
+const MAX_PEERS: usize = 16;
+
 impl Drop for Bridge {
     fn drop(&mut self) {
         self.task.abort();
     }
 }
 
-/// A bridge carries one peer: webrtc-rs gives it a single UDP socket. The
-/// first source to speak is that peer, and anything else on this machine that
-/// finds the loopback port is ignored rather than given a relay connection of
-/// its own.
+/// A bridge carries the sockets webrtc-rs sends from, and no more than a
+/// handful of them.
+///
+/// It once carried a session per source address it had ever seen, which any
+/// local process could grow without bound. It then carried exactly one, on
+/// the belief that webrtc-rs gives a bridge a single socket — it does not:
+/// gathering one relayed candidate against a real relay arrived from seven
+/// local ports, and everything past the first was dropped, so nothing
+/// gathered at all. A cap keeps the bound without making that mistake again.
 async fn run(socket: Arc<UdpSocket>, connector: Connector, stats: Arc<BridgeStats>) {
-    // Owned by this task, so aborting it aborts the session with it.
+    // Owned by this task, so aborting it aborts every session with it.
     let mut sessions = JoinSet::new();
-    let mut peer: Option<(SocketAddr, mpsc::Sender<Bytes>)> = None;
-    let mut warned_about_strangers = false;
+    let mut peers: Vec<(SocketAddr, mpsc::Sender<Bytes>)> = Vec::new();
+    let mut warned_about_the_cap = false;
     let mut buf = vec![0u8; 65_536];
     loop {
         let (n, source) = match socket.recv_from(&mut buf).await {
@@ -114,15 +127,24 @@ async fn run(socket: Arc<UdpSocket>, connector: Connector, stats: Arc<BridgeStat
                 return;
             }
         };
-        match &peer {
-            Some((addr, _)) if *addr != source => {
-                if !warned_about_strangers {
-                    warned_about_strangers = true;
-                    warn!(%source, "TURN bridge ignoring datagrams from another local socket");
-                }
-                continue;
-            }
+        let known = peers.iter().position(|(addr, _)| *addr == source);
+        let index = match known {
+            Some(index) => index,
             None => {
+                // A session that has ended leaves a closed queue behind; its
+                // slot is the one a new socket gets before the cap is reached.
+                peers.retain(|(_, queue)| !queue.is_closed());
+                if peers.len() >= MAX_PEERS {
+                    if !warned_about_the_cap {
+                        warned_about_the_cap = true;
+                        warn!(
+                            %source,
+                            peers = peers.len(),
+                            "TURN bridge is carrying as many local sockets as it will"
+                        );
+                    }
+                    continue;
+                }
                 let (tx, rx) = mpsc::channel(QUEUE_WHILE_CONNECTING);
                 sessions.spawn(session(
                     Arc::clone(&socket),
@@ -131,16 +153,13 @@ async fn run(socket: Arc<UdpSocket>, connector: Connector, stats: Arc<BridgeStat
                     rx,
                     Arc::clone(&stats),
                 ));
-                peer = Some((source, tx));
+                peers.push((source, tx));
+                peers.len() - 1
             }
-            Some(_) => {}
-        }
+        };
         // A full queue means the connection is still opening; webrtc-rs retransmits,
-        // so dropping here is cheaper than buffering without bound. The session
-        // never ends on its own, so a closed queue means the bridge is going away.
-        if let Some((_, queue)) = &peer {
-            let _ = queue.try_send(Bytes::copy_from_slice(&buf[..n]));
-        }
+        // so dropping here is cheaper than buffering without bound.
+        let _ = peers[index].1.try_send(Bytes::copy_from_slice(&buf[..n]));
     }
 }
 
@@ -360,23 +379,64 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_second_source_gets_no_connection_of_its_own() {
+    async fn every_socket_webrtc_uses_gets_carried() {
+        // webrtc-rs does not give a bridge one socket. Gathering a single
+        // relayed candidate against a real coturn sends from seven different
+        // local ports on this machine, one per interface it is willing to
+        // try, and each is a TURN client of its own as far as the relay is
+        // concerned. A bridge that carries only the first of them gathers
+        // nothing: `make check-gateway-relay` times out.
         let relay = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let bridge = Bridge::spawn(tcp_connector(relay.local_addr().unwrap()))
             .await
             .unwrap();
-        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let stranger = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
-        let request = allocate_request().raw;
-        peer.send_to(&request, bridge.local_addr()).await.unwrap();
-        let (mut upstream, _) = relay.accept().await.unwrap();
-        let mut arrived = vec![0u8; request.len()];
-        upstream.read_exact(&mut arrived).await.unwrap();
+        let mut sockets = Vec::new();
+        for _ in 0..7 {
+            let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let request = allocate_request().raw;
+            socket.send_to(&request, bridge.local_addr()).await.unwrap();
+            let (mut upstream, _) = tokio::time::timeout(Duration::from_secs(2), relay.accept())
+                .await
+                .expect("each socket opens its own connection to the relay")
+                .unwrap();
+            let mut arrived = vec![0u8; request.len()];
+            upstream.read_exact(&mut arrived).await.unwrap();
+            assert_eq!(arrived, request);
+            sockets.push((socket, upstream));
+        }
+    }
 
-        // webrtc-rs gives a bridge exactly one socket. Anything else on this
-        // machine spraying at the loopback port is not it.
-        stranger
+    #[tokio::test]
+    async fn a_flood_of_local_sockets_is_capped() {
+        // The bound is the point: anything on this machine can find the
+        // loopback port, and a session each — a task, a queue, a 64 KiB
+        // buffer and a connection to the relay — is not something to hand out
+        // on request.
+        let relay = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bridge = Bridge::spawn(tcp_connector(relay.local_addr().unwrap()))
+            .await
+            .unwrap();
+
+        let mut sockets = Vec::new();
+        let mut upstreams = Vec::new();
+        for _ in 0..MAX_PEERS {
+            let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            socket
+                .send_to(&allocate_request().raw, bridge.local_addr())
+                .await
+                .unwrap();
+            upstreams.push(
+                tokio::time::timeout(Duration::from_secs(2), relay.accept())
+                    .await
+                    .expect("a connection for each peer up to the cap")
+                    .unwrap(),
+            );
+            sockets.push(socket);
+        }
+
+        let one_too_many = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        one_too_many
             .send_to(&allocate_request().raw, bridge.local_addr())
             .await
             .unwrap();
@@ -384,19 +444,7 @@ mod tests {
             tokio::time::timeout(Duration::from_millis(300), relay.accept())
                 .await
                 .is_err(),
-            "a second source must not open a second connection to the relay"
-        );
-        let mut buf = [0u8; 64];
-        assert!(
-            tokio::time::timeout(Duration::from_millis(300), upstream.read(&mut buf))
-                .await
-                .is_err(),
-            "a second source's datagrams must not be carried"
-        );
-        assert_eq!(
-            bridge.stats().bytes_up(),
-            request.len() as u64,
-            "only the peer's bytes count"
+            "past the cap, another local socket must not open another connection"
         );
     }
 

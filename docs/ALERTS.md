@@ -47,9 +47,22 @@ docker compose --profile plugins up -d webhook-sink
 
 ```bash
 WEBHOOK_URL=https://hooks.slack.com/services/...   # where to post
-WEBHOOK_FORMAT=text                                # or json, for your own endpoint
+WEBHOOK_FORMAT=text                                # discord for Discord, json for your own
 WEBHOOK_MIN_SEVERITY=critical                      # only the bad ones
 ```
+
+**Which shape a service takes is not a detail.** `text` posts
+`{"text": "…"}`, which Slack and Mattermost take as is. Discord does not: its
+endpoint wants one of `content`, `embeds`, `file` or `poll` and ignores every
+other key, so the Slack shape reaches it as an empty message and comes back
+as HTTP 400, code 50006. `WEBHOOK_FORMAT=discord` sends `{"content": "…"}`
+instead, and appending `/slack` to the Discord webhook URL works too, at
+Discord's own Slack-compatible endpoint. Telegram has no webhook of this
+shape at all — its bot API wants a chat id alongside the message — so it
+needs a bridge in front. A refusal now carries what the service said rather
+than urllib's "HTTP Error 400: Bad Request", and names the setting to change
+when the URL is Discord's; the URL itself never appears in it, because it is
+the whole credential.
 
 Filtering lives in the sink, not in the core: whoever is being woken up
 decides what is worth waking up for. The plugin's own README in
@@ -79,9 +92,35 @@ Events age out with incidents (`INCIDENT_RETENTION_DAYS`).
 
 ## What has never run
 
-- **No real chat service has ever received one of these.** The sink is tested
-  against its own decisions and the core against a sink in the test process.
-  Nobody has pointed it at a live Slack workspace.
+- **The chain has run for real between processes**, with `make check-alert`:
+  the control plane raises a real event, its outbox hands it to the real
+  webhook sink plugin over HTTP, and the sink posts a Slack-shaped
+  `{"text": "…"}` to a URL. Pointed at a receiver on the same machine it
+  proves the plumbing; pointed at a chat service with
+  `make check-alert WEBHOOK_URL=…` it posts to the channel.
+- **A real chat service has received them**, with `make check-alert-chat`:
+  Mattermost 12 in a container, with its own database and its own incoming
+  webhooks, gets a team, a channel and a webhook of its own; then the test
+  alert and a real camera going offline both have to turn up as posts, and the
+  check reads them back out of the channel through Mattermost's API. The second
+  one has to carry the reason the gateway gave — the first run showed "gateway
+  telemetry is stale" instead, because the check's one-second stale window made
+  every camera look silent, and an alert whose reason is an artefact of the
+  clock is worse than terse.
+- **Slack has, on 2026-11-10**: `make check-alert WEBHOOK_URL=…` against a
+  real workspace's incoming webhook, through the whole chain above. The post
+  arrived as the app the webhook belongs to, the blue circle in front of the
+  title rendered as the emoji, and the second line — "Nothing is wrong.
+  Somebody pressed the button." — came out on its own line, so Slack keeps
+  the newline the sink puts between title and body. One message, one
+  workspace, by hand; the URL is a credential and cannot live in a check
+  anybody can run, which is why this is a note and not a target.
+- **Discord and Telegram have not.** Discord would have refused every alert
+  until 2026-10-22: the sink's own comment claimed it took the Slack shape,
+  and Discord's documentation says otherwise. The `discord` format is read
+  from that documentation and proved against a receiver that enforces the
+  same contract — which is not the same as having met Discord. Telegram
+  needs a bridge (above).
 - **No pager, no SMS, no email.** A sink could do any of them; none exists.
 - **Nothing deduplicates a camera that flaps.** A camera going up and down
   every minute raises an event every minute, and a sink that cannot cope with

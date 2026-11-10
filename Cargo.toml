@@ -3,6 +3,7 @@ members = [
   "crates/domain",
   "crates/plugin-sdk",
   "crates/plugin-runtime",
+  "crates/fake-oidc",
   "services/api",
   "edge/gateway",
 ]
@@ -25,3 +26,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uuid = { version = "1", features = ["serde", "v4", "v5"] }
 
+
+# Generating an RSA key with these unoptimised takes seconds, and the fake
+# identity provider generates one every time a test starts it.
+[profile.dev.package.num-bigint-dig]
+opt-level = 3
+
+[profile.dev.package.rsa]
+opt-level = 3

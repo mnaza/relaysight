@@ -1,5 +1,6 @@
 mod auth;
 mod health;
+mod oidc;
 mod store;
 mod turn;
 
@@ -78,6 +79,12 @@ struct AppState {
     /// restart every camera looks silent until its gateway re-reports.
     incident_grace: Duration,
     incident_retention_days: i64,
+    /// The identity provider, when one is configured.
+    oidc: Option<Arc<crate::oidc::OidcConfig>>,
+    /// Sign-ins that have been started and not finished.
+    oidc_attempts: crate::oidc::Attempts,
+    /// One HTTP client for the control plane's own outbound calls.
+    http: reqwest::Client,
     /// Open tunnel sessions, keyed by session id. In memory on purpose: a
     /// restart should close every way into a site network rather than
     /// carrying them across.
@@ -182,6 +189,9 @@ async fn main() -> anyhow::Result<()> {
         login_throttle: Arc::new(tokio::sync::Mutex::new(auth::LoginThrottle::default())),
         cookie_secure: env::var("AUTH_COOKIE_SECURE").is_ok_and(|value| value == "true"),
         incident_grace: Duration::from_secs(stale_camera_seconds.max(0) as u64),
+        oidc: crate::oidc::OidcConfig::from_env().map(Arc::new),
+        oidc_attempts: crate::oidc::Attempts::default(),
+        http: reqwest::Client::new(),
         tunnels: Arc::new(RwLock::new(HashMap::new())),
         tunnel_calls: Arc::new(RwLock::new(HashMap::new())),
         tunnel_answers: Arc::new(RwLock::new(HashMap::new())),
@@ -234,6 +244,12 @@ fn build_router(state: AppState) -> Router {
         .route("/healthz", get(healthz))
         .route("/api/v1/system/edition", get(system_edition))
         .route("/api/v1/auth/login", post(crate::auth::auth_login))
+        .route("/api/v1/auth/methods", get(crate::oidc::auth_methods))
+        .route("/api/v1/auth/oidc/start", get(crate::oidc::oidc_start))
+        .route(
+            "/api/v1/auth/oidc/callback",
+            get(crate::oidc::oidc_callback),
+        )
         .route("/api/v1/auth/session", get(crate::auth::auth_session))
         .route("/api/v1/cameras/telemetry", post(camera_telemetry))
         .route("/api/v1/gateways/heartbeat", post(gateway_heartbeat))
@@ -1078,8 +1094,21 @@ async fn cameras(
             None => offline_camera(record),
         })
         .collect();
-    // A live camera the store has not caught up with yet still shows.
-    values.extend(live.into_values());
+    // A live camera the store has not caught up with yet still shows — unless
+    // it was removed on purpose. A gateway keeps reporting from its cached
+    // source list for a round or two after a source is deleted, and without
+    // this the camera it just removed reappears from that last batch.
+    let removed: std::collections::HashSet<String> = state
+        .store
+        .removed_camera_ids()
+        .await
+        .map_err(store_status)?
+        .into_iter()
+        .collect();
+    values.extend(
+        live.into_values()
+            .filter(|camera| !removed.contains(&camera.camera_id)),
+    );
     for camera in &mut values {
         if (now - camera.last_seen).num_seconds() > state.stale_camera_seconds {
             camera.status = HealthStatus::Offline;
@@ -1404,17 +1433,54 @@ async fn rtc_config(State(state): State<AppState>) -> Json<RtcConfigResponse> {
 }
 
 async fn gateway_for_camera(state: &AppState, camera_id: &str) -> Result<String, StatusCode> {
-    let batches = state.camera_batches.read().await;
-    batches
-        .values()
-        .find_map(|batch| {
+    // A camera removed with its source is gone, whatever the last telemetry
+    // batch still says. Every camera-id endpoint comes through here, so this
+    // is the one place that has to know.
+    if state
+        .store
+        .removed_camera_ids()
+        .await
+        .map_err(store_status)?
+        .iter()
+        .any(|removed| removed == camera_id)
+    {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    // Memory first: it is the freshest word on where a camera is now, and it
+    // is how a revoked gateway's cameras stop being addressable — the revoke
+    // drops its batch.
+    let from_memory = {
+        let batches = state.camera_batches.read().await;
+        batches.values().find_map(|batch| {
             batch
                 .cameras
                 .iter()
                 .any(|camera| camera.camera_id == camera_id)
                 .then(|| batch.gateway_id.clone())
         })
-        .ok_or(StatusCode::NOT_FOUND)
+    };
+    if let Some(gateway_id) = from_memory {
+        return Ok(gateway_id);
+    }
+    // Nothing in memory is not the same as no such camera: a control plane
+    // that has just restarted has an empty cache, and answering 404 there
+    // tells an operator their camera does not exist. The roster knows, and a
+    // revoked gateway is still refused.
+    let gateway_id = state
+        .store
+        .camera_gateway(camera_id)
+        .await
+        .map_err(store_status)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    if state
+        .store
+        .gateway_revoked(&gateway_id)
+        .await
+        .map_err(store_status)?
+    {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    Ok(gateway_id)
 }
 
 async fn enqueue_gateway_command(state: &AppState, command: GatewayCommand) -> CommandAccepted {
@@ -2447,6 +2513,7 @@ async fn retention_loop(state: AppState) {
         incident_pass(&state).await;
         gateway_pass(&state, &mut reporting).await;
         delivery_pass(&state, Utc::now()).await;
+        crate::oidc::forget_stale_attempts(&state.oidc_attempts).await;
     }
 }
 
@@ -3133,6 +3200,9 @@ mod tests {
             )),
             cookie_secure: false,
             incident_grace: Duration::ZERO,
+            oidc: None,
+            oidc_attempts: crate::oidc::Attempts::default(),
+            http: reqwest::Client::new(),
             tunnels: Arc::new(RwLock::new(HashMap::new())),
             tunnel_calls: Arc::new(RwLock::new(HashMap::new())),
             tunnel_answers: Arc::new(RwLock::new(HashMap::new())),
@@ -5393,6 +5463,179 @@ mod tests {
         })
     }
 
+    /// The store is the roster; memory is only the liveness. A control plane
+    /// that has just restarted has an empty batch cache, and until each
+    /// gateway reports again every camera-id endpoint answered 404 — "your
+    /// camera does not exist" for a camera sitting right there in the fleet.
+    /// Measured 2026-09-29 on the local stack: a live request for a healthy
+    /// camera was 404 straight after a restart and 202 once telemetry landed.
+    #[tokio::test]
+    async fn a_camera_is_addressable_before_its_gateway_reports_again() {
+        let state = test_state().await;
+        seed_admin(&state).await;
+        let cookie = login_cookie(&state).await;
+        gateway_with_two_cameras(&state, &cookie).await;
+
+        // What a restart leaves behind: the roster in the store, nothing in memory.
+        state.camera_batches.write().await.clear();
+
+        let live = serde_json::json!({ "offer_sdp": "v=0\r\n", "session_seconds": 30 });
+        let (status, _) = send(
+            &state,
+            with_cookie(
+                post("/api/v1/cameras/cam-1/live", None, live.clone()),
+                &cookie,
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "a camera in the store has a gateway whether or not it has reported since boot"
+        );
+
+        // A camera nobody has ever heard of is still a miss.
+        let (status, _) = send(
+            &state,
+            with_cookie(post("/api/v1/cameras/cam-nope/live", None, live), &cookie),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// A camera the operator removed is not addressable, even though its last
+    /// telemetry batch is still in memory. The dashboard cannot offer it — it
+    /// is off the roster — but a direct call could still queue work for it,
+    /// and every camera-id endpoint goes through the same lookup.
+    #[tokio::test]
+    async fn a_removed_camera_cannot_be_asked_for_live_video() {
+        let state = test_state().await;
+        seed_admin(&state).await;
+        let cookie = login_cookie(&state).await;
+        let token = enrolled_gateway_token(&state, &cookie).await;
+
+        let address = "rtsp://nvr.test/cam/realmonitor?channel=9&subtype=1";
+        let camera_id = vms_domain::source_camera_id(address);
+        let (_, created) = add_source(&state, &cookie, rtsp_source("gw-1", address)).await;
+        let mut batch = telemetry_batch("gw-1");
+        batch["cameras"] = serde_json::json!([camera(&camera_id, "gw-1")]);
+        send(
+            &state,
+            post("/api/v1/cameras/telemetry", Some(&token), batch),
+        )
+        .await;
+
+        let live = serde_json::json!({ "offer_sdp": "v=0\r\n", "session_seconds": 30 });
+        let (status, _) = send(
+            &state,
+            with_cookie(
+                post(
+                    &format!("/api/v1/cameras/{camera_id}/live"),
+                    None,
+                    live.clone(),
+                ),
+                &cookie,
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "it works while the camera is there"
+        );
+
+        let source_id = created["id"].as_str().expect("an id").to_owned();
+        send(
+            &state,
+            with_cookie(
+                post(
+                    &format!("/api/v1/sources/{source_id}/delete"),
+                    None,
+                    serde_json::json!({}),
+                ),
+                &cookie,
+            ),
+        )
+        .await;
+
+        let (status, _) = send(
+            &state,
+            with_cookie(
+                post(&format!("/api/v1/cameras/{camera_id}/live"), None, live),
+                &cookie,
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "a removed camera must not be addressable through its last telemetry batch"
+        );
+    }
+
+    /// The roster is the store's, not the last telemetry batch's. Removing a
+    /// source took its camera out of the store and the camera kept showing
+    /// anyway: the handler adds cameras the store "has not caught up with
+    /// yet" from memory, and the gateway goes on reporting from its cached
+    /// source list for a round or two after the delete. Measured on the live
+    /// stack before this was fixed: source deleted, HTTP 204, camera still
+    /// listed.
+    #[tokio::test]
+    async fn a_removed_cameras_last_telemetry_does_not_keep_it_on_the_roster() {
+        let state = test_state().await;
+        seed_admin(&state).await;
+        let cookie = login_cookie(&state).await;
+        let token = enrolled_gateway_token(&state, &cookie).await;
+
+        let address = "rtsp://nvr.test/cam/realmonitor?channel=2&subtype=1";
+        let camera_id = vms_domain::source_camera_id(address);
+        let (status, created) = add_source(&state, &cookie, rtsp_source("gw-1", address)).await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let mut batch = telemetry_batch("gw-1");
+        batch["cameras"] = serde_json::json!([camera(&camera_id, "gw-1")]);
+        let (status, _) = send(
+            &state,
+            post("/api/v1/cameras/telemetry", Some(&token), batch.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(roster_size(&state, &cookie).await, 1);
+
+        let source_id = created["id"].as_str().expect("an id").to_owned();
+        let (status, _) = send(
+            &state,
+            with_cookie(
+                post(
+                    &format!("/api/v1/sources/{source_id}/delete"),
+                    None,
+                    serde_json::json!({}),
+                ),
+                &cookie,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(
+            roster_size(&state, &cookie).await,
+            0,
+            "a removed source's camera must leave the roster at once"
+        );
+
+        // The gateway has not caught up and reports it once more.
+        let (status, _) = send(
+            &state,
+            post("/api/v1/cameras/telemetry", Some(&token), batch),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(
+            roster_size(&state, &cookie).await,
+            0,
+            "one more batch from a gateway that has not caught up must not bring it back"
+        );
+    }
+
     /// The whole life of a source: added from the dashboard, listed there, handed to
     /// its own gateway and to no other, removed, and audited at both ends.
     #[tokio::test]
@@ -7337,5 +7580,443 @@ mod tests {
             "re-enrollment must bring the camera back under watch"
         );
         assert!(incidents[0].ended_at.is_none());
+    }
+
+    // --- Signing in with somebody else's identity provider -----------------
+
+    /// A state pointed at a provider that has just been started.
+    async fn sso_state(
+        provider: &vms_fake_oidc::FakeProvider,
+        autocreate: Option<vms_domain::Role>,
+    ) -> AppState {
+        let mut state = test_state().await;
+        state.oidc = Some(Arc::new(crate::oidc::OidcConfig {
+            issuer: provider.issuer.clone(),
+            client_id: provider.client_id.clone(),
+            client_secret: provider.client_secret.clone(),
+            redirect_url: "http://control-plane.test/api/v1/auth/oidc/callback".into(),
+            autocreate_role: autocreate,
+        }));
+        state
+    }
+
+    /// Like `send`, but the whole response: the interesting part of a sign-in
+    /// is in the headers.
+    async fn raw(state: &AppState, request: Request<Body>) -> axum::response::Response {
+        build_router(state.clone())
+            .oneshot(request)
+            .await
+            .expect("router responds")
+    }
+
+    fn location_of(response: &axum::response::Response) -> String {
+        response
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .expect("a redirect")
+            .to_str()
+            .expect("a printable location")
+            .to_owned()
+    }
+
+    /// The browser's half of the flow: ask to start, let the provider answer,
+    /// and hand back the query it sends the callback.
+    async fn provider_round_trip(state: &AppState, who: Option<&str>) -> String {
+        let started = raw(state, get("/api/v1/auth/oidc/start")).await;
+        assert_eq!(
+            started.status(),
+            StatusCode::SEE_OTHER,
+            "starting a sign-in must send the browser to the provider"
+        );
+        let mut authorize = location_of(&started);
+        if let Some(who) = who {
+            authorize.push_str(&format!("&login_hint={who}"));
+        }
+        let browser = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("an http client");
+        let answered = browser
+            .get(&authorize)
+            .send()
+            .await
+            .expect("the provider answers");
+        let back = answered
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .expect("the provider sends the browser back")
+            .to_str()
+            .expect("a printable location")
+            .to_owned();
+        back.split_once('?')
+            .expect("a query to hand the callback")
+            .1
+            .to_owned()
+    }
+
+    fn callback(query: &str) -> Request<Body> {
+        get(&format!("/api/v1/auth/oidc/callback?{query}"))
+    }
+
+    fn param(query: &str, name: &str) -> String {
+        query
+            .split('&')
+            .find_map(|pair| pair.strip_prefix(&format!("{name}=")))
+            .unwrap_or_else(|| panic!("no {name} in {query}"))
+            .to_owned()
+    }
+
+    async fn text_of(response: axum::response::Response) -> String {
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    fn cookie_of(response: &axum::response::Response) -> String {
+        response
+            .headers()
+            .get(axum::http::header::SET_COOKIE)
+            .expect("a sign-in must set a cookie")
+            .to_str()
+            .expect("a printable cookie")
+            .split(';')
+            .next()
+            .expect("a cookie value")
+            .to_owned()
+    }
+
+    #[tokio::test]
+    async fn the_provider_signs_in_somebody_who_already_has_an_account() {
+        let provider = vms_fake_oidc::start(0, ADMIN_EMAIL)
+            .await
+            .expect("a provider");
+        let state = sso_state(&provider, None).await;
+        seed_admin(&state).await;
+
+        let query = provider_round_trip(&state, None).await;
+        let response = raw(&state, callback(&query)).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::SEE_OTHER,
+            "a sign-in the provider vouched for was refused"
+        );
+
+        let cookie = cookie_of(&response);
+        let (status, _) = send(&state, with_cookie(get("/api/v1/fleet"), &cookie)).await;
+        assert_eq!(status, StatusCode::OK, "the cookie it set is not a session");
+
+        let audit = state.store.audit_entries(20).await.unwrap();
+        let entry = audit
+            .iter()
+            .find(|entry| entry.action == "login.ok")
+            .expect("a sign-in must be audited");
+        assert_eq!(entry.actor, ADMIN_EMAIL);
+        assert_eq!(
+            entry.detail.as_deref(),
+            Some("sso"),
+            "the audit must say how they got in"
+        );
+        assert_eq!(
+            crate::oidc::attempts_open(&state.oidc_attempts).await,
+            0,
+            "a finished sign-in must not be left open"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_email_with_no_account_here_is_refused() {
+        // A provider answering for anyone@gmail.com is not a reason to let
+        // them in, let alone to create them an account.
+        let provider = vms_fake_oidc::start(0, "stranger@example.test")
+            .await
+            .expect("a provider");
+        let state = sso_state(&provider, None).await;
+        seed_admin(&state).await;
+
+        let query = provider_round_trip(&state, None).await;
+        let response = raw(&state, callback(&query)).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            state
+                .store
+                .user_by_email("stranger@example.test")
+                .await
+                .unwrap()
+                .is_none(),
+            "a refused sign-in left an account behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn autocreate_makes_the_role_it_was_told_to_and_no_other() {
+        let provider = vms_fake_oidc::start(0, "newcomer@example.test")
+            .await
+            .expect("a provider");
+        let state = sso_state(&provider, Some(vms_domain::Role::Viewer)).await;
+        seed_admin(&state).await;
+
+        let query = provider_round_trip(&state, None).await;
+        let response = raw(&state, callback(&query)).await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+        let created = state
+            .store
+            .user_by_email("newcomer@example.test")
+            .await
+            .unwrap()
+            .expect("autocreate must create the account");
+        assert_eq!(created.role, vms_domain::Role::Viewer);
+
+        // And a viewer is what they are, not an owner with a viewer's label.
+        let cookie = cookie_of(&response);
+        let (status, _) = send(
+            &state,
+            with_cookie(
+                post(
+                    "/api/v1/users",
+                    None,
+                    serde_json::json!({
+                        "email": "someone@example.test",
+                        "password": "a long enough password",
+                        "role": "owner",
+                    }),
+                ),
+                &cookie,
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "an account the provider created must not be able to make owners"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_account_that_came_from_the_provider_has_no_password() {
+        let provider = vms_fake_oidc::start(0, "newcomer@example.test")
+            .await
+            .expect("a provider");
+        let state = sso_state(&provider, Some(vms_domain::Role::Viewer)).await;
+        seed_admin(&state).await;
+        let query = provider_round_trip(&state, None).await;
+        assert_eq!(
+            raw(&state, callback(&query)).await.status(),
+            StatusCode::SEE_OTHER
+        );
+
+        for password in ["", crate::oidc::NO_PASSWORD] {
+            let (status, _) = send(
+                &state,
+                post(
+                    "/api/v1/auth/login",
+                    None,
+                    serde_json::json!({ "email": "newcomer@example.test", "password": password }),
+                ),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "{password:?} got in as an account that has no password"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_disabled_account_is_refused_whatever_the_provider_says() {
+        let provider = vms_fake_oidc::start(0, "leaver@example.test")
+            .await
+            .expect("a provider");
+        let state = sso_state(&provider, None).await;
+        seed_admin(&state).await;
+        state
+            .store
+            .create_user(
+                "user-leaver",
+                "leaver@example.test",
+                "$argon2id$nonsense",
+                vms_domain::Role::Technician,
+                None,
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        state
+            .store
+            .update_user("user-leaver", None, None, Some(true), None, Utc::now())
+            .await
+            .unwrap();
+
+        let query = provider_round_trip(&state, None).await;
+        let response = raw(&state, callback(&query)).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "a provider cannot turn an account back on"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sign_in_this_system_did_not_start_is_refused() {
+        let provider = vms_fake_oidc::start(0, ADMIN_EMAIL)
+            .await
+            .expect("a provider");
+        let state = sso_state(&provider, None).await;
+        seed_admin(&state).await;
+        let response = raw(&state, callback("code=made-up&state=made-up")).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn a_state_is_good_once() {
+        let provider = vms_fake_oidc::start(0, ADMIN_EMAIL)
+            .await
+            .expect("a provider");
+        let state = sso_state(&provider, None).await;
+        seed_admin(&state).await;
+
+        let query = provider_round_trip(&state, None).await;
+        assert_eq!(
+            raw(&state, callback(&query)).await.status(),
+            StatusCode::SEE_OTHER
+        );
+        let replayed = raw(&state, callback(&query)).await;
+        assert_eq!(
+            replayed.status(),
+            StatusCode::UNAUTHORIZED,
+            "the same callback twice is a replay, not a second sign-in"
+        );
+        // And refused here, by this system, rather than by a provider that
+        // happened to have spent the code: a state is good once whatever the
+        // far end does with codes.
+        let why = text_of(replayed).await;
+        assert!(
+            why.contains("not one this system started"),
+            "the replay was refused for the wrong reason: {why}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_code_from_a_different_sign_in_is_refused() {
+        // The nonce is what ties the token to the sign-in that asked for it.
+        let provider = vms_fake_oidc::start(0, ADMIN_EMAIL)
+            .await
+            .expect("a provider");
+        let state = sso_state(&provider, None).await;
+        seed_admin(&state).await;
+
+        let mine = provider_round_trip(&state, None).await;
+        let theirs = provider_round_trip(&state, None).await;
+        let mixed = format!(
+            "code={}&state={}",
+            param(&theirs, "code"),
+            param(&mine, "state")
+        );
+        let response = raw(&state, callback(&mixed)).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn an_email_the_provider_has_not_verified_is_refused() {
+        // A provider where somebody can type an address they do not own says
+        // so in `email_verified`. Ignoring it is a way in as whoever owns
+        // that address — with autocreate on, as a new account; with it off,
+        // as the account that is already here.
+        let provider =
+            vms_fake_oidc::start_as(0, ADMIN_EMAIL, vms_fake_oidc::Quirk::UnverifiedEmail)
+                .await
+                .expect("a provider");
+        let state = sso_state(&provider, None).await;
+        seed_admin(&state).await;
+        let query = provider_round_trip(&state, None).await;
+        let response = raw(&state, callback(&query)).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "an unverified email signed in as the owner"
+        );
+
+        // And it is not a way to have an account made, either.
+        let creating = vms_fake_oidc::start_as(
+            0,
+            "unverified@example.test",
+            vms_fake_oidc::Quirk::UnverifiedEmail,
+        )
+        .await
+        .expect("a provider");
+        let state = sso_state(&creating, Some(vms_domain::Role::Viewer)).await;
+        seed_admin(&state).await;
+        let query = provider_round_trip(&state, None).await;
+        assert_eq!(
+            raw(&state, callback(&query)).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert!(
+            state
+                .store
+                .user_by_email("unverified@example.test")
+                .await
+                .unwrap()
+                .is_none(),
+            "an unverified email had an account created for it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_token_that_is_wrong_in_any_way_is_refused() {
+        for quirk in [
+            vms_fake_oidc::Quirk::WrongAudience,
+            vms_fake_oidc::Quirk::WrongIssuer,
+            vms_fake_oidc::Quirk::Expired,
+            vms_fake_oidc::Quirk::OtherKey,
+        ] {
+            let provider = vms_fake_oidc::start_as(0, ADMIN_EMAIL, quirk)
+                .await
+                .expect("a provider");
+            let state = sso_state(&provider, None).await;
+            seed_admin(&state).await;
+            let query = provider_round_trip(&state, None).await;
+            let response = raw(&state, callback(&query)).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{quirk:?} was let through"
+            );
+            assert!(
+                response
+                    .headers()
+                    .get(axum::http::header::SET_COOKIE)
+                    .is_none(),
+                "{quirk:?} was refused and still got a cookie"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_login_page_is_told_what_it_may_offer() {
+        let without = test_state().await;
+        let (status, body) = send(&without, get("/api/v1/auth/methods")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["password"], serde_json::json!(true));
+        assert_eq!(body["sso"], serde_json::json!(false));
+        let (status, _) = send(&without, get("/api/v1/auth/oidc/start")).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "no provider must mean no half-working sign-in"
+        );
+
+        let provider = vms_fake_oidc::start(0, ADMIN_EMAIL)
+            .await
+            .expect("a provider");
+        let with = sso_state(&provider, None).await;
+        let (_, body) = send(&with, get("/api/v1/auth/methods")).await;
+        assert_eq!(body["sso"], serde_json::json!(true));
+        assert!(
+            body["sso_label"]
+                .as_str()
+                .is_some_and(|label| !label.is_empty()),
+            "a button needs something on it: {body}"
+        );
     }
 }

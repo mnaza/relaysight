@@ -12,6 +12,22 @@ function showLogin(dict) {
 }
 
 /**
+ * The login form offers single sign-on only when there is a provider behind
+ * it. A button that goes nowhere is worse than no button, and whether one is
+ * configured is the API's to say, not the page's to guess.
+ */
+async function offerSso(dict) {
+  const methods = await fetch('api/v1/auth/methods')
+    .then(response => (response.ok ? response.json() : null))
+    .catch(() => null);
+  if (!methods?.sso) return;
+  const label = methods.sso_label || 'SSO';
+  document.querySelector('#sso-button').textContent =
+    t(dict, 'app.auth.sso', 'Sign in with {provider}').replace('{provider}', label);
+  document.querySelector('#sso-row').hidden = false;
+}
+
+/**
  * Resolves once a session exists — immediately, or after a successful login.
  *
  * The login view and its submit handler are wired up before the session
@@ -41,6 +57,8 @@ export async function requireSession(dict) {
       document.querySelector('#login-error').hidden = false;
     }
   });
+
+  await offerSso(dict);
 
   const alive = await fetch('api/v1/auth/session').then(r => r.status === 204).catch(() => false);
   if (alive) {

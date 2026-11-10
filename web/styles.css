@@ -88,6 +88,8 @@ button { cursor: pointer; }
    viewer must not see the fleet behind a translucent scrim. */
 .login-backdrop { background: #0a1420; backdrop-filter: none; z-index: 60; }
 .login-modal { width: min(400px, 100%); }
+.login-sso { margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--border); display: grid; }
+.login-sso .button { justify-content: center; text-align: center; text-decoration: none; }
 .modal { width: min(650px, 100%); max-height: 90vh; overflow: auto; background: #0d1829; border: 1px solid var(--border); border-radius: 20px; box-shadow: var(--shadow); padding: 28px; }
 .modal h2 { margin: 0 0 7px; }
 .modal > p { color: var(--muted); margin: 0 0 25px; line-height: 1.6; }
@@ -208,4 +210,31 @@ button { cursor: pointer; }
 .ai-detections span { border:1px solid var(--border); border-radius:999px; padding:4px 7px; }
 @media (max-width:620px) {
   .camera-actions { flex-wrap:wrap; }
+}
+
+/* The wall. One row of controls, then as many tiles as the layout asks for.
+   The tile is the only place in the app that paints its own black: a video
+   letterbox is black because that is what no signal looks like, not because
+   of a theme. */
+.wall-view { padding:26px 30px 40px; display:flex; flex-direction:column; gap:14px; min-height:100vh; }
+.wall-view[hidden] { display:none; }
+.wall-bar { display:flex; align-items:flex-end; gap:14px; flex-wrap:wrap; }
+.wall-bar-title { margin-right:auto; }
+.wall-bar-title strong { font-size:20px; letter-spacing:-.02em; }
+.wall-bar .field { min-width:118px; }
+.wall-actions { display:flex; gap:8px; flex-wrap:wrap; }
+.wall-note { color:var(--muted); font-size:12px; }
+.wall-grid { --wall-columns:2; display:grid; gap:10px; grid-template-columns:repeat(var(--wall-columns), minmax(0, 1fr)); }
+.wall-tile { position:relative; aspect-ratio:16/9; border:1px solid var(--border); border-radius:13px; overflow:hidden; background:#050a12; }
+.wall-tile.wall-dragging { opacity:.45; outline:2px dashed var(--primary); }
+.wall-video { width:100%; height:100%; object-fit:contain; display:block; }
+.wall-video[hidden] { display:none; }
+.wall-placeholder { position:absolute; inset:0; display:grid; place-items:center; padding:10px; text-align:center; color:var(--muted); font-size:12px; pointer-events:none; }
+.wall-placeholder:empty { display:none; }
+.wall-tile-bar { position:absolute; left:0; right:0; bottom:0; display:flex; align-items:center; gap:8px; padding:8px 10px; background:linear-gradient(to top, rgba(5,10,18,.86), transparent); }
+.wall-tile-name { font-size:13px; font-weight:650; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.wall-tile-bar .health-pill { margin-right:auto; }
+@media (max-width:620px) {
+  .wall-view { padding:18px 14px 30px; }
+  .wall-grid { --wall-columns:1 !important; }
 }

@@ -73,17 +73,26 @@ pub struct RtcConfig {
     pub ttl_secs: u64,
 }
 
+/// A comma-separated list of ICE server URLs, or the fallback when the setting
+/// is absent entirely.
+///
+/// An empty value means an empty list. It used to mean "use the fallback", so a
+/// deployment that asked for no STUN was handed Google's — and on an isolated
+/// network that is a server which never answers, which costs the gateway its
+/// whole ICE gathering budget (relaysight-vms-0kem).
+fn urls(value: Option<&str>, fallback: &str) -> Vec<String> {
+    value
+        .unwrap_or(fallback)
+        .split(',')
+        .map(|part| part.trim().to_string())
+        .filter(|part| !part.is_empty())
+        .collect()
+}
+
 impl RtcConfig {
     pub fn from_env() -> Self {
         let list = |name: &str, fallback: &str| -> Vec<String> {
-            std::env::var(name)
-                .ok()
-                .filter(|v| !v.trim().is_empty())
-                .unwrap_or_else(|| fallback.to_string())
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect()
+            urls(std::env::var(name).ok().as_deref(), fallback)
         };
         Self {
             stun_urls: list("RTC_STUN_URLS", "stun:stun.l.google.com:19302"),
@@ -177,6 +186,25 @@ mod tests {
             turn_secret: secret.into(),
             ttl_secs: 600,
         }
+    }
+
+    #[test]
+    fn an_empty_setting_means_none_rather_than_the_default() {
+        // RTC_STUN_URLS= used to be read as "unset", so a deployment that asked
+        // for no STUN was given Google's. On an isolated network — which is
+        // where cameras live — that is a server that never answers, and the
+        // gateway spends its whole ICE gathering budget waiting for it
+        // (relaysight-vms-0kem). An empty value is an answer, not a gap.
+        assert_eq!(
+            urls(None, "stun:default.test:3478"),
+            vec!["stun:default.test:3478"]
+        );
+        assert!(urls(Some(""), "stun:default.test:3478").is_empty());
+        assert!(urls(Some("  "), "stun:default.test:3478").is_empty());
+        assert_eq!(
+            urls(Some("stun:a.test:3478, stun:b.test:3478"), ""),
+            vec!["stun:a.test:3478", "stun:b.test:3478"],
+        );
     }
 
     #[test]

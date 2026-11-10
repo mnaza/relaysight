@@ -79,6 +79,16 @@ depends on the bitrate: 2 GiB is about two and a half hours of a 2 Mbit/s
 stream, and about twenty minutes of a 15 Mbit/s one. The journal says how much
 each camera's ring actually holds every time a recording session ends.
 
+**The filesystem is a second budget, and it wins.** A budget larger than the
+disk is an easy thing to configure — four cameras at 2 GiB on a 4 GB box, or
+something else on the machine growing into the space. When a write runs out
+of room, the ring drops its oldest video and writes again, however far inside
+its configured budget it is. It keeps what fits, which is the point of a ring;
+before this it stopped recording at the first ENOSPC and left the disk full
+with nothing being kept. There is a line in the journal each time this
+happens, because a ring that is being cut short by the disk is something an
+operator should be told about rather than discover.
+
 ## How a clip is cut
 
 Segments start on keyframes, so a clip asked for mid-segment widens backwards
@@ -97,12 +107,25 @@ Segments are renamed into place, so a reader never sees half of one.
   transport stream in the test suite, and against no site. The recorder
   underneath them is the one a Dahua NVR proved over twenty hours
   (`docs/HARDWARE-NOTES.md`), and the segmenting is shared with it.
-- **Schedules** are tested against a clock that does not move, including
-  windows crossing midnight and a site three hours east of UTC. They have
-  never run across a daylight-saving change on a real box.
+- **Schedules** have been run across a daylight-saving change, both against
+  the IANA database compiled into the tests and against the machine's own
+  (`make check-dst`). That found a real bug: the window was worked out by
+  adding minutes to an instant rather than to the clock on the wall, so on
+  the Sunday the clocks go back a "09:00 to 17:00" rule quietly became 08:00
+  to 16:00 — twice a year, an hour of the day the operator asked for was
+  never kept. Windows are now wall-clock at both ends: the hour that happens
+  twice makes the night longer, the hour that never happens makes it shorter,
+  and a window starting inside the missing hour starts as soon as it can.
+  No box has had its clock actually step through a transition while
+  recording.
 - **Incident keeps** are tested by unplugging a camera mid-recording.
 - **Plugin-driven keeps** have run against a plugin that always sees a person.
   No real detector has ever driven one.
-- **Nothing has filled a disk yet.** The budget is exercised with megabytes in
-  tests, not with a fortnight of a real camera, and pruning under a genuinely
-  full filesystem — as opposed to a full budget — is untested.
+- **A filesystem has actually been filled.** `make check-ring-full` mounts an
+  8 MiB tmpfs in a user namespace and records twenty minutes of video into a
+  ring configured for 64 GiB of it. The ring ends up holding about five
+  minutes, the newest five, on a filesystem reporting 100% full — and the
+  recording never stopped. That is where the ENOSPC behaviour above came
+  from: the first run of that check ended the recording outright.
+  What still has not happened is a *real* camera filling a *real* disk over a
+  fortnight, which is a question about bitrate and wear, not about ENOSPC.

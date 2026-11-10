@@ -18,7 +18,6 @@ use anyhow::{Context, anyhow};
 use bytes::Bytes;
 use retina::client::{PlayOptions, SessionOptions, SetupOptions};
 use retina::codec::{CodecItem, FrameFormat, ParametersRef};
-use std::time::Duration;
 
 /// How a consumer wants NAL units framed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -89,7 +88,7 @@ impl RtspSource {
     ) -> anyhow::Result<Self> {
         let (url, creds) = crate::rtsp::split_credentials(raw_url, username, password)?;
         let session = tokio::time::timeout(
-            Duration::from_secs(8),
+            crate::rtsp::dial_timeout(),
             retina::client::Session::describe(
                 url,
                 SessionOptions::default()
@@ -112,7 +111,7 @@ impl RtspSource {
             );
         }
         tokio::time::timeout(
-            Duration::from_secs(8),
+            crate::rtsp::dial_timeout(),
             session.setup(
                 video_stream,
                 SetupOptions::default().frame_format(framing.into()),
@@ -120,10 +119,12 @@ impl RtspSource {
         )
         .await
         .context("RTSP SETUP timeout")??;
-        let playing =
-            tokio::time::timeout(Duration::from_secs(8), session.play(PlayOptions::default()))
-                .await
-                .context("RTSP PLAY timeout")??;
+        let playing = tokio::time::timeout(
+            crate::rtsp::dial_timeout(),
+            session.play(PlayOptions::default()),
+        )
+        .await
+        .context("RTSP PLAY timeout")??;
         Ok(Self {
             demuxed: Box::pin(playing.demuxed()?),
             video_stream,
@@ -200,7 +201,7 @@ pub(crate) mod testing {
     impl FrameSource for EndlessSource {
         async fn next_frame(&mut self) -> anyhow::Result<Option<Frame>> {
             // Paced, so a test that forgets to stop it does not spin a core.
-            tokio::time::sleep(Duration::from_millis(5)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             let index = self.index;
             self.index += 1;
             Ok(Some(Frame {

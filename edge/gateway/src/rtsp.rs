@@ -107,6 +107,29 @@ pub fn frame_duration(ticks: i64, clock_rate: u32) -> Duration {
     Duration::from_secs_f64((ticks as f64 / f64::from(clock_rate)).clamp(0.005, 0.5))
 }
 
+/// How long a dial to a camera may take before the gateway gives up on it:
+/// `RTSP_DIAL_TIMEOUT_SECONDS`, eight seconds by default. Eight is fine for a
+/// camera on the same switch and tight for one reached over the internet —
+/// this NVR answered an idle DESCRIBE in 0.16s and a loaded one in 6.2s — and
+/// with no knob there was no way to tell a slow device from an absent stream.
+pub fn dial_timeout() -> Duration {
+    static VALUE: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| {
+        dial_timeout_from(std::env::var("RTSP_DIAL_TIMEOUT_SECONDS").ok().as_deref())
+    })
+}
+
+/// Split out so the decision can be tested without the environment: anything
+/// unparseable keeps the default rather than becoming zero, and the range is
+/// bounded at both ends.
+fn dial_timeout_from(value: Option<&str>) -> Duration {
+    const DEFAULT: u64 = 8;
+    let seconds = value
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT);
+    Duration::from_secs(seconds.clamp(1, 120))
+}
+
 pub async fn probe(
     raw_url: &str,
     username: Option<&str>,
@@ -119,7 +142,7 @@ pub async fn probe(
         .creds(creds)
         .user_agent(format!("vms-gateway/{}", crate::VERSION));
 
-    let mut session = timeout(Duration::from_secs(8), Session::describe(url, options))
+    let mut session = timeout(dial_timeout(), Session::describe(url, options))
         .await
         .context("RTSP DESCRIBE timeout")??;
 
@@ -131,13 +154,13 @@ pub async fn probe(
     let codec = Some(session.streams()[video_stream].encoding_name().to_owned());
 
     timeout(
-        Duration::from_secs(8),
+        dial_timeout(),
         session.setup(video_stream, SetupOptions::default()),
     )
     .await
     .context("RTSP SETUP timeout")??;
 
-    let playing = timeout(Duration::from_secs(8), session.play(PlayOptions::default()))
+    let playing = timeout(dial_timeout(), session.play(PlayOptions::default()))
         .await
         .context("RTSP PLAY timeout")??;
     let mut demuxed = playing.demuxed()?;
@@ -196,6 +219,34 @@ pub fn redacted_endpoint(raw_url: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_dial_timeout_is_configurable_and_bounded() {
+        assert_eq!(
+            super::dial_timeout_from(None),
+            Duration::from_secs(8),
+            "the default has to stay what it has always been"
+        );
+        assert_eq!(
+            super::dial_timeout_from(Some("25")),
+            Duration::from_secs(25)
+        );
+        assert_eq!(
+            super::dial_timeout_from(Some("banana")),
+            Duration::from_secs(8),
+            "nonsense in the environment must not shorten the dial to nothing"
+        );
+        assert_eq!(
+            super::dial_timeout_from(Some("0")),
+            Duration::from_secs(1),
+            "a zero timeout would fail every dial before it began"
+        );
+        assert_eq!(
+            super::dial_timeout_from(Some("9999")),
+            Duration::from_secs(120),
+            "a camera that has said nothing for two minutes is not coming"
+        );
+    }
+
     use super::{frame_duration, redacted_endpoint, split_credentials, strip_userinfo};
     use std::time::Duration;
 

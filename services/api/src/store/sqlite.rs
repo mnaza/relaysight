@@ -289,9 +289,12 @@ impl Store for SqliteStore {
     }
 
     async fn fleet_cameras(&self) -> Result<Vec<CameraRecord>, StoreError> {
-        let rows = sqlx::query("SELECT * FROM cameras WHERE retired_at IS NULL ORDER BY name, id")
-            .fetch_all(&self.pool)
-            .await?;
+        let rows = sqlx::query(
+            "SELECT * FROM cameras WHERE retired_at IS NULL AND removed_at IS NULL
+             ORDER BY name, id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
         rows.iter().map(camera_from_row).collect()
     }
 
@@ -302,10 +305,12 @@ impl Store for SqliteStore {
         let site_rows = sqlx::query("SELECT id, org_id, name, city FROM sites ORDER BY id")
             .fetch_all(&self.pool)
             .await?;
-        let camera_rows =
-            sqlx::query("SELECT * FROM cameras WHERE retired_at IS NULL ORDER BY name, id")
-                .fetch_all(&self.pool)
-                .await?;
+        let camera_rows = sqlx::query(
+            "SELECT * FROM cameras WHERE retired_at IS NULL AND removed_at IS NULL
+             ORDER BY name, id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
 
         let mut cameras_by_site: std::collections::HashMap<String, Vec<CameraRecord>> =
             std::collections::HashMap::new();
@@ -738,6 +743,12 @@ impl Store for SqliteStore {
     }
 
     async fn add_video_source(&self, source: &VideoSource) -> Result<(), StoreError> {
+        // Deliberate return: a camera removed with its source comes back when
+        // the source does, and not because a gateway happened to mention it.
+        sqlx::query("UPDATE cameras SET removed_at = NULL WHERE id = ?1")
+            .bind(vms_domain::source_camera_id(&source.address))
+            .execute(&self.pool)
+            .await?;
         sqlx::query(
             "INSERT INTO video_sources (id, gateway_id, name, kind, address, added_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -1203,6 +1214,21 @@ impl Store for SqliteStore {
     }
 
     async fn delete_video_source(&self, id: &str) -> Result<(), StoreError> {
+        // The camera goes with it. Without this the row stays in the fleet
+        // for good: there is no per-camera removal, and retiring it by hand
+        // does not hold because telemetry clears `retired_at`.
+        if let Some(row) = sqlx::query("SELECT address FROM video_sources WHERE id = ?1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?
+        {
+            let address: String = row.try_get("address")?;
+            sqlx::query("UPDATE cameras SET removed_at = ?2 WHERE id = ?1")
+                .bind(vms_domain::source_camera_id(&address))
+                .bind(ts(&Utc::now()))
+                .execute(&self.pool)
+                .await?;
+        }
         let removed = sqlx::query("DELETE FROM video_sources WHERE id = ?1")
             .bind(id)
             .execute(&self.pool)
@@ -1211,6 +1237,27 @@ impl Store for SqliteStore {
             return Err(StoreError::NotFound);
         }
         Ok(())
+    }
+
+    async fn camera_gateway(&self, camera_id: &str) -> Result<Option<String>, StoreError> {
+        let row = sqlx::query(
+            "SELECT gateway_id FROM cameras
+             WHERE id = ?1 AND retired_at IS NULL AND removed_at IS NULL",
+        )
+        .bind(camera_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| row.try_get("gateway_id").map_err(StoreError::from))
+            .transpose()
+    }
+
+    async fn removed_camera_ids(&self) -> Result<Vec<String>, StoreError> {
+        let rows = sqlx::query("SELECT id FROM cameras WHERE removed_at IS NOT NULL")
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter()
+            .map(|row| row.try_get("id").map_err(StoreError::from))
+            .collect()
     }
 
     async fn retire_gateway_cameras(
@@ -1656,6 +1703,71 @@ mod tests {
             address: address.into(),
             added_at: Utc::now(),
         }
+    }
+
+    /// Removing a source used to leave its camera in the fleet for good. The
+    /// row came back on the next telemetry batch — ingest clears `retired_at`
+    /// on every camera it mentions, deliberately, so a camera that returns is
+    /// listed again — and the gateway keeps probing from its cached source
+    /// list for a round or two after the delete. An operator was left with a
+    /// dead row and no way to remove it; found removing a substream that does
+    /// not exist on the device (docs/DEVICE-MATRIX.md).
+    #[tokio::test]
+    async fn a_camera_whose_source_was_removed_does_not_come_back() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let address = "rtsp://camera.test/cam/realmonitor?channel=2&subtype=1";
+        let camera_id = vms_domain::source_camera_id(address);
+
+        // Telemetry first: it is what creates the gateway the source hangs off.
+        store
+            .upsert_fleet_identity(
+                &batch_with_camera("gw-1", &camera_id, "Substream"),
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        store
+            .add_video_source(&source("src-1", "gw-1", address))
+            .await
+            .unwrap();
+        assert_eq!(store.fleet_cameras().await.unwrap().len(), 1);
+
+        store.delete_video_source("src-1").await.unwrap();
+        assert!(
+            store.fleet_cameras().await.unwrap().is_empty(),
+            "removing the source has to take its camera out of the fleet"
+        );
+
+        // The gateway has not caught up yet and reports it once more.
+        store
+            .upsert_fleet_identity(
+                &batch_with_camera("gw-1", &camera_id, "Substream"),
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            store.fleet_cameras().await.unwrap().is_empty(),
+            "a camera removed on purpose must not be resurrected by telemetry"
+        );
+
+        // Adding the source back is how it returns — deliberately, not by accident.
+        store
+            .add_video_source(&source("src-2", "gw-1", address))
+            .await
+            .unwrap();
+        store
+            .upsert_fleet_identity(
+                &batch_with_camera("gw-1", &camera_id, "Substream"),
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.fleet_cameras().await.unwrap().len(),
+            1,
+            "a source added again brings its camera back"
+        );
     }
 
     /// A gateway is told its own sources and nobody else's: the poll is how a

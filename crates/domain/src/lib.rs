@@ -625,6 +625,13 @@ pub struct VideoSource {
     pub added_at: DateTime<Utc>,
 }
 
+/// The camera id a pulled source turns into. The gateway derives it when it
+/// reports telemetry and the control plane derives it when a source is added
+/// or removed, so the rule has to be one rule: a UUIDv5 of the address.
+pub fn source_camera_id(address: &str) -> String {
+    uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, address.as_bytes()).to_string()
+}
+
 /// What the dashboard sends to add one.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VideoSourceRequest {

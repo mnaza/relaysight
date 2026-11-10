@@ -16,6 +16,7 @@ This page exists so nobody has to guess which is which.
 | **Dahua NVR, RTSP** | 20 hours, 32 connectivity outages, recovered from every one |
 | **Dahua SSRC, hex in `Transport` and decimal in `RTP-Info`** | stock retina refuses the stream; the gateway pins a fork with the fix ([scottlamb/retina#137](https://github.com/scottlamb/retina/pull/137)) |
 | **Main and sub profiles, H.264, full-range colour** | the sub-stream is what live view uses, so a relayed session carries a fraction of the bytes |
+| **A channel whose sub-stream is not encoded** | channel 2 of this NVR answers the main stream and drops the authenticated `DESCRIBE` for `subtype=1` — either a silent timeout or `EOF while expecting response to DESCRIBE CSeq 2`. Channel 1's sub-stream answers normally, and a 40s dial changes nothing, so this is the device saying the stream is not there. Nothing on this side can fix it: the sub-stream has to be enabled on the device |
 
 ## Handled, from the documented behaviour of other devices
 

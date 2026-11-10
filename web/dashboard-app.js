@@ -16,6 +16,7 @@
 
 import { brandMark, localeSelect, t } from './theme.js';
 import { wireAccountModal } from './auth.js';
+import { createWall } from './wall.js';
 
 export async function startDashboard({ brand, locale, dict }) {
   document.documentElement.lang = locale;
@@ -344,6 +345,8 @@ export async function startDashboard({ brand, locale, dict }) {
   }
 
   const body = document.querySelector('#fleet-body');
+  // Kept rather than read back out of the input: see render() below.
+  let currentFilter = '';
   function siteStatus(cameras) {
     if (cameras.some(camera => camera.status === 'offline')) return 'offline';
     if (cameras.some(camera => camera.status === 'warning')) return 'warning';
@@ -360,11 +363,14 @@ export async function startDashboard({ brand, locale, dict }) {
   }
 
   async function pollCommand(commandId, statusNode, labels = {}) {
+    // Most callers have one node to write progress into. The wall has one per
+    // tile and no node to hand over, so a function is allowed here too.
+    const say = typeof statusNode === 'function' ? statusNode : text => { statusNode.textContent = text; };
     for (let attempt = 0; attempt < 70; attempt += 1) {
       const view = await tryJson(`api/v1/commands/${encodeURIComponent(commandId)}`, 3500);
       if (view.status === 'succeeded') return view.result;
       if (view.status === 'failed') throw new Error(view.result?.error || t(dict, labels.failed || 'app.command.failed'));
-      statusNode.textContent = view.status === 'queued' ? t(dict, labels.queued || 'app.command.queued') : t(dict, labels.running || 'app.command.running');
+      say(view.status === 'queued' ? t(dict, labels.queued || 'app.command.queued') : t(dict, labels.running || 'app.command.running'));
       await new Promise(resolve => setTimeout(resolve, 1000));
     }
     throw new Error(t(dict, labels.timeout || 'app.command.timeout'));
@@ -447,50 +453,105 @@ export async function startDashboard({ brand, locale, dict }) {
       : t(dict, 'app.policy.failed');
   }
 
-  async function startLive(cameraId) {
-    closeActiveLive();
-    const player = document.querySelector('#live-player');
-    const status = document.querySelector('#live-player-status');
-    status.hidden = false; status.textContent = t(dict,'app.live.connecting');
+  // One recording command, one camera. A camera's own card drives this, and so
+  // does the wall, which calls it once per tile — so the duration, the segment
+  // length and the clip window are decided in one place rather than per button.
+  async function sendCameraCommand(cameraId, path, payload, say) {
+    say(t(dict, 'app.archive.queued'));
+    const response = await fetch(`api/v1/cameras/${encodeURIComponent(cameraId)}/${path}`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload),
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const accepted = await response.json();
+    await pollCommand(accepted.command_id, say);
+    say(t(dict, 'app.archive.ready'));
+  }
+
+  function recordNow(cameraId, say) {
+    return sendCameraCommand(cameraId, 'recordings',
+      { duration_seconds: 10, segment_seconds: 2, storage_plugin_id: storagePluginId() }, say);
+  }
+
+  function saveClip(cameraId, say) {
+    return sendCameraCommand(cameraId, 'clips',
+      { seconds: CLIP_SECONDS, storage_plugin_id: storagePluginId() }, say);
+  }
+
+  // One live session, negotiated. Everything in here used to be the body of
+  // startLive, which wrote straight into the modal's own player and kept the
+  // single peer in a module variable — so a second player was impossible. The
+  // caller now owns the peer: whoever opens it closes it.
+  //
+  // `onPeer` fires as soon as the peer exists, before the slow part. A caller
+  // that gives up mid-negotiation needs the handle by then or it leaks a peer
+  // that connects to nobody.
+  async function openLivePeer(cameraId, { onStatus = () => {}, onTrack = () => {}, onStateChange, onPeer, sessionSeconds = 300 } = {}) {
+    onStatus(t(dict, 'app.live.connecting'));
+    const rtc = await tryJson('api/v1/rtc/config', 3500);
+    const iceServers = (rtc.ice_servers || []).map(server => ({
+      urls: server.urls, username: server.username || '', credential: server.credential || '',
+    }));
+    const peer = new RTCPeerConnection({iceServers});
+    onPeer?.(peer);
     try {
-      const rtc = await tryJson('api/v1/rtc/config', 3500);
-      const iceServers = (rtc.ice_servers || []).map(server => ({
-        urls: server.urls, username: server.username || '', credential: server.credential || '',
-      }));
-      const peer = new RTCPeerConnection({iceServers});
-      activeLivePeer = peer;
       peer.addTransceiver('video', {direction:'recvonly'});
       peer.addEventListener('track', event => {
-        player.srcObject = event.streams?.[0] || new MediaStream([event.track]);
-        player.hidden = false; status.hidden = true;
-        player.play().catch(() => {});
+        onTrack(event.streams?.[0] || new MediaStream([event.track]));
       });
-      peer.addEventListener('connectionstatechange', () => {
-        if (['failed','disconnected','closed'].includes(peer.connectionState)) {
-          status.hidden = false;
-          status.textContent = t(dict, peer.connectionState === 'failed' ? 'app.live.failed' : 'app.live.disconnected');
-        }
-      });
+      if (onStateChange) {
+        peer.addEventListener('connectionstatechange', () => onStateChange(peer.connectionState));
+      }
       const offer = await peer.createOffer();
       await peer.setLocalDescription(offer);
       await waitIceComplete(peer);
       const local = peer.localDescription;
+      // A browser that gathered no candidates has offered no path for the
+      // video to take, and the gateway can only wait twenty seconds and give
+      // up — which from here looks like loading forever. Say so instead.
+      if (!/^a=candidate/m.test(local.sdp)) throw new Error(t(dict,'app.live.noCandidates'));
       const response = await fetch(`api/v1/cameras/${encodeURIComponent(cameraId)}/live`, {
         method:'POST', headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({offer_sdp:local.sdp, offer_type:local.type, session_seconds:300}),
+        body:JSON.stringify({offer_sdp:local.sdp, offer_type:local.type, session_seconds:sessionSeconds}),
       });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const accepted = await response.json();
-      const result = await pollCommand(accepted.command_id, status, {
+      const result = await pollCommand(accepted.command_id, onStatus, {
         queued:'app.live.queued', running:'app.live.starting', failed:'app.live.failed', timeout:'app.live.timeout',
       });
       if (!result?.live?.sdp) throw new Error(t(dict,'app.live.noAnswer'));
       await peer.setRemoteDescription({type:result.live.sdp_type || 'answer', sdp:result.live.sdp});
-      status.textContent = t(dict,'app.live.negotiating');
+      onStatus(t(dict,'app.live.negotiating'));
+      return peer;
+    } catch (error) {
+      try { peer.close(); } catch { /* never negotiated */ }
+      throw error;
+    }
+  }
+
+  async function startLive(cameraId) {
+    closeActiveLive();
+    const player = document.querySelector('#live-player');
+    const status = document.querySelector('#live-player-status');
+    status.hidden = false;
+    const say = text => { status.hidden = false; status.textContent = text; };
+    try {
+      await openLivePeer(cameraId, {
+        onStatus: say,
+        onPeer: peer => { activeLivePeer = peer; },
+        onTrack: stream => {
+          player.srcObject = stream;
+          player.hidden = false; status.hidden = true;
+          player.play().catch(() => {});
+        },
+        onStateChange: state => {
+          if (['failed','disconnected','closed'].includes(state)) {
+            say(t(dict, state === 'failed' ? 'app.live.failed' : 'app.live.disconnected'));
+          }
+        },
+      });
     } catch (error) {
       closeActiveLive();
-      status.hidden = false;
-      status.textContent = `${t(dict,'app.live.failed')}: ${error.message}`;
+      say(`${t(dict,'app.live.failed')}: ${error.message}`);
     }
   }
 
@@ -704,35 +765,23 @@ export async function startDashboard({ brand, locale, dict }) {
         // What already happened, out of the gateway's ring buffer. It answers
         // with what it still holds, which may be less than asked for.
         clipButton.addEventListener('click', async () => {
-          clipButton.disabled = true; recordStatus.textContent = t(dict,'app.archive.queued');
+          clipButton.disabled = true;
+          const say = text => { recordStatus.textContent = text; };
           try {
-            const response = await fetch(`api/v1/cameras/${encodeURIComponent(cameraId)}/clips`, {
-              method:'POST', headers:{'Content-Type':'application/json'},
-              body:JSON.stringify({seconds:CLIP_SECONDS, storage_plugin_id:storagePluginId()}),
-            });
-            if (!response.ok) throw new Error(`HTTP ${response.status}`);
-            const accepted = await response.json();
-            await pollCommand(accepted.command_id, recordStatus);
-            recordStatus.textContent = t(dict,'app.archive.ready');
+            await saveClip(cameraId, say);
             await loadCameraTimeline(cameraId, timeline);
           } catch (error) {
-            recordStatus.textContent = `${t(dict,'app.archive.failed')}: ${error.message}`;
+            say(`${t(dict,'app.archive.failed')}: ${error.message}`);
           } finally { clipButton.disabled = false; }
         });
         recordButton.addEventListener('click', async () => {
-          recordButton.disabled = true; recordStatus.textContent = t(dict,'app.archive.queued');
+          recordButton.disabled = true;
+          const say = text => { recordStatus.textContent = text; };
           try {
-            const response = await fetch(`api/v1/cameras/${encodeURIComponent(cameraId)}/recordings`, {
-              method:'POST', headers:{'Content-Type':'application/json'},
-              body:JSON.stringify({duration_seconds:10, segment_seconds:2, storage_plugin_id:storagePluginId()}),
-            });
-            if (!response.ok) throw new Error(`HTTP ${response.status}`);
-            const accepted = await response.json();
-            await pollCommand(accepted.command_id, recordStatus);
-            recordStatus.textContent = t(dict,'app.archive.ready');
+            await recordNow(cameraId, say);
             await loadCameraTimeline(cameraId, timeline);
           } catch (error) {
-            recordStatus.textContent = `${t(dict,'app.archive.failed')}: ${error.message}`;
+            say(`${t(dict,'app.archive.failed')}: ${error.message}`);
           } finally { recordButton.disabled = false; }
         });
       }
@@ -820,11 +869,11 @@ export async function startDashboard({ brand, locale, dict }) {
   }
   // The search box is the one piece of state a refresh must not stamp on, so
   // the current filter is kept rather than read back out of the input.
-  let currentFilter = '';
   render();
   document.querySelector('#fleet-search').addEventListener('input', event => {
     currentFilter = event.target.value;
     render(currentFilter);
+    wall.repaint();
   });
 
   // Poll, because a dashboard that only tells the truth at page load is a
@@ -863,6 +912,7 @@ export async function startDashboard({ brand, locale, dict }) {
     paintUsers();
     paintAudit();
     render(currentFilter);
+    wall.repaint();
     renderGateways();
     renderSources();
     markUpdated();
@@ -1146,6 +1196,40 @@ export async function startDashboard({ brand, locale, dict }) {
     finally { button.disabled = false; }
   });
 
+  // What the wall shows: every camera, or the ones the search box matches. The
+  // table filters by site, which is the right grain for a list of sites; a wall
+  // is a list of cameras, so this matches the camera's own name too. The site
+  // comes along for the tile's tooltip — on a wall spanning several, the camera
+  // name alone does not say where it is.
+  function wallCameras() {
+    const query = currentFilter.trim().toLowerCase();
+    return rows.flatMap(({ customer, site }) => site.cameras
+      .filter(camera => !query
+        || `${customer.name} ${site.name} ${site.city} ${camera.name}`.toLowerCase().includes(query))
+      .map(camera => ({ ...camera, site_name: site.name })));
+  }
+
+  // The wall is its own view rather than a modal: a modal would stop the poll
+  // (see refresh below), and a wall whose status pills freeze the moment it
+  // opens is a wall nobody should trust.
+  const wall = createWall({
+    dict,
+    cameras: wallCameras,
+    isLive: () => isLive,
+    storagePluginId,
+    openLivePeer,
+    recordNow,
+    saveClip,
+  });
+  document.querySelector('#wall-link').addEventListener('click', event => { event.preventDefault(); wall.open(); });
+  // The wall hides the dashboard, so every other way out of it has to put the
+  // dashboard back. Otherwise a sidebar link scrolls to a section nobody can
+  // see and the only way home is the browser's back button.
+  for (const link of document.querySelectorAll('.sidebar-link')) {
+    if (link.id === 'wall-link') continue;
+    link.addEventListener('click', () => { if (wall.isOpen()) wall.close(); });
+  }
+
   function openModal(selector) { document.querySelector(selector).classList.add('open'); }
   function closeModal(selector) { document.querySelector(selector).classList.remove('open'); }
 
@@ -1315,5 +1399,5 @@ export async function startDashboard({ brand, locale, dict }) {
   // only means anything mid-render. `stop` is here because anything that starts
   // this dashboard should be able to end it — a timer with no off switch is a
   // leak waiting for whoever embeds this next.
-  return { siteStatus, fmt, escapeHtml, storagePluginId, aiPluginId, render, refresh, stop: () => clearInterval(timer) };
+  return { siteStatus, fmt, escapeHtml, storagePluginId, aiPluginId, render, refresh, wall, stop: () => clearInterval(timer) };
 }

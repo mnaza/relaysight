@@ -373,6 +373,16 @@ pub trait Store: Send + Sync {
     /// `NotFound` when there is nothing to remove.
     async fn delete_video_source(&self, id: &str) -> Result<(), StoreError>;
 
+    /// Which gateway a camera belongs to, from the roster rather than from
+    /// whatever telemetry is in memory. `None` for a camera that is unknown,
+    /// retired or removed.
+    async fn camera_gateway(&self, camera_id: &str) -> Result<Option<String>, StoreError>;
+
+    /// The cameras whose source was removed on purpose. The roster query
+    /// already hides them; callers that merge in live telemetry need this so
+    /// a gateway that has not caught up cannot put one back.
+    async fn removed_camera_ids(&self) -> Result<Vec<String>, StoreError>;
+
     /// Set how a camera is recorded, replacing whatever it had.
     async fn set_recording_policy(&self, policy: &RecordingPolicy) -> Result<(), StoreError>;
 

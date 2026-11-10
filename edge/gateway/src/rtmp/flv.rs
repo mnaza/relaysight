@@ -61,8 +61,126 @@ pub fn rfc6381_codec(avcc: &[u8]) -> anyhow::Result<String> {
     ))
 }
 
+/// The SPS and PPS an AVCDecoderConfigurationRecord carries. A browser will
+/// not decode a stream without them, and FLV sends them once, out of band.
+pub fn parameter_sets(avcc: &[u8]) -> anyhow::Result<Vec<Vec<u8>>> {
+    if avcc.len() < 6 || avcc[0] != 1 {
+        return Err(anyhow!("invalid AVCDecoderConfigurationRecord"));
+    }
+    let mut sets = Vec::new();
+    let mut at = 5;
+    // Two runs, each counted in the low bits of its own byte: SPS then PPS.
+    for (count_mask, counted_at) in [(0x1f_u8, 5_usize), (0xff, usize::MAX)] {
+        let (count, from) = if counted_at == usize::MAX {
+            let Some(&byte) = avcc.get(at) else { break };
+            at += 1;
+            (byte & count_mask, at)
+        } else {
+            (avcc[counted_at] & count_mask, 6)
+        };
+        at = at.max(from);
+        for _ in 0..count {
+            let Some(length) = avcc
+                .get(at..at + 2)
+                .map(|bytes| usize::from(u16::from_be_bytes([bytes[0], bytes[1]])))
+            else {
+                return Err(anyhow!("truncated parameter set length"));
+            };
+            at += 2;
+            let Some(set) = avcc.get(at..at + length) else {
+                return Err(anyhow!("truncated parameter set"));
+            };
+            sets.push(set.to_vec());
+            at += length;
+        }
+    }
+    Ok(sets)
+}
+
+/// How many bytes each NALU's length takes in this stream: the record says,
+/// and four is what every encoder seen here uses.
+pub fn nalu_length_size(avcc: &[u8]) -> usize {
+    avcc.get(4).map_or(4, |byte| usize::from((byte & 0x03) + 1))
+}
+
+/// Length-prefixed NALUs to Annex B start codes, with the parameter sets in
+/// front of a key frame so a decoder can start on it. A NALU whose length runs
+/// past the end of the frame is dropped rather than guessed at.
+pub fn to_annex_b(
+    frame: &[u8],
+    length_size: usize,
+    parameter_sets: &[Vec<u8>],
+    keyframe: bool,
+) -> Vec<u8> {
+    const START: [u8; 4] = [0, 0, 0, 1];
+    let mut out = Vec::with_capacity(frame.len() + 64);
+    if keyframe {
+        for set in parameter_sets {
+            out.extend_from_slice(&START);
+            out.extend_from_slice(set);
+        }
+    }
+    let mut at = 0;
+    while at + length_size <= frame.len() {
+        let mut length = 0usize;
+        for byte in &frame[at..at + length_size] {
+            length = (length << 8) | usize::from(*byte);
+        }
+        at += length_size;
+        let Some(nalu) = frame.get(at..at + length) else {
+            break;
+        };
+        out.extend_from_slice(&START);
+        out.extend_from_slice(nalu);
+        at += length;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
+    /// A browser needs Annex B with the parameter sets in band. FLV carries
+    /// neither: NALUs come length-prefixed and SPS/PPS arrive once, in the
+    /// decoder configuration. Sending the payload as it arrives gave a browser
+    /// 288 KB and no decoded frame at all.
+    #[test]
+    fn a_pushed_frame_becomes_annex_b_with_its_parameter_sets() {
+        // One SPS (0x67 ...), one PPS (0x68 ...), 4-byte NALU lengths.
+        let avcc = vec![
+            1, 0x42, 0xe0, 0x1e, 0xff, 0xe1, 0, 3, 0x67, 0x42, 0x1e, 1, 0, 2, 0x68, 0xce,
+        ];
+        let sets = parameter_sets(&avcc).expect("a record this shape parses");
+        assert_eq!(sets, vec![vec![0x67, 0x42, 0x1e], vec![0x68, 0xce]]);
+        assert_eq!(nalu_length_size(&avcc), 4);
+
+        let frame = [0, 0, 0, 2, 0x65, 0xaa, 0, 0, 0, 1, 0x41];
+        let start = [0u8, 0, 0, 1];
+
+        let key = to_annex_b(&frame, 4, &sets, true);
+        assert_eq!(
+            key,
+            [
+                &start[..],
+                &[0x67, 0x42, 0x1e],
+                &start[..],
+                &[0x68, 0xce],
+                &start[..],
+                &[0x65, 0xaa],
+                &start[..],
+                &[0x41],
+            ]
+            .concat(),
+            "a key frame carries the parameter sets before it"
+        );
+
+        let inter = to_annex_b(&frame, 4, &sets, false);
+        assert_eq!(
+            inter,
+            [&start[..], &[0x65, 0xaa], &start[..], &[0x41]].concat(),
+            "an inter frame repeats nothing"
+        );
+    }
+
     use super::*;
 
     #[test]

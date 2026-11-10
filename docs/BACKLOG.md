@@ -101,7 +101,7 @@
 - [ ] Signed license / subscription validation
 - [ ] Reseller hierarchy and multi-tenancy
 - [ ] Advanced white-label domains/apps
-- [ ] SSO/OIDC/SAML
+- [x] SSO — OpenID Connect with PKCE, an account only if it already exists unless autocreate is configured, and a provider in this repository to test the whole round trip against (`docs/SSO.md`, spec: `docs/superpowers/specs/2026-09-24-sso-oidc-design.md`); met Keycloak 26 (`make check-sso-keycloak`), which found an unverified email being let in; Entra, Okta and Google have not been met, and SAML is not done
 - [x] Audit controls — a hash chain over every row, verification that says where it breaks, and a CSV export an auditor can check outside this system (`docs/AUDIT.md`); tamper-evident rather than tamper-proof, and no compliance framework has been run against it
 - [ ] HA control plane and SLA tooling
 

@@ -34,6 +34,20 @@ needed. For example, a camera network that multicast discovery cannot reach:
 Running it again brings the install up to the latest release. It keeps the
 configuration, changing only the keys it's given.
 
+A camera reached over a slow link may need longer than the eight seconds a
+dial is given by default — DESCRIBE, SETUP and PLAY each. `RTSP_DIAL_TIMEOUT_SECONDS`
+raises it (1 to 120; anything unparseable keeps the default). Measured reason
+for the knob: an NVR reached over the internet answered an idle DESCRIBE in
+0.16s and a loaded one in 6.2s, which leaves nothing to spare.
+
+A gateway offers a browser every address its host has, which on a box running
+Docker means one per bridge: addresses only that host can route, each of them a
+connectivity check the browser has to try and fail, and the site's internal
+network written into an SDP. `RTC_UDP_ADDRS` pins what it offers instead —
+comma-separated, a bare address meaning any port on it. Measured on a developer
+machine with five bridges: sixteen host candidates unpinned, two when pinned to
+the one interface that matters, same video either way (`docs/LIVE.md`).
+
 ## Where things live
 
 | | |

@@ -9,7 +9,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { web } from './sources.mjs';
+import { allSources, web } from './sources.mjs';
 
 const css = readFileSync(join(web, 'styles.css'), 'utf8');
 const theme = readFileSync(join(web, 'theme.js'), 'utf8');
@@ -75,6 +75,9 @@ test('the app chrome that is still hardcoded is exactly this list', () => {
     '.sidebar',
     '.telemetry-metric',
     '.timeline-row',
+    // The wall's tiles. A video letterbox is black because that is what no
+    // signal looks like, not because of a theme.
+    '.wall-tile',
   ]);
 });
 
@@ -132,7 +135,9 @@ test('every class the stylesheet styles is one the app can produce', () => {
   // usually the leftover of a rename that half happened. This is a substring
   // match, so it is deliberately lenient: it catches a class name that appears
   // nowhere at all, not one that survives only inside a longer word.
-  const markup = ['app.html', 'dashboard-app.js', 'theme.js']
+  // Derived from what the pages load rather than listed here: a hardcoded list
+  // stops covering a module the moment one is added, and wall.js was added.
+  const markup = allSources()
     .map(f => readFileSync(join(web, f), 'utf8'))
     .join('\n');
   const styled = new Set([...css.matchAll(/\.([a-z][\w-]*)/g)].map(m => m[1]));

@@ -59,6 +59,12 @@ happens to expire.
 An owner cannot disable or demote themselves. That is a support call nobody
 can answer.
 
+## Signing in with an identity provider
+
+There is single sign-on through OIDC — `docs/SSO.md`. An account that comes
+from the provider has no password here at all, so the login form cannot be
+used to get in as it. Roles stay this system's to decide either way.
+
 ## What is still shared
 
 - **The gateway token.** Gateways authenticate with their own per-gateway
@@ -66,7 +72,6 @@ can answer.
 - **Plugin tokens**, which belong to the plugins.
 - **Password reset by email.** There is no mail in the control plane on
   purpose, so an owner sets a new password instead.
-- **SSO and OIDC**, which are their own epic.
 - **Per-site roles.** The split is per customer; a technician is trusted with
   the fleet they are given.
 

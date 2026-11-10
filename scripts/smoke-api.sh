@@ -17,7 +17,7 @@ echo ok
 printf '2/6 log in... '
 curl -fsS -c "$COOKIE_JAR" -X POST "${API_URL}/api/v1/auth/login" \
   -H 'Content-Type: application/json' \
-  -d "$(python3 -c 'import json,os; print(json.dumps({"password": os.environ["ADMIN_PASSWORD"]}))')" \
+  -d "$(ADMIN_EMAIL="${ADMIN_EMAIL:-admin@localhost}" python3 -c 'import json,os; print(json.dumps({"email": os.environ["ADMIN_EMAIL"], "password": os.environ["ADMIN_PASSWORD"]}))')" \
   >/dev/null
 echo ok
 

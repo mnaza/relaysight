@@ -10,6 +10,10 @@ set -euo pipefail
 
 API_URL="${API_URL:-http://localhost:8080}"
 ADMIN_PASSWORD="${ADMIN_PASSWORD:-demo-admin-password}"
+# Logging in has taken an email since there were users rather than one
+# password (docs/USERS.md). This script kept sending only the password, so it
+# had been answering 401 ever since — and with it `make check-editions`.
+ADMIN_EMAIL="${ADMIN_EMAIL:-admin@localhost}"
 CAMERAS="${CAMERAS:-5}"
 CUSTOMER_ID="${CUSTOMER_ID:-pilot-customer}"
 CUSTOMER_NAME="${CUSTOMER_NAME:-Pilot customer}"
@@ -26,7 +30,7 @@ trap 'rm -f "$cookie_jar"' EXIT
 printf 'log in... '
 curl -fsS -c "$cookie_jar" -X POST "${API_URL}/api/v1/auth/login" \
   -H 'Content-Type: application/json' \
-  -d "$(python3 -c 'import json,os; print(json.dumps({"password": os.environ["ADMIN_PASSWORD"]}))')" \
+  -d "$(ADMIN_EMAIL="$ADMIN_EMAIL" python3 -c 'import json,os; print(json.dumps({"email": os.environ["ADMIN_EMAIL"], "password": os.environ["ADMIN_PASSWORD"]}))')" \
   >/dev/null
 echo ok
 

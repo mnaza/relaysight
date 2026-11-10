@@ -372,10 +372,15 @@ async fn main() -> anyhow::Result<()> {
         client.clone(),
         cameras.clone(),
         reconnects,
-        backoff,
+        backoff.clone(),
         sources.clone(),
     ));
-    let command_task = tokio::spawn(command_loop(config.clone(), client.clone(), sources));
+    let command_task = tokio::spawn(command_loop(
+        config.clone(),
+        client.clone(),
+        sources,
+        backoff.clone(),
+    ));
     let heartbeat_task = tokio::spawn(heartbeat_loop(config, client, cameras, hostname, started));
 
     tokio::select! {
@@ -1206,7 +1211,10 @@ fn cameras_to_record(
 /// A source's camera id. Derived from the address, so the same address keeps its
 /// identity — and its recordings and incidents — across restarts and re-adds.
 fn source_camera_id(address: &str) -> String {
-    uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, address.as_bytes()).to_string()
+    // One rule, shared with the control plane: it derives the same id when a
+    // source is added or removed. Two copies of this would mean a removal that
+    // silently missed its camera.
+    vms_domain::source_camera_id(address)
 }
 
 /// The polled sources worth probing this pass: the pulled ones, minus anything
@@ -1497,10 +1505,24 @@ async fn post_json<T: serde::Serialize>(
     }
 }
 
+/// Whether to refuse a live session outright, and what to say. The RTSP dial
+/// happens late on purpose — a camera should not stream while the browser is
+/// still gathering — so a camera that is already known to be unreachable would
+/// otherwise answer the offer, connect, and leave a black screen when the dial
+/// fails. The gateway knows; this is it saying so.
+fn live_refusal(camera_id: &str, offline: Option<(u32, String)>) -> Option<String> {
+    let (failures, reason) = offline?;
+    Some(format!(
+        "camera {camera_id} is not answering: {reason}. The gateway's last \
+         {failures} attempts to reach it failed, so there is nothing to stream yet"
+    ))
+}
+
 async fn command_loop(
     config: Config,
     client: reqwest::Client,
     sources: Arc<RwLock<HashMap<String, CameraSource>>>,
+    backoff: Arc<RwLock<Backoff>>,
 ) -> anyhow::Result<()> {
     loop {
         let endpoint = format!(
@@ -1512,7 +1534,8 @@ async fn command_loop(
             Ok(response) if response.status().is_success() => {
                 let command: Option<GatewayCommand> = response.json().await?;
                 if let Some(command) = command {
-                    let result = execute_command(&config, &client, &sources, &command).await;
+                    let result =
+                        execute_command(&config, &client, &sources, &backoff, &command).await;
                     complete_command(&config, &client, &command, result).await;
                     continue;
                 }
@@ -1535,6 +1558,7 @@ async fn execute_command(
     config: &Config,
     client: &reqwest::Client,
     sources: &Arc<RwLock<HashMap<String, CameraSource>>>,
+    backoff: &Arc<RwLock<Backoff>>,
     command: &GatewayCommand,
 ) -> anyhow::Result<CommandPayload> {
     match &command.kind {
@@ -1660,13 +1684,20 @@ async fn execute_command(
             session_seconds,
             ice_servers,
         } => {
+            if let Some(refusal) =
+                live_refusal(camera_id, backoff.read().await.offline_reason(camera_id))
+            {
+                anyhow::bail!(refusal);
+            }
             let source = camera_source(sources, camera_id).await?;
             info!(command_id = %command.id, camera_id, "starting outbound-signaled WebRTC live session");
             let media = match &source.push_key {
                 Some(key) => live::LiveMedia::Pushed(Box::new(
                     config
                         .ingest
-                        .subscribe(key)
+                        // A browser needs Annex B with the parameter sets in
+                        // band; the recorder wants the AVCC that arrived.
+                        .subscribe_as(key, crate::frames::Framing::AnnexB)
                         .ok_or_else(|| anyhow!("nothing is publishing to stream key {key}"))?,
                 )),
                 None => live::LiveMedia::Rtsp {
@@ -2066,6 +2097,15 @@ mod tests {
     /// change meant to quieten the log left it exactly as loud and started
     /// inventing reconnects on top. Unit tests on the Backoff type could not
     /// see it; only running the thing did.
+    /// A backoff that has heard nothing yet: every camera is presumed fine, the
+    /// way it is on a gateway that has just started.
+    fn fresh_backoff() -> Arc<RwLock<Backoff>> {
+        Arc::new(RwLock::new(Backoff::new(
+            Duration::from_secs(30),
+            Duration::from_secs(300),
+        )))
+    }
+
     #[tokio::test]
     async fn a_held_off_probe_is_not_counted_as_a_reconnect() {
         let cfg = config("http://127.0.0.1:9");
@@ -2883,7 +2923,12 @@ mod tests {
         let api = FakeControlPlane::start(vec![record_command("cmd-1", "no-such-camera")], 0).await;
         let sources = Arc::new(RwLock::new(HashMap::new()));
         let client = reqwest::Client::new();
-        tokio::spawn(command_loop(config(&api.url), client, sources));
+        tokio::spawn(command_loop(
+            config(&api.url),
+            client,
+            sources,
+            fresh_backoff(),
+        ));
 
         let completions = api.wait_for_completions(1, Duration::from_secs(10)).await;
         assert_eq!(completions[0]["command_id"], "cmd-1");
@@ -2906,6 +2951,7 @@ mod tests {
             config(&api.url),
             reqwest::Client::new(),
             sources,
+            fresh_backoff(),
         ));
 
         let completions = api.wait_for_completions(1, Duration::from_secs(20)).await;
@@ -2977,6 +3023,7 @@ mod tests {
             config,
             reqwest::Client::new(),
             Arc::new(RwLock::new(HashMap::new())),
+            fresh_backoff(),
         ));
 
         let completions = api.wait_for_completions(1, Duration::from_secs(20)).await;
@@ -3003,6 +3050,7 @@ mod tests {
             config,
             reqwest::Client::new(),
             Arc::new(RwLock::new(HashMap::new())),
+            fresh_backoff(),
         ));
 
         let completions = api.wait_for_completions(1, Duration::from_secs(10)).await;
@@ -3023,6 +3071,7 @@ mod tests {
             config(&api.url),
             reqwest::Client::new(),
             Arc::new(RwLock::new(HashMap::new())),
+            fresh_backoff(),
         ));
         api.wait_for_completions(1, Duration::from_secs(10)).await;
 
@@ -3050,6 +3099,7 @@ mod tests {
             config(&api.url),
             reqwest::Client::new(),
             sources,
+            fresh_backoff(),
         ));
 
         api.wait_for_completions(1, Duration::from_secs(20)).await;
@@ -3076,6 +3126,7 @@ mod tests {
             config(&api.url),
             reqwest::Client::new(),
             Arc::new(RwLock::new(HashMap::new())),
+            fresh_backoff(),
         ));
 
         let completions = api.wait_for_completions(1, Duration::from_secs(10)).await;
@@ -3093,6 +3144,7 @@ mod tests {
             config(&api.url),
             reqwest::Client::new(),
             Arc::new(RwLock::new(HashMap::new())),
+            fresh_backoff(),
         ));
         tokio::time::sleep(Duration::from_millis(300)).await;
         let seen = api.seen.read().await;
@@ -3176,6 +3228,34 @@ mod tests {
             establish_identity(&mut cfg3, &client, "edge-1", &store, true)
                 .await
                 .is_err()
+        );
+    }
+
+    /// A live session for a camera the gateway cannot reach used to answer the
+    /// offer, connect, and then die on the RTSP dial with nothing but a black
+    /// screen to show for it — the reason stayed in the gateway's log. Measured
+    /// on 2026-09-28: peer connected in 0.4s, `RTSP DESCRIBE timeout` eight
+    /// seconds later, "Live connection ended" in the browser.
+    #[test]
+    fn live_is_refused_for_a_camera_the_gateway_cannot_reach() {
+        let refusal = live_refusal("front-door", Some((4, "RTSP DESCRIBE timeout".into())))
+            .expect("a camera that has failed four dials cannot be streamed");
+        assert!(
+            refusal.contains("RTSP DESCRIBE timeout"),
+            "the refusal has to carry the reason the dial failed: {refusal}"
+        );
+        assert!(
+            refusal.contains("front-door"),
+            "the refusal has to name the camera: {refusal}"
+        );
+        assert!(
+            refusal.contains('4'),
+            "how many dials have failed says whether this is a blip: {refusal}"
+        );
+        assert_eq!(
+            live_refusal("front-door", None),
+            None,
+            "a camera that is answering must not be refused"
         );
     }
 }

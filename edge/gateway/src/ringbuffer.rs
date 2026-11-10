@@ -20,6 +20,7 @@ use std::{
 
 use anyhow::{Context, anyhow};
 use chrono::{DateTime, TimeZone, Utc};
+use tracing::warn;
 
 use crate::{
     frames::FrameSource,
@@ -280,7 +281,7 @@ impl Ring {
             path: PathBuf::new(),
         };
         let path = self.dir.join(stored.file_name());
-        write_atomically(&path, &segment.bytes)?;
+        self.write_making_room(&path, &segment.bytes)?;
         Ok(StoredSegment { path, ..stored })
     }
 
@@ -291,11 +292,11 @@ impl Ring {
         let name = short_hash(bytes);
         let path = self.dir.join(format!("init-{name}.mp4"));
         if !path.exists() {
-            write_atomically(&path, bytes)?;
+            self.write_making_room(&path, bytes)?;
         }
         let description_path = self.dir.join(format!("init-{name}.json"));
         if !description_path.exists() {
-            write_atomically(&description_path, &serde_json::to_vec(description)?)?;
+            self.write_making_room(&description_path, &serde_json::to_vec(description)?)?;
         }
         Ok(name)
     }
@@ -405,6 +406,53 @@ impl Ring {
         Ok(freed)
     }
 
+    /// Write, and if the filesystem is full, make room by dropping the
+    /// oldest video and try again.
+    ///
+    /// The byte budget is what an operator asked for; the filesystem is what
+    /// they actually have, and the two disagree the moment somebody sets a
+    /// 50 GB ring on a 20 GB disk, or something else on the box grows. A ring
+    /// that stops recording the first time a write fails is the worst of both:
+    /// the disk stays full *and* there is no video. So the disk gets treated
+    /// as a second budget, discovered rather than configured.
+    fn write_making_room(&self, path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+        loop {
+            match write_atomically(path, bytes) {
+                Ok(()) => return Ok(()),
+                Err(error) if is_storage_full(&error) => {
+                    if !self.drop_oldest()? {
+                        // Nothing left to give. The caller sees the real
+                        // error, which names the filesystem's answer.
+                        return Err(error);
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// Delete the oldest segment whatever the budget says. `false` when there
+    /// is nothing left to delete.
+    fn drop_oldest(&self) -> anyhow::Result<bool> {
+        let segments = self.segments()?;
+        let Some(oldest) = segments.first() else {
+            // No media left to give up. The inits that named it go too:
+            // small, but on a filesystem with nothing left, small is what
+            // there is.
+            let _ = self.prune_unused_inits();
+            return Ok(false);
+        };
+        let gone = std::fs::remove_file(&oldest.path).is_ok();
+        if gone {
+            warn!(
+                path = %oldest.path.display(),
+                "the filesystem is full; dropping the oldest recording to keep recording"
+            );
+            self.prune_unused_inits()?;
+        }
+        Ok(gone)
+    }
+
     /// An init segment no remaining media segment names is dead weight.
     fn prune_unused_inits(&self) -> anyhow::Result<()> {
         let live: std::collections::HashSet<String> = self
@@ -436,9 +484,24 @@ impl Ring {
 /// half-written segment and a crash never leaves one.
 fn write_atomically(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     let temporary = path.with_extension("partial");
-    std::fs::write(&temporary, bytes).with_context(|| format!("write {}", temporary.display()))?;
+    if let Err(error) = std::fs::write(&temporary, bytes) {
+        // A failed write leaves whatever fitted behind it. On a full disk
+        // that is exactly the space somebody needs back.
+        let _ = std::fs::remove_file(&temporary);
+        return Err(anyhow::Error::new(error))
+            .with_context(|| format!("write {}", temporary.display()));
+    }
     std::fs::rename(&temporary, path).with_context(|| format!("rename into {}", path.display()))?;
     Ok(())
+}
+
+/// Did this fail because the filesystem is full, rather than for one of the
+/// hundred other reasons a write fails?
+fn is_storage_full(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .any(|io| io.kind() == std::io::ErrorKind::StorageFull)
 }
 
 /// Enough of a digest to tell two inits apart, short enough to read. (This
@@ -513,6 +576,84 @@ mod tests {
         let (from, to) = ring.span().unwrap().expect("a span");
         assert!(to > from);
         assert!(!ring.init_bytes(&segments[0].init).unwrap().is_empty());
+    }
+
+    /// A filesystem that actually runs out, rather than a budget standing in
+    /// for one.
+    ///
+    /// Ignored because it needs a small filesystem to fill and this process
+    /// cannot make one. `make check-ring-full` mounts an 8 MiB tmpfs in a
+    /// user namespace and points this at it:
+    ///
+    /// ```text
+    /// unshare --user --map-root-user --mount sh -c \
+    ///   'mount -t tmpfs -o size=8m tmpfs /mnt && RING_FULL_DIR=/mnt cargo test -p vms-gateway -- --ignored a_full_filesystem'
+    /// ```
+    ///
+    /// The budget is deliberately far larger than the filesystem, which is
+    /// the misconfiguration this is about: an operator who sets the ring to
+    /// 50 GB on a 20 GB disk. The ring must keep the last however-much fits,
+    /// not stop recording the first time a write fails.
+    #[tokio::test]
+    #[ignore = "needs a small filesystem to fill; see make check-ring-full"]
+    async fn a_full_filesystem_shrinks_the_ring_rather_than_ending_the_recording() {
+        let dir = std::env::var("RING_FULL_DIR")
+            .expect("RING_FULL_DIR must name a directory on a small filesystem");
+        let dir = std::path::Path::new(&dir);
+        let before = free_bytes(dir);
+        // Far more than the filesystem holds.
+        let ring = Ring::open(dir, "camera-1", 64 * 1024 * 1024 * 1024).unwrap();
+        let stop = tokio::sync::Notify::new();
+
+        // Roughly 30 MiB of video into whatever this filesystem is, which is
+        // meant to be a few MiB.
+        ring.record(&mut scripted(30_000), &stop)
+            .await
+            .expect("a full filesystem ended the recording");
+
+        let segments = ring.segments().unwrap();
+        assert!(
+            !segments.is_empty(),
+            "the ring kept nothing at all after filling the disk"
+        );
+        let (_, to) = ring.span().unwrap().expect("a span");
+        assert!(
+            to > Utc::now() - chrono::Duration::seconds(120),
+            "what survived is the start of the stream, not the end of it"
+        );
+        let held: u64 = segments
+            .iter()
+            .map(|segment| {
+                std::fs::metadata(&segment.path)
+                    .map(|m| m.len())
+                    .unwrap_or(0)
+            })
+            .sum();
+        assert!(
+            held < before,
+            "the ring holds {held} bytes on a filesystem that had {before}"
+        );
+        // Nothing half-written may be left lying about holding space.
+        let partials: Vec<_> = std::fs::read_dir(ring.dir.as_path())
+            .unwrap()
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.extension().is_some_and(|ext| ext == "partial"))
+            .collect();
+        assert!(partials.is_empty(), "left behind: {partials:?}");
+    }
+
+    /// What the filesystem says it has left, for the assertions above.
+    fn free_bytes(path: &std::path::Path) -> u64 {
+        let output = std::process::Command::new("df")
+            .args(["-B1", "--output=avail"])
+            .arg(path)
+            .output()
+            .expect("df");
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .nth(1)
+            .and_then(|line| line.trim().parse().ok())
+            .expect("a number from df")
     }
 
     #[tokio::test]

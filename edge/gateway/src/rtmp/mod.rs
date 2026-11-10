@@ -372,12 +372,61 @@ mod tests {
         assert!(stats.publishing);
     }
 
+    /// What a browser gets, as opposed to what the recorder gets. The same
+    /// publisher feeds both, and only one of them wants the bytes as they
+    /// arrived — this is the difference that left a browser with 288 KB of
+    /// video and no decoded frame.
+    #[tokio::test]
+    async fn a_pushed_stream_reads_as_annex_b_for_a_browser_and_avcc_for_the_recorder() {
+        let ingest = Ingest::new();
+        ingest.allow(["yard".to_string()]);
+        let state = ingest.open("yard");
+        {
+            let mut held = crate::ingest::lock(&state);
+            held.avcc = Some(vec![
+                1, 0x42, 0xe0, 0x1e, 0xff, 0xe1, 0, 3, 0x67, 0x42, 0x1e, 1, 0, 2, 0x68, 0xce,
+            ]);
+        }
+        let mut browser = ingest
+            .subscribe_as("yard", crate::frames::Framing::AnnexB)
+            .expect("the stream is open");
+        let mut recorder = ingest.subscribe("yard").expect("the stream is open");
+
+        ingest.publish(
+            "yard",
+            Frame {
+                data: Bytes::from_static(&[0, 0, 0, 2, 0x65, 0xaa]),
+                timestamp: 0,
+                clock_rate: RTMP_CLOCK_RATE,
+                keyframe: true,
+                new_parameters: true,
+            },
+        );
+
+        let seen = browser.next_frame().await.unwrap().expect("a frame");
+        assert_eq!(
+            seen.data.as_ref(),
+            &[
+                0, 0, 0, 1, 0x67, 0x42, 0x1e, 0, 0, 0, 1, 0x68, 0xce, 0, 0, 0, 1, 0x65, 0xaa
+            ],
+            "a browser needs start codes and the parameter sets on the key frame"
+        );
+
+        let stored = recorder.next_frame().await.unwrap().expect("a frame");
+        assert_eq!(
+            stored.data.as_ref(),
+            &[0, 0, 0, 2, 0x65, 0xaa],
+            "the recorder still gets the AVCC that arrived"
+        );
+    }
+
     /// Everything above proves this gateway understands `rml_rtmp`. This
     /// proves it understands ffmpeg, which is what an encoder actually is.
     ///
     /// Run with `make check-ingest`. It publishes the committed H.264 fixture
     /// with `-c copy`, so the bytes are the fixture's and the framing,
     /// timing and handshake are ffmpeg's.
+
     #[tokio::test]
     #[ignore = "needs ffmpeg on the machine; run make check-ingest"]
     async fn ffmpeg_can_publish_to_this_gateway() {
