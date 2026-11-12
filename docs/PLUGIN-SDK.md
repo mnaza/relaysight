@@ -141,9 +141,14 @@ line is useful. `id` is stable across every retry and every sink, so a sink
 that has already posted a message can recognise it rather than posting twice.
 
 Event kinds today: `camera_offline`, `camera_recovered`, `gateway_offline`,
-`gateway_recovered`, and `test` for the dashboard's "send a test event". A
-sink must ignore kinds it does not know: more will be added without a protocol
-bump.
+`gateway_recovered`, `camera_flapping` (a camera that keeps going up and
+down; its single transitions are held back from here until it settles),
+`camera_settled` (it has held one state for a while — critical if that
+state is down, info if it is answering), and `test` for the dashboard's
+"send a test event". A sink must ignore kinds it does not know: more will
+be added without a protocol bump. A sink written on the Rust SDK sees such
+a kind as `FleetEventKind::Other`, and should still post the title or
+answer `delivered: false` rather than fail.
 
 ## Running a plugin beside the control plane
 

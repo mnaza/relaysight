@@ -1,4 +1,5 @@
 mod auth;
+mod flaps;
 mod health;
 mod oidc;
 mod store;
@@ -79,6 +80,8 @@ struct AppState {
     /// restart every camera looks silent until its gateway re-reports.
     incident_grace: Duration,
     incident_retention_days: i64,
+    /// When a camera's transitions stop going out one by one.
+    flap: crate::flaps::FlapSettings,
     /// The identity provider, when one is configured.
     oidc: Option<Arc<crate::oidc::OidcConfig>>,
     /// Sign-ins that have been started and not finished.
@@ -203,6 +206,7 @@ async fn main() -> anyhow::Result<()> {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(90),
+        flap: crate::flaps::FlapSettings::from_env(),
         audit_retention_days: env::var("AUDIT_RETENTION_DAYS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -2510,7 +2514,7 @@ async fn retention_loop(state: AppState) {
     loop {
         interval.tick().await;
         retention_pass(&state).await;
-        incident_pass(&state).await;
+        incident_pass(&state, Utc::now()).await;
         gateway_pass(&state, &mut reporting).await;
         delivery_pass(&state, Utc::now()).await;
         crate::oidc::forget_stale_attempts(&state.oidc_attempts).await;
@@ -2744,6 +2748,26 @@ async fn raise_event(state: &AppState, event: vms_plugin_sdk::FleetEvent) {
     );
 }
 
+/// Write an event down and queue it for nobody: the dashboard shows it, no
+/// sink hears it. For a camera's single transitions while it is flapping;
+/// `metadata.held` says why, so the Alerts panel does not read it as "no sink
+/// registered".
+async fn hold_event(state: &AppState, mut event: vms_plugin_sdk::FleetEvent) {
+    if let serde_json::Value::Object(metadata) = &mut event.metadata {
+        metadata.insert("held".into(), "flapping".into());
+    } else {
+        event.metadata = serde_json::json!({"held": "flapping"});
+    }
+    if let Err(err) = state.store.record_event(&event, &[], Utc::now()).await {
+        warn!(error = %err, kind = event.kind.as_str(), "a held event was not written down");
+        return;
+    }
+    info!(
+        event_id = %event.id, kind = event.kind.as_str(), title = %event.title,
+        "held an event: the camera is flapping"
+    );
+}
+
 async fn retention_pass(state: &AppState) {
     if let Err(err) = state.store.delete_expired_sessions(Utc::now()).await {
         warn!(error = %err, "retention could not sweep expired sessions");
@@ -2832,11 +2856,45 @@ async fn retention_pass(state: &AppState) {
     }
 }
 
+/// An event about one camera, in the voice the existing ones use:
+/// "Yard camera stopped answering at Bakery".
+#[allow(clippy::too_many_arguments)]
+fn camera_event(
+    record: &crate::store::CameraRecord,
+    place: Option<&Place>,
+    now: DateTime<Utc>,
+    kind: vms_plugin_sdk::FleetEventKind,
+    severity: vms_plugin_sdk::EventSeverity,
+    what: &str,
+    detail: Option<String>,
+    metadata: serde_json::Value,
+) -> vms_plugin_sdk::FleetEvent {
+    let site_name = place
+        .map(|place| place.site_name.clone())
+        .unwrap_or_else(|| record.site_id.clone());
+    vms_plugin_sdk::FleetEvent {
+        id: Uuid::new_v4().to_string(),
+        kind,
+        severity,
+        occurred_at: now,
+        customer_id: place
+            .map(|place| place.customer_id.clone())
+            .unwrap_or_default(),
+        site_id: record.site_id.clone(),
+        title: format!("{} {what} at {site_name}", record.name),
+        site_name,
+        gateway_id: Some(record.gateway_id.clone()),
+        camera_id: Some(record.id.clone()),
+        detail,
+        metadata,
+    }
+}
+
 /// Record disconnects and recoveries. One writer, on the retention cadence.
 /// Effective status follows the same rule as the /cameras view: reported
 /// offline, or silent past the stale window. Idempotent against the store's
 /// one-open-incident-per-camera invariant, so no read-modify-write.
-async fn incident_pass(state: &AppState) {
+async fn incident_pass(state: &AppState, now: DateTime<Utc>) {
     if state.up_since.elapsed() < state.incident_grace {
         return;
     }
@@ -2847,14 +2905,16 @@ async fn incident_pass(state: &AppState) {
             return;
         }
     };
-    let now = Utc::now();
     let live = newest_camera_map(&*state.camera_batches.read().await);
     // Where each camera is, so an event can say "Yard camera at Bakery"
     // rather than a pair of uuids.
     let places = places_by_site(state).await;
     let mut revoked_gateways: std::collections::HashMap<String, bool> =
         std::collections::HashMap::new();
-    for record in records {
+    // Where every camera the pass tracked ended up, for the flap sweep below:
+    // a flapping camera that is not in here is gone, and its flap goes with it.
+    let mut down_now: HashMap<&str, bool> = HashMap::new();
+    for record in &records {
         let revoked = match revoked_gateways.get(&record.gateway_id) {
             Some(&revoked) => revoked,
             None => {
@@ -2886,6 +2946,7 @@ async fn incident_pass(state: &AppState) {
             None => (record.last_seen, false, None),
         };
         let stale = (now - last_seen).num_seconds() > state.stale_camera_seconds;
+        down_now.insert(record.id.as_str(), stale || reported_offline);
         let (detail, result) = if stale {
             let started = last_seen + chrono::Duration::seconds(state.stale_camera_seconds);
             let detail = "gateway telemetry is stale";
@@ -2914,53 +2975,145 @@ async fn incident_pass(state: &AppState) {
             Ok(true) => {
                 let place = places.get(&record.site_id);
                 let down = stale || reported_offline;
-                raise_event(
-                    state,
-                    vms_plugin_sdk::FleetEvent {
-                        id: Uuid::new_v4().to_string(),
-                        kind: if down {
-                            vms_plugin_sdk::FleetEventKind::CameraOffline
-                        } else {
-                            vms_plugin_sdk::FleetEventKind::CameraRecovered
-                        },
-                        severity: if down {
-                            vms_plugin_sdk::EventSeverity::Critical
-                        } else {
-                            vms_plugin_sdk::EventSeverity::Info
-                        },
-                        occurred_at: now,
-                        customer_id: place
-                            .map(|place| place.customer_id.clone())
-                            .unwrap_or_default(),
-                        site_id: record.site_id.clone(),
-                        site_name: place
-                            .map(|place| place.site_name.clone())
-                            .unwrap_or_else(|| record.site_id.clone()),
-                        gateway_id: Some(record.gateway_id.clone()),
-                        camera_id: Some(record.id.clone()),
-                        title: format!(
-                            "{} {} at {}",
-                            record.name,
-                            if down {
-                                "stopped answering"
-                            } else {
-                                "is answering again"
-                            },
-                            place
-                                .map(|place| place.site_name.clone())
-                                .unwrap_or_else(|| record.site_id.clone()),
-                        ),
-                        detail,
-                        metadata: serde_json::json!({"gateway_id": record.gateway_id}),
+                let transition = camera_event(
+                    record,
+                    place,
+                    now,
+                    if down {
+                        vms_plugin_sdk::FleetEventKind::CameraOffline
+                    } else {
+                        vms_plugin_sdk::FleetEventKind::CameraRecovered
                     },
-                )
-                .await;
+                    if down {
+                        vms_plugin_sdk::EventSeverity::Critical
+                    } else {
+                        vms_plugin_sdk::EventSeverity::Info
+                    },
+                    if down {
+                        "stopped answering"
+                    } else {
+                        "is answering again"
+                    },
+                    detail,
+                    serde_json::json!({"gateway_id": record.gateway_id}),
+                );
+                // A camera going up and down every minute would send a
+                // message every minute. Once it has crossed the threshold its
+                // single transitions are recorded but held, and one message
+                // says it is flapping; another says when it has settled.
+                match crate::flaps::verdict(state.store.as_ref(), &state.flap, &record.id, now)
+                    .await
+                {
+                    Ok(crate::flaps::Verdict::Deliver) => raise_event(state, transition).await,
+                    Ok(crate::flaps::Verdict::Held) => hold_event(state, transition).await,
+                    Ok(crate::flaps::Verdict::Started { changes }) => {
+                        hold_event(state, transition).await;
+                        raise_event(
+                            state,
+                            camera_event(
+                                record,
+                                place,
+                                now,
+                                vms_plugin_sdk::FleetEventKind::CameraFlapping,
+                                vms_plugin_sdk::EventSeverity::Warning,
+                                "is flapping",
+                                Some(crate::flaps::flapping_detail(&state.flap, changes)),
+                                serde_json::json!({
+                                    "gateway_id": record.gateway_id,
+                                    "changes": changes,
+                                    "flapping_since": now,
+                                }),
+                            ),
+                        )
+                        .await;
+                    }
+                    Err(err) => {
+                        // The store is the same one that just recorded the
+                        // transition, so this is unlikely; if it happens the
+                        // transition goes out as it always did rather than
+                        // being lost to the rule.
+                        warn!(camera_id = %record.id, error = %err, "flap check failed; delivering");
+                        raise_event(state, transition).await;
+                    }
+                }
             }
             Ok(false) => {}
             Err(err) => {
                 warn!(camera_id = %record.id, error = %err, "incident pass store failure")
             }
         }
+    }
+    settle_flaps(state, &records, &down_now, &places, now).await;
+}
+
+/// The second half of the flap rule: a flapping camera that has held one
+/// state for the settle window is reported settled, saying which state —
+/// critical if it is still down, because then this *is* the outage alert.
+/// A flapping camera the pass no longer tracks (removed, retired, or behind
+/// a revoked gateway) loses its flap without a word: the removal is the
+/// news, and it has its own path.
+async fn settle_flaps(
+    state: &AppState,
+    records: &[crate::store::CameraRecord],
+    down_now: &HashMap<&str, bool>,
+    places: &HashMap<String, Place>,
+    now: DateTime<Utc>,
+) {
+    let open = match state.store.open_camera_flaps().await {
+        Ok(open) => open,
+        Err(err) => {
+            warn!(error = %err, "flap sweep could not list flapping cameras");
+            return;
+        }
+    };
+    for flap in open {
+        // With the rule turned off, a flap left open from before would hold
+        // the first transition after the rule came back, with no
+        // camera_flapping behind it. Drop such rows instead; off means off.
+        let tracked = down_now.get(flap.camera_id.as_str());
+        let Some(&down) = tracked.filter(|_| state.flap.enabled()) else {
+            if let Err(err) = state.store.delete_camera_flap(&flap.camera_id).await {
+                warn!(camera_id = %flap.camera_id, error = %err, "flap sweep store failure");
+            }
+            continue;
+        };
+        if !crate::flaps::has_settled(&flap, &state.flap, now) {
+            continue;
+        }
+        let Some(record) = records.iter().find(|record| record.id == flap.camera_id) else {
+            continue;
+        };
+        if let Err(err) = state.store.settle_camera_flap(&flap.camera_id, now).await {
+            warn!(camera_id = %flap.camera_id, error = %err, "flap sweep store failure");
+            continue;
+        }
+        raise_event(
+            state,
+            camera_event(
+                record,
+                places.get(&record.site_id),
+                now,
+                vms_plugin_sdk::FleetEventKind::CameraSettled,
+                if down {
+                    vms_plugin_sdk::EventSeverity::Critical
+                } else {
+                    vms_plugin_sdk::EventSeverity::Info
+                },
+                if down {
+                    "settled and is still down"
+                } else {
+                    "settled and is answering"
+                },
+                Some(crate::flaps::settled_detail(&flap, down)),
+                serde_json::json!({
+                    "gateway_id": record.gateway_id,
+                    "changes": flap.changes,
+                    "flapping_since": flap.started_at,
+                    "state": if down { "down" } else { "up" },
+                }),
+            ),
+        )
+        .await;
     }
 }
 
@@ -3208,6 +3361,7 @@ mod tests {
             tunnel_answers: Arc::new(RwLock::new(HashMap::new())),
             health_retention_days: 30,
             incident_retention_days: 90,
+            flap: crate::flaps::FlapSettings::default(),
             audit_retention_days: 0,
             up_since: std::time::Instant::now(),
         }
@@ -6218,7 +6372,7 @@ mod tests {
             )
             .await
             .unwrap();
-        incident_pass(&state).await;
+        incident_pass(&state, Utc::now()).await;
         assert_eq!(state.store.incidents(10).await.unwrap().len(), 1);
 
         let store2: Arc<dyn crate::store::Store> = Arc::new(
@@ -6235,7 +6389,7 @@ mod tests {
             "gw-1".into(),
             typed_batch("gw-1", "cam-1", HealthStatus::Healthy, Utc::now(), None),
         );
-        incident_pass(&restarted).await;
+        incident_pass(&restarted, Utc::now()).await;
         assert!(
             restarted.store.incidents(10).await.unwrap()[0]
                 .ended_at
@@ -6876,7 +7030,7 @@ mod tests {
             .await
             .unwrap();
 
-        incident_pass(&state).await;
+        incident_pass(&state, Utc::now()).await;
 
         let incidents = state.store.incidents(10).await.unwrap();
         assert_eq!(incidents.len(), 1);
@@ -6893,7 +7047,7 @@ mod tests {
         );
 
         // A second silent pass must not open another one.
-        incident_pass(&state).await;
+        incident_pass(&state, Utc::now()).await;
         assert_eq!(state.store.incidents(10).await.unwrap().len(), 1);
 
         // Fresh healthy telemetry closes it.
@@ -6901,7 +7055,7 @@ mod tests {
             "gw-1".into(),
             typed_batch("gw-1", "cam-1", HealthStatus::Healthy, Utc::now(), None),
         );
-        incident_pass(&state).await;
+        incident_pass(&state, Utc::now()).await;
         let incidents = state.store.incidents(10).await.unwrap();
         assert_eq!(incidents.len(), 1);
         assert!(
@@ -6939,7 +7093,7 @@ mod tests {
             ),
         );
 
-        incident_pass(&state).await;
+        incident_pass(&state, Utc::now()).await;
 
         let incidents = state.store.incidents(10).await.unwrap();
         assert_eq!(incidents.len(), 1);
@@ -7013,7 +7167,7 @@ mod tests {
             typed_batch("gw-new", "cam-1", HealthStatus::Healthy, now, None),
         );
 
-        incident_pass(&state).await;
+        incident_pass(&state, Utc::now()).await;
         assert!(
             state.store.incidents(10).await.unwrap().is_empty(),
             "a moved camera must not get an incident from its old gateway's ghost"
@@ -7050,21 +7204,447 @@ mod tests {
             "gw-1".into(),
             typed_batch("gw-1", "cam-1", HealthStatus::Offline, now, None),
         );
-        incident_pass(&state).await;
+        incident_pass(&state, Utc::now()).await;
         state.camera_batches.write().await.insert(
             "gw-1".into(),
             typed_batch("gw-1", "cam-1", HealthStatus::Healthy, Utc::now(), None),
         );
-        incident_pass(&state).await;
+        incident_pass(&state, Utc::now()).await;
         state.camera_batches.write().await.insert(
             "gw-1".into(),
             typed_batch("gw-1", "cam-1", HealthStatus::Offline, Utc::now(), None),
         );
-        incident_pass(&state).await;
+        incident_pass(&state, Utc::now()).await;
 
         let incidents = state.store.incidents(10).await.unwrap();
         assert_eq!(incidents.len(), 2);
         assert_eq!(incidents.iter().filter(|i| i.ended_at.is_none()).count(), 1);
+    }
+
+    /// The camera reports `status` at `at`, and the pass runs at `at`. The
+    /// first call also puts the camera in the roster.
+    async fn camera_reports(state: &AppState, status: HealthStatus, at: DateTime<Utc>) {
+        let batch = typed_batch("gw-1", "cam-1", status, at, None);
+        state.store.upsert_fleet_identity(&batch, at).await.unwrap();
+        state
+            .camera_batches
+            .write()
+            .await
+            .insert("gw-1".into(), batch);
+        incident_pass(state, at).await;
+    }
+
+    /// Offline, healthy, offline, a minute apart: three transitions.
+    async fn three_transitions(state: &AppState, t: DateTime<Utc>) {
+        camera_reports(state, HealthStatus::Offline, t).await;
+        camera_reports(
+            state,
+            HealthStatus::Healthy,
+            t + chrono::Duration::seconds(60),
+        )
+        .await;
+        camera_reports(
+            state,
+            HealthStatus::Offline,
+            t + chrono::Duration::seconds(120),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn the_third_transition_in_ten_minutes_is_held_and_one_flapping_event_goes_out() {
+        let (endpoint, seen) = fake_sink("sink-1", true).await;
+        let state = state_with_sinks(&[("sink", &endpoint)]).await;
+        let t = Utc::now();
+        three_transitions(&state, t).await;
+
+        // The held transition and the flapping message share a second, and
+        // recent_events breaks that tie by id, so find them by what they are.
+        let events = state.store.recent_events(10).await.unwrap();
+        assert_eq!(events.len(), 4, "{events:?}");
+        let flapping = events
+            .iter()
+            .find(|view| view.event.kind == vms_plugin_sdk::FleetEventKind::CameraFlapping)
+            .expect("one camera_flapping");
+        let held = events
+            .iter()
+            .find(|view| view.event.metadata.get("held").is_some())
+            .expect("the third transition is held");
+        assert_eq!(
+            held.event.kind,
+            vms_plugin_sdk::FleetEventKind::CameraOffline
+        );
+        let delivered: Vec<_> = events
+            .iter()
+            .filter(|view| !std::ptr::eq(*view, flapping) && !std::ptr::eq(*view, held))
+            .collect();
+        assert_eq!(
+            flapping.event.severity,
+            vms_plugin_sdk::EventSeverity::Warning
+        );
+        assert_eq!(flapping.event.title, "Entrance is flapping at Site");
+        assert_eq!(
+            flapping.event.detail.as_deref(),
+            Some("3 changes in 10 minutes; single changes are held until it settles")
+        );
+        assert_eq!(flapping.event.metadata["changes"], 3);
+        assert_eq!(flapping.event.metadata["gateway_id"], "gw-1");
+        assert_eq!(flapping.event.camera_id.as_deref(), Some("cam-1"));
+        assert_eq!(
+            flapping.deliveries.len(),
+            1,
+            "the flapping message goes out"
+        );
+        assert_eq!(held.event.metadata["held"], "flapping");
+        assert_eq!(
+            held.event.metadata["gateway_id"], "gw-1",
+            "held is added to the metadata, not put in its place"
+        );
+        assert!(
+            held.deliveries.is_empty(),
+            "a held transition is not queued"
+        );
+        assert_eq!(delivered.len(), 2);
+        for view in delivered {
+            assert_eq!(view.deliveries.len(), 1, "{view:?}");
+        }
+
+        delivery_pass(&state, Utc::now()).await;
+        let sent = seen.read().await.clone();
+        let mut sent_kinds: Vec<_> = sent
+            .iter()
+            .map(|post| post["event"]["kind"].as_str().unwrap().to_owned())
+            .collect();
+        sent_kinds.sort();
+        assert_eq!(
+            sent_kinds,
+            vec!["camera_flapping", "camera_offline", "camera_recovered"],
+            "the sink hears the first two transitions and the flap, not the third"
+        );
+    }
+
+    #[tokio::test]
+    async fn while_flapping_every_further_transition_is_held_and_counted() {
+        let (endpoint, seen) = fake_sink("sink-1", true).await;
+        let state = state_with_sinks(&[("sink", &endpoint)]).await;
+        let t = Utc::now();
+        three_transitions(&state, t).await;
+        camera_reports(
+            &state,
+            HealthStatus::Healthy,
+            t + chrono::Duration::seconds(180),
+        )
+        .await;
+        camera_reports(
+            &state,
+            HealthStatus::Offline,
+            t + chrono::Duration::seconds(240),
+        )
+        .await;
+
+        let events = state.store.recent_events(10).await.unwrap();
+        assert_eq!(events.len(), 6);
+        for view in &events[..2] {
+            assert_eq!(view.event.metadata["held"], "flapping", "{view:?}");
+            assert!(view.deliveries.is_empty());
+        }
+        let flap = state.store.camera_flap("cam-1").await.unwrap().unwrap();
+        assert_eq!(flap.changes, 5);
+        assert_eq!(
+            flap.last_transition_at.timestamp(),
+            (t + chrono::Duration::seconds(240)).timestamp()
+        );
+        delivery_pass(&state, Utc::now()).await;
+        assert_eq!(seen.read().await.len(), 3, "nothing more left the building");
+    }
+
+    #[tokio::test]
+    async fn flap_transitions_zero_holds_nothing() {
+        let (endpoint, _seen) = fake_sink("sink-1", true).await;
+        let mut state = state_with_sinks(&[("sink", &endpoint)]).await;
+        state.flap.transitions = 0;
+        let t = Utc::now();
+        three_transitions(&state, t).await;
+        camera_reports(
+            &state,
+            HealthStatus::Healthy,
+            t + chrono::Duration::seconds(180),
+        )
+        .await;
+        camera_reports(
+            &state,
+            HealthStatus::Offline,
+            t + chrono::Duration::seconds(240),
+        )
+        .await;
+
+        let events = state.store.recent_events(10).await.unwrap();
+        assert_eq!(events.len(), 5);
+        for view in &events {
+            assert_eq!(view.deliveries.len(), 1, "{view:?}");
+            assert!(view.event.metadata.get("held").is_none());
+        }
+        assert_eq!(state.store.camera_flap("cam-1").await.unwrap(), None);
+    }
+
+    fn settled_events(events: &[crate::store::EventView]) -> Vec<&crate::store::EventView> {
+        events
+            .iter()
+            .filter(|view| view.event.kind == vms_plugin_sdk::FleetEventKind::CameraSettled)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_camera_that_holds_up_for_the_settle_window_is_reported_settled_and_answering() {
+        let (endpoint, _seen) = fake_sink("sink-1", true).await;
+        let state = state_with_sinks(&[("sink", &endpoint)]).await;
+        let t = Utc::now();
+        three_transitions(&state, t).await;
+        // Up at t + 180s, and quiet from there.
+        let up = t + chrono::Duration::seconds(180);
+        camera_reports(&state, HealthStatus::Healthy, up).await;
+        camera_reports(
+            &state,
+            HealthStatus::Healthy,
+            up + chrono::Duration::seconds(599),
+        )
+        .await;
+        let events = state.store.recent_events(10).await.unwrap();
+        assert!(settled_events(&events).is_empty(), "599s is not settled");
+
+        camera_reports(
+            &state,
+            HealthStatus::Healthy,
+            up + chrono::Duration::seconds(600),
+        )
+        .await;
+        let events = state.store.recent_events(10).await.unwrap();
+        let settled = settled_events(&events);
+        assert_eq!(settled.len(), 1, "{events:?}");
+        let settled = settled[0];
+        assert_eq!(settled.event.severity, vms_plugin_sdk::EventSeverity::Info);
+        assert_eq!(
+            settled.event.title,
+            "Entrance settled and is answering at Site"
+        );
+        assert_eq!(settled.event.metadata["state"], "up");
+        assert_eq!(settled.event.metadata["changes"], 4);
+        assert_eq!(
+            settled.event.detail.as_deref(),
+            Some(format!("4 changes; quiet since {} UTC", up.format("%H:%M")).as_str())
+        );
+        assert_eq!(settled.deliveries.len(), 1, "the settled message goes out");
+        let flap = state.store.camera_flap("cam-1").await.unwrap().unwrap();
+        assert!(flap.settled_at.is_some());
+
+        // The next transition goes out as itself again.
+        camera_reports(
+            &state,
+            HealthStatus::Offline,
+            up + chrono::Duration::seconds(660),
+        )
+        .await;
+        let events = state.store.recent_events(10).await.unwrap();
+        let newest = &events[0];
+        assert_eq!(
+            newest.event.kind,
+            vms_plugin_sdk::FleetEventKind::CameraOffline
+        );
+        assert!(newest.event.metadata.get("held").is_none(), "{newest:?}");
+        assert_eq!(newest.deliveries.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_camera_that_stays_down_is_reported_settled_and_still_down_as_critical() {
+        let (endpoint, _seen) = fake_sink("sink-1", true).await;
+        let state = state_with_sinks(&[("sink", &endpoint)]).await;
+        let t = Utc::now();
+        three_transitions(&state, t).await;
+        // The third transition, at t + 120s, put it down; it stays down.
+        let down_since = t + chrono::Duration::seconds(120);
+        camera_reports(
+            &state,
+            HealthStatus::Offline,
+            down_since + chrono::Duration::seconds(600),
+        )
+        .await;
+        let events = state.store.recent_events(10).await.unwrap();
+        let settled = settled_events(&events);
+        assert_eq!(settled.len(), 1, "{events:?}");
+        let settled = settled[0];
+        assert_eq!(
+            settled.event.severity,
+            vms_plugin_sdk::EventSeverity::Critical
+        );
+        assert_eq!(
+            settled.event.title,
+            "Entrance settled and is still down at Site"
+        );
+        assert_eq!(settled.event.metadata["state"], "down");
+        assert_eq!(
+            settled.event.detail.as_deref(),
+            Some(format!("3 changes; down since {} UTC", down_since.format("%H:%M")).as_str())
+        );
+        assert_eq!(settled.deliveries.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn turning_the_rule_off_drops_open_flaps_so_turning_it_back_on_holds_nothing_quietly() {
+        // Found in review: with the rule off, verdict and the sweep both
+        // returned early, so a flap open at the time stayed open for good,
+        // and the first transition after the rule came back was held with
+        // no camera_flapping behind it — an alert that silently went nowhere.
+        let (endpoint, _seen) = fake_sink("sink-1", true).await;
+        let mut state = state_with_sinks(&[("sink", &endpoint)]).await;
+        let t = Utc::now();
+        three_transitions(&state, t).await;
+        assert!(state.store.camera_flap("cam-1").await.unwrap().is_some());
+
+        state.flap.transitions = 0;
+        camera_reports(
+            &state,
+            HealthStatus::Offline,
+            t + chrono::Duration::seconds(180),
+        )
+        .await;
+        assert_eq!(state.store.camera_flap("cam-1").await.unwrap(), None);
+        let events = state.store.recent_events(10).await.unwrap();
+        assert!(settled_events(&events).is_empty(), "{events:?}");
+
+        // Back on: the window still holds four changes, so the camera is
+        // flapping again — and that is said out loud, with a fresh row,
+        // rather than inherited from the stale one in silence.
+        state.flap.transitions = 3;
+        camera_reports(
+            &state,
+            HealthStatus::Healthy,
+            t + chrono::Duration::seconds(240),
+        )
+        .await;
+        let events = state.store.recent_events(10).await.unwrap();
+        let flapping: Vec<_> = events
+            .iter()
+            .filter(|view| view.event.kind == vms_plugin_sdk::FleetEventKind::CameraFlapping)
+            .collect();
+        assert_eq!(flapping.len(), 2, "{events:?}");
+        assert_eq!(flapping[0].deliveries.len(), 1, "the second flap goes out");
+        assert_eq!(flapping[0].event.metadata["changes"], 4);
+        let flap = state.store.camera_flap("cam-1").await.unwrap().unwrap();
+        assert_eq!((flap.changes, flap.settled_at), (4, None));
+        assert_eq!(
+            flap.started_at.timestamp(),
+            (t + chrono::Duration::seconds(240)).timestamp()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_flapping_camera_whose_gateway_is_revoked_drops_the_flap_without_a_word() {
+        let (endpoint, _seen) = fake_sink("sink-1", true).await;
+        let state = state_with_sinks(&[("sink", &endpoint)]).await;
+        let t = Utc::now();
+        three_transitions(&state, t).await;
+        assert!(state.store.camera_flap("cam-1").await.unwrap().is_some());
+        state.store.revoke_gateway("gw-1", t).await.unwrap();
+        incident_pass(&state, t + chrono::Duration::seconds(700)).await;
+        let events = state.store.recent_events(10).await.unwrap();
+        assert!(settled_events(&events).is_empty(), "{events:?}");
+        assert_eq!(state.store.camera_flap("cam-1").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn after_a_settle_shorter_than_the_window_the_next_transition_goes_out_as_itself() {
+        let (endpoint, _seen) = fake_sink("sink-1", true).await;
+        let mut state = state_with_sinks(&[("sink", &endpoint)]).await;
+        state.flap.settle = chrono::Duration::seconds(120);
+        let t = Utc::now();
+        three_transitions(&state, t).await;
+        let down_since = t + chrono::Duration::seconds(120);
+        camera_reports(
+            &state,
+            HealthStatus::Offline,
+            down_since + chrono::Duration::seconds(120),
+        )
+        .await;
+        let events = state.store.recent_events(10).await.unwrap();
+        assert_eq!(settled_events(&events).len(), 1, "{events:?}");
+
+        camera_reports(
+            &state,
+            HealthStatus::Healthy,
+            down_since + chrono::Duration::seconds(180),
+        )
+        .await;
+        let events = state.store.recent_events(10).await.unwrap();
+        let newest = &events[0];
+        assert_eq!(
+            newest.event.kind,
+            vms_plugin_sdk::FleetEventKind::CameraRecovered
+        );
+        assert!(newest.event.metadata.get("held").is_none(), "{newest:?}");
+        assert_eq!(newest.deliveries.len(), 1);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|view| view.event.kind == vms_plugin_sdk::FleetEventKind::CameraFlapping)
+                .count(),
+            1,
+            "the old transitions do not re-open the flap"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_camera_that_flaps_again_after_settling_gets_a_second_flapping_event() {
+        let (endpoint, _seen) = fake_sink("sink-1", true).await;
+        let state = state_with_sinks(&[("sink", &endpoint)]).await;
+        let t = Utc::now();
+        three_transitions(&state, t).await;
+        let down_since = t + chrono::Duration::seconds(120);
+        camera_reports(
+            &state,
+            HealthStatus::Offline,
+            down_since + chrono::Duration::seconds(600),
+        )
+        .await;
+        let settled_at = state
+            .store
+            .camera_flap("cam-1")
+            .await
+            .unwrap()
+            .unwrap()
+            .settled_at
+            .expect("settled");
+
+        // Three more inside a fresh window: it settled down, so up is the
+        // first of them.
+        let again = settled_at + chrono::Duration::seconds(60);
+        camera_reports(&state, HealthStatus::Healthy, again).await;
+        camera_reports(
+            &state,
+            HealthStatus::Offline,
+            again + chrono::Duration::seconds(60),
+        )
+        .await;
+        camera_reports(
+            &state,
+            HealthStatus::Healthy,
+            again + chrono::Duration::seconds(120),
+        )
+        .await;
+        let events = state.store.recent_events(20).await.unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|view| view.event.kind == vms_plugin_sdk::FleetEventKind::CameraFlapping)
+                .count(),
+            2,
+            "{events:?}"
+        );
+        let flap = state.store.camera_flap("cam-1").await.unwrap().unwrap();
+        assert_eq!((flap.changes, flap.settled_at), (3, None));
+        assert_eq!(
+            flap.started_at.timestamp(),
+            (again + chrono::Duration::seconds(120)).timestamp()
+        );
     }
 
     #[tokio::test]
@@ -7081,7 +7661,7 @@ mod tests {
             .await
             .unwrap();
 
-        incident_pass(&state).await;
+        incident_pass(&state, Utc::now()).await;
 
         assert!(
             state.store.incidents(10).await.unwrap().is_empty(),
@@ -7291,7 +7871,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        incident_pass(&state).await;
+        incident_pass(&state, Utc::now()).await;
         assert_eq!(
             state
                 .store
@@ -7316,7 +7896,7 @@ mod tests {
             "another gateway's outage is still an outage"
         );
 
-        incident_pass(&state).await;
+        incident_pass(&state, Utc::now()).await;
         let incidents = state.store.incidents(10).await.unwrap();
         let cam1 = incident_for(&incidents, "cam-1");
         assert_eq!(
@@ -7344,7 +7924,7 @@ mod tests {
             .await
             .unwrap();
 
-        incident_pass(&state).await;
+        incident_pass(&state, Utc::now()).await;
         delivery_pass(&state, Utc::now()).await;
         let sent = seen.read().await.clone();
         assert_eq!(sent.len(), 1, "one outage, one alert: {sent:?}");
@@ -7359,7 +7939,7 @@ mod tests {
         );
 
         // Still down on the next pass: the same outage, not a new one.
-        incident_pass(&state).await;
+        incident_pass(&state, Utc::now()).await;
         delivery_pass(&state, Utc::now()).await;
         assert_eq!(
             seen.read().await.len(),
@@ -7380,7 +7960,7 @@ mod tests {
             .write()
             .await
             .insert("gw-1".into(), batch);
-        incident_pass(&state).await;
+        incident_pass(&state, Utc::now()).await;
         delivery_pass(&state, Utc::now()).await;
         let sent = seen.read().await.clone();
         assert_eq!(sent.len(), 2, "coming back is news too: {sent:?}");
@@ -7526,7 +8106,7 @@ mod tests {
             )
             .await
             .unwrap();
-        incident_pass(&state).await;
+        incident_pass(&state, Utc::now()).await;
         state
             .store
             .revoke_gateway("gw-1", Utc::now())
@@ -7538,7 +8118,7 @@ mod tests {
                 .is_none()
         );
 
-        incident_pass(&state).await;
+        incident_pass(&state, Utc::now()).await;
 
         let incidents = state.store.incidents(10).await.unwrap();
         assert_eq!(incidents.len(), 1);
@@ -7564,14 +8144,14 @@ mod tests {
             .await
             .unwrap();
         revoke_through_the_dashboard(&state, &cookie, "gw-1").await;
-        incident_pass(&state).await;
+        incident_pass(&state, Utc::now()).await;
         assert!(
             state.store.incidents(10).await.unwrap().is_empty(),
             "a revoked gateway's camera opened an incident"
         );
 
         let _ = enrolled_gateway_token(&state, &cookie).await;
-        incident_pass(&state).await;
+        incident_pass(&state, Utc::now()).await;
 
         let incidents = state.store.incidents(10).await.unwrap();
         assert_eq!(

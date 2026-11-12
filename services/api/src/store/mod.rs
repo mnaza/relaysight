@@ -113,6 +113,20 @@ pub struct DeliveryView {
     pub next_attempt_at: Option<DateTime<Utc>>,
 }
 
+/// A camera that keeps going up and down. One row per camera that has ever
+/// flapped: open (`settled_at` None) while it flaps, kept afterwards so the
+/// next window knows where to start counting.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CameraFlap {
+    pub camera_id: String,
+    /// The transition that crossed the threshold.
+    pub started_at: DateTime<Utc>,
+    /// Transitions since the window opened, the held ones included.
+    pub changes: i64,
+    pub last_transition_at: DateTime<Utc>,
+    pub settled_at: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, Clone)]
 pub struct CameraRecord {
     pub id: String,
@@ -332,6 +346,45 @@ pub trait Store: Send + Sync {
     /// are never pruned.
     async fn delete_closed_incidents_before(&self, cutoff: DateTime<Utc>)
     -> Result<(), StoreError>;
+
+    /// This camera's flap row, open or settled; None if it has never flapped.
+    async fn camera_flap(&self, camera_id: &str) -> Result<Option<CameraFlap>, StoreError>;
+
+    /// The cameras flapping now (`settled_at` NULL), by camera id.
+    async fn open_camera_flaps(&self) -> Result<Vec<CameraFlap>, StoreError>;
+
+    /// A camera starts flapping: its row is written or rewritten with
+    /// `started_at = last_transition_at = now`, these `changes`, and no
+    /// `settled_at`.
+    async fn start_camera_flap(
+        &self,
+        camera_id: &str,
+        now: DateTime<Utc>,
+        changes: i64,
+    ) -> Result<(), StoreError>;
+
+    /// One more transition while flapping: `changes + 1`,
+    /// `last_transition_at = now`. A settled row is history and is left alone.
+    async fn bump_camera_flap(&self, camera_id: &str, now: DateTime<Utc>)
+    -> Result<(), StoreError>;
+
+    /// The flap is over: `settled_at = now`. The row stays.
+    async fn settle_camera_flap(
+        &self,
+        camera_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), StoreError>;
+
+    /// The camera is gone; so is its flap, without a word.
+    async fn delete_camera_flap(&self, camera_id: &str) -> Result<(), StoreError>;
+
+    /// How many times this camera changed state since `since`, edge
+    /// included: incidents that started then plus incidents that ended then.
+    async fn transitions_since(
+        &self,
+        camera_id: &str,
+        since: DateTime<Utc>,
+    ) -> Result<i64, StoreError>;
 
     /// Set the tombstone and clear the token: every bearer credential for
     /// this id is refused from now on, the bootstrap secret included.

@@ -24,6 +24,8 @@ was written, with nothing behind it. This is what it means.
 | --- | --- |
 | `camera_offline` / `camera_recovered` | a camera's incident opening or closing — one event per transition, not one per telemetry batch |
 | `gateway_offline` / `gateway_recovered` | a gateway stopping or resuming reporting |
+| `camera_flapping` | a camera's third change of state in ten minutes — from here its single changes are held (below) |
+| `camera_settled` | the flapping camera has held one state for ten minutes; critical if that state is down |
 | `test` | somebody pressed *Send a test alert* |
 
 A gateway going quiet is the one outage a site cannot report itself — it takes
@@ -90,6 +92,39 @@ happened". So an event is written down first and delivered afterwards.
 
 Events age out with incidents (`INCIDENT_RETENTION_DAYS`).
 
+## A camera that flaps
+
+A camera that goes down and comes back every minute raises an event every
+minute, and thirty "stopped answering" and "is answering again" messages in
+an evening teach the person in the channel to mute the channel — and then
+the real outage goes unread. So a camera that changes state three times in
+ten minutes is *flapping*, and from the third change on:
+
+- one `camera_flapping` message goes out (warning), saying so;
+- every further change is still recorded and still shown in the *Alerts*
+  panel, where its *Delivery* column says it was held because the camera is
+  flapping — but no sink hears it;
+- when the camera has held one state for ten minutes, one `camera_settled`
+  message goes out saying which state. "Settled and is answering" is
+  information. "Settled and is still down" is critical, because it *is* the
+  outage alert for that camera: settled must not read as good news when the
+  camera is off the air.
+
+The dashboard keeps showing everything; only the way out collapses.
+Changes the channel has already heard about do not count toward the next
+flap, so the camera that flaps again after settling gets a second
+"is flapping" only on three new changes.
+
+```bash
+FLAP_TRANSITIONS=3        # changes inside the window that make a flap; 0 turns this off
+FLAP_WINDOW_SECONDS=600   # the window
+FLAP_SETTLE_SECONDS=600   # one state held this long ends the flap
+```
+
+Gateways are not covered: a gateway that flaps takes every camera behind it
+with it, and those cameras then flap by this rule, while the gateway's own
+`gateway_offline` / `gateway_recovered` go out one per change as before.
+
 ## What has never run
 
 - **The chain has run for real between processes**, with `make check-alert`:
@@ -122,9 +157,10 @@ Events age out with incidents (`INCIDENT_RETENTION_DAYS`).
   same contract — which is not the same as having met Discord. Telegram
   needs a bridge (above).
 - **No pager, no SMS, no email.** A sink could do any of them; none exists.
-- **Nothing deduplicates a camera that flaps.** A camera going up and down
-  every minute raises an event every minute, and a sink that cannot cope with
-  that will not enjoy it. That belongs in a rule engine, and there isn't one.
+- **A flapping camera is collapsed, since 2026-11-11** (above): one message
+  out when it is noticed, one when it settles. Tested in-process, with a
+  sink in the test process and the clock walked through the settle window;
+  no site has run it, and no real camera has flapped through it.
 - **There are no alert rules and no quiet hours**, deliberately: the control
   plane sends everything and the sink decides. That is honest and simple, and
   it will not stay sufficient forever.

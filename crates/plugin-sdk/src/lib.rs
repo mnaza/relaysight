@@ -217,8 +217,20 @@ pub enum FleetEventKind {
     CameraRecovered,
     GatewayOffline,
     GatewayRecovered,
+    /// A camera that keeps going up and down. From here until it settles,
+    /// its single transitions are recorded but not delivered.
+    CameraFlapping,
+    /// The flapping camera has held one state for the settle window;
+    /// `severity` says which: info if it is answering, critical if it is
+    /// still down, because then this *is* the outage alert.
+    CameraSettled,
     /// Sent by hand from the dashboard, to prove a sink is wired up.
     Test,
+    /// A kind this build does not know. More kinds are added without a
+    /// protocol bump, so a sink has to survive one: post the title, or
+    /// answer `delivered: false`.
+    #[serde(other)]
+    Other,
 }
 
 impl FleetEventKind {
@@ -228,7 +240,10 @@ impl FleetEventKind {
             FleetEventKind::CameraRecovered => "camera_recovered",
             FleetEventKind::GatewayOffline => "gateway_offline",
             FleetEventKind::GatewayRecovered => "gateway_recovered",
+            FleetEventKind::CameraFlapping => "camera_flapping",
+            FleetEventKind::CameraSettled => "camera_settled",
             FleetEventKind::Test => "test",
+            FleetEventKind::Other => "other",
         }
     }
 }
@@ -289,4 +304,35 @@ pub struct EventDeliveryResponse {
     pub delivered: bool,
     #[serde(default)]
     pub detail: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_unknown_kind_on_the_wire_parses_as_other() {
+        // docs/PLUGIN-SDK.md promises that a sink ignores kinds it does not
+        // know. A typed sink can only keep that promise if parsing survives.
+        let kind: FleetEventKind = serde_json::from_str("\"camera_on_fire\"").unwrap();
+        assert_eq!(kind, FleetEventKind::Other);
+        assert_eq!(kind.as_str(), "other");
+    }
+
+    #[test]
+    fn the_known_kinds_round_trip_unchanged() {
+        for kind in [
+            FleetEventKind::CameraOffline,
+            FleetEventKind::CameraRecovered,
+            FleetEventKind::GatewayOffline,
+            FleetEventKind::GatewayRecovered,
+            FleetEventKind::CameraFlapping,
+            FleetEventKind::CameraSettled,
+            FleetEventKind::Test,
+        ] {
+            let wire = serde_json::to_string(&kind).unwrap();
+            assert_eq!(wire, format!("\"{}\"", kind.as_str()));
+            assert_eq!(serde_json::from_str::<FleetEventKind>(&wire).unwrap(), kind);
+        }
+    }
 }

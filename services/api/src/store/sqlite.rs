@@ -3,7 +3,7 @@
 use sha2::{Digest, Sha256};
 
 use crate::store::{
-    AuditIntegrity, CameraRecord, DeliveryView, DueDelivery, EventView, HealthHour,
+    AuditIntegrity, CameraFlap, CameraRecord, DeliveryView, DueDelivery, EventView, HealthHour,
     OrganizationRecord, SessionUser, SiteRecord, Store, StoreError, StoredRegistration, StoredUser,
     parse_ts, token_hash, ts,
 };
@@ -727,6 +727,101 @@ impl Store for SqliteStore {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    async fn camera_flap(&self, camera_id: &str) -> Result<Option<CameraFlap>, StoreError> {
+        let row = sqlx::query("SELECT * FROM camera_flaps WHERE camera_id = ?1")
+            .bind(camera_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.as_ref().map(flap_from_row).transpose()
+    }
+
+    async fn open_camera_flaps(&self) -> Result<Vec<CameraFlap>, StoreError> {
+        let rows =
+            sqlx::query("SELECT * FROM camera_flaps WHERE settled_at IS NULL ORDER BY camera_id")
+                .fetch_all(&self.pool)
+                .await?;
+        rows.iter().map(flap_from_row).collect()
+    }
+
+    async fn start_camera_flap(
+        &self,
+        camera_id: &str,
+        now: DateTime<Utc>,
+        changes: i64,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO camera_flaps
+                 (camera_id, started_at, changes, last_transition_at, settled_at)
+             VALUES (?1, ?2, ?3, ?2, NULL)
+             ON CONFLICT(camera_id) DO UPDATE SET
+                 started_at = excluded.started_at,
+                 changes = excluded.changes,
+                 last_transition_at = excluded.last_transition_at,
+                 settled_at = NULL",
+        )
+        .bind(camera_id)
+        .bind(ts(&now))
+        .bind(changes)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn bump_camera_flap(
+        &self,
+        camera_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE camera_flaps SET changes = changes + 1, last_transition_at = ?2
+             WHERE camera_id = ?1 AND settled_at IS NULL",
+        )
+        .bind(camera_id)
+        .bind(ts(&now))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn settle_camera_flap(
+        &self,
+        camera_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        sqlx::query("UPDATE camera_flaps SET settled_at = ?2 WHERE camera_id = ?1")
+            .bind(camera_id)
+            .bind(ts(&now))
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn delete_camera_flap(&self, camera_id: &str) -> Result<(), StoreError> {
+        sqlx::query("DELETE FROM camera_flaps WHERE camera_id = ?1")
+            .bind(camera_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn transitions_since(
+        &self,
+        camera_id: &str,
+        since: DateTime<Utc>,
+    ) -> Result<i64, StoreError> {
+        // Timestamps are fixed-width RFC 3339, so string order is time order.
+        let count: i64 = sqlx::query_scalar(
+            "SELECT (SELECT COUNT(*) FROM incidents WHERE camera_id = ?1 AND started_at >= ?2)
+                  + (SELECT COUNT(*) FROM incidents
+                     WHERE camera_id = ?1 AND ended_at IS NOT NULL AND ended_at >= ?2)",
+        )
+        .bind(camera_id)
+        .bind(ts(&since))
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count)
     }
 
     async fn revoke_gateway(&self, gateway_id: &str, now: DateTime<Utc>) -> Result<(), StoreError> {
@@ -1463,6 +1558,20 @@ fn health_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<HealthHour, StoreErr
     })
 }
 
+fn flap_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<CameraFlap, StoreError> {
+    Ok(CameraFlap {
+        camera_id: row.try_get("camera_id")?,
+        started_at: parse_ts(row.try_get("started_at")?)?,
+        changes: row.try_get("changes")?,
+        last_transition_at: parse_ts(row.try_get("last_transition_at")?)?,
+        settled_at: row
+            .try_get::<Option<String>, _>("settled_at")?
+            .as_deref()
+            .map(parse_ts)
+            .transpose()?,
+    })
+}
+
 fn event_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<FleetEvent, StoreError> {
     let kind: String = row.try_get("kind")?;
     let kind = match kind.as_str() {
@@ -1470,6 +1579,8 @@ fn event_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<FleetEvent, StoreErro
         "camera_recovered" => FleetEventKind::CameraRecovered,
         "gateway_offline" => FleetEventKind::GatewayOffline,
         "gateway_recovered" => FleetEventKind::GatewayRecovered,
+        "camera_flapping" => FleetEventKind::CameraFlapping,
+        "camera_settled" => FleetEventKind::CameraSettled,
         "test" => FleetEventKind::Test,
         other => {
             return Err(StoreError::Internal(anyhow::anyhow!(
@@ -2570,5 +2681,110 @@ mod tests {
 
         store.delete_all_sessions().await.unwrap();
         assert!(store.session_user("s2", now).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_camera_flap_starts_bumps_settles_and_is_rewritten_by_the_next_start() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let t0 = Utc::now();
+        assert_eq!(store.camera_flap("cam-1").await.unwrap(), None);
+        store.start_camera_flap("cam-1", t0, 3).await.unwrap();
+        store
+            .bump_camera_flap("cam-1", t0 + Duration::seconds(60))
+            .await
+            .unwrap();
+        let flap = store.camera_flap("cam-1").await.unwrap().unwrap();
+        assert_eq!((flap.changes, flap.settled_at), (4, None));
+        assert_eq!(flap.started_at.timestamp(), t0.timestamp());
+        assert_eq!(flap.last_transition_at.timestamp(), t0.timestamp() + 60);
+        assert_eq!(store.open_camera_flaps().await.unwrap().len(), 1);
+        store
+            .settle_camera_flap("cam-1", t0 + Duration::seconds(700))
+            .await
+            .unwrap();
+        assert!(store.open_camera_flaps().await.unwrap().is_empty());
+        assert!(
+            store
+                .camera_flap("cam-1")
+                .await
+                .unwrap()
+                .unwrap()
+                .settled_at
+                .is_some()
+        );
+        // A settled row ignores bumps: it is history, not an open flap.
+        store
+            .bump_camera_flap("cam-1", t0 + Duration::seconds(800))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.camera_flap("cam-1").await.unwrap().unwrap().changes,
+            4
+        );
+        store
+            .start_camera_flap("cam-1", t0 + Duration::seconds(900), 3)
+            .await
+            .unwrap();
+        let again = store.camera_flap("cam-1").await.unwrap().unwrap();
+        assert_eq!((again.changes, again.settled_at), (3, None));
+        assert_eq!(again.started_at.timestamp(), t0.timestamp() + 900);
+        store.delete_camera_flap("cam-1").await.unwrap();
+        assert_eq!(store.camera_flap("cam-1").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn transitions_since_counts_starts_and_ends_inside_the_window_edge_included() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        let now = Utc::now();
+        let m = |minutes: i64| now - Duration::minutes(minutes);
+        // Down at -30, up at -25: both outside a 10-minute window.
+        store.open_incident("cam-1", m(30), None).await.unwrap();
+        store.close_incident("cam-1", m(25)).await.unwrap();
+        // Down exactly at the edge, up at -5, down again at -1 (still open).
+        store.open_incident("cam-1", m(10), None).await.unwrap();
+        store.close_incident("cam-1", m(5)).await.unwrap();
+        store.open_incident("cam-1", m(1), None).await.unwrap();
+        // Another camera's transitions do not count.
+        store.open_incident("cam-2", m(2), None).await.unwrap();
+        assert_eq!(store.transitions_since("cam-1", m(10)).await.unwrap(), 3);
+        assert_eq!(store.transitions_since("cam-1", m(3)).await.unwrap(), 1);
+        assert_eq!(store.transitions_since("cam-1", m(60)).await.unwrap(), 5);
+    }
+
+    #[tokio::test]
+    async fn the_new_event_kinds_read_back_through_recent_events() {
+        // The Alerts panel reads every stored event back; a kind the row
+        // mapper does not know fails the whole request.
+        let store = SqliteStore::in_memory().await.unwrap();
+        for (id, kind) in [
+            ("e-1", FleetEventKind::CameraFlapping),
+            ("e-2", FleetEventKind::CameraSettled),
+        ] {
+            let event = FleetEvent {
+                id: id.into(),
+                kind,
+                severity: EventSeverity::Warning,
+                occurred_at: Utc::now(),
+                customer_id: "cust-1".into(),
+                site_id: "site-1".into(),
+                site_name: "Bakery".into(),
+                gateway_id: Some("gw-1".into()),
+                camera_id: Some("cam-1".into()),
+                title: "Yard camera is flapping at Bakery".into(),
+                detail: None,
+                metadata: serde_json::json!({}),
+            };
+            store.record_event(&event, &[], Utc::now()).await.unwrap();
+        }
+        let kinds: Vec<_> = store
+            .recent_events(10)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|view| view.event.kind)
+            .collect();
+        assert_eq!(kinds.len(), 2);
+        assert!(kinds.contains(&FleetEventKind::CameraFlapping));
+        assert!(kinds.contains(&FleetEventKind::CameraSettled));
     }
 }

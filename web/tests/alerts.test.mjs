@@ -33,6 +33,27 @@ const events = [
         last_error: 'connection refused', next_attempt_at: null },
     ],
   },
+  // A transition recorded while the camera was flapping: shown, not sent.
+  {
+    id: 'evt-held', kind: 'camera_offline', severity: 'critical',
+    occurred_at: new Date().toISOString(), customer_id: 'cust-1', site_id: 'site-1',
+    site_name: 'Bakery', gateway_id: 'gw-1', camera_id: 'cam-1',
+    title: 'Yard camera stopped answering at Bakery', detail: 'RTSP probe failed',
+    metadata: { gateway_id: 'gw-1', held: 'flapping' },
+    deliveries: [],
+  },
+  {
+    id: 'evt-settled', kind: 'camera_settled', severity: 'critical',
+    occurred_at: new Date().toISOString(), customer_id: 'cust-1', site_id: 'site-1',
+    site_name: 'Bakery', gateway_id: 'gw-1', camera_id: 'cam-1',
+    title: 'Yard camera settled and is still down at Bakery',
+    detail: '7 changes over 38 minutes; down since 21:52 UTC',
+    metadata: { gateway_id: 'gw-1', changes: 7, state: 'down' },
+    deliveries: [
+      { plugin_id: 'webhook', attempts: 1, delivered_at: new Date().toISOString(),
+        declined: false, last_error: null, next_attempt_at: null },
+    ],
+  },
 ];
 
 let startDashboard, posted;
@@ -92,6 +113,19 @@ test('an alert nobody could deliver says so, with the reason', async () => {
   assert.match(failed.textContent, /connection refused/);
   const delivered = rows.find(row => row.textContent.includes('Yard camera'));
   assert.doesNotMatch(delivered.textContent, /connection refused/);
+});
+
+test('a transition held while the camera flaps says so, not "no sink registered"', async () => {
+  // The dashboard keeps showing every transition; only the way out collapses.
+  // A held row must not read as the silence that means nobody was listening.
+  await startDashboard({ brand, locale: 'en', dict });
+  const rows = [...document.querySelectorAll('#alerts-body tr')];
+  const held = rows.find(row => row.textContent.includes('stopped answering') && row.textContent.includes('held'));
+  assert.ok(held, 'the held transition is shown');
+  assert.match(held.textContent, /held: the camera is flapping/);
+  assert.doesNotMatch(held.textContent, /no event_sink plugin registered/);
+  const settled = rows.find(row => row.textContent.includes('settled and is still down'));
+  assert.ok(settled.querySelector('.alert-critical'), 'a camera that settled down is shown as critical');
 });
 
 test('the test button asks the control plane to send one', async () => {

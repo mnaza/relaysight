@@ -176,6 +176,10 @@ export async function startDashboard({ brand, locale, dict }) {
   // deliver is the case an operator has to see: silence that means nobody was
   // listening rather than nothing happened.
   function deliveryText(event) {
+    // A transition recorded while its camera was flapping was never queued:
+    // the flapping message went out in its place. Not the same silence as
+    // "no sink registered".
+    if (event.metadata?.held === 'flapping') return t(dict, 'app.alerts.held');
     if (!event.deliveries?.length) return t(dict, 'app.alerts.nosinks');
     return event.deliveries.map(delivery => {
       if (delivery.delivered_at && !delivery.declined) return `${delivery.plugin_id}: ${t(dict, 'app.alerts.delivered')}`;
