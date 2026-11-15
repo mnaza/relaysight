@@ -1,4 +1,4 @@
-.PHONY: web community plugins edge demo demo-community demo-commercial demo-fleet gateway-image check-web check-relay check-gateway-relay check-editions check-installer check-ingest check-plugin check-plugin-mtls check-sso check-sso-keycloak check-ring-full check-dst check-restore check-alert check-alert-chat check-live
+.PHONY: web community plugins edge demo demo-community demo-commercial demo-fleet gateway-image check-web check-relay check-gateway-relay check-editions check-installer check-ingest check-plugin check-plugin-mtls check-sso check-sso-keycloak check-ring-full check-dst check-restore check-alert check-alert-chat check-live check-vps
 
 # Which plan the stand-in entitlement service hands out: hosted-free or pro.
 PLAN ?= hosted-free
@@ -104,3 +104,9 @@ check-plugin-mtls:
 check-plugin:
 	@test -n "$(ENDPOINT)" || (echo "set ENDPOINT, e.g. make check-plugin ENDPOINT=http://localhost:9002" && false)
 	cargo run -q -p vms-plugin-runtime --example conformance -- "$(ENDPOINT)"
+
+# The bundle a rented server runs, brought up here from nothing: Caddy over
+# TLS, the API on loopback, a gateway and test-pattern cameras, live frames in
+# a real Firefox. docs/DEPLOY-VPS.md.
+check-vps:
+	./scripts/check-vps.sh

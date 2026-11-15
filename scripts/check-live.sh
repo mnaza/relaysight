@@ -82,6 +82,34 @@ GATEWAY_TOKEN="check-live-token-$(head -c 6 /dev/urandom | base64 | tr -dc 'a-zA
 STREAM_KEY="checklive"
 API="http://127.0.0.1:$API_PORT"
 
+cookie="$work/cookie"
+login() {
+    curl -fs -c "$cookie" -H 'content-type: application/json' \
+        -d "{\"email\":\"admin@localhost\",\"password\":\"$ADMIN_PASSWORD\"}" \
+        -o /dev/null "$API/api/v1/auth/login"
+}
+
+camera_id() {
+    curl -fs -b "$cookie" "$API/api/v1/cameras" | python3 -c "
+import json, sys
+for camera in json.load(sys.stdin):
+    if camera.get('status') == 'healthy':
+        print(camera['camera_id'])
+        break
+"
+}
+
+# LIVE_API points this at a stack that is already up — make check-vps does,
+# with the bundle a VPS runs — and skips building, starting and publishing:
+# the browser half below is the same either way.
+if [ -n "${LIVE_API:-}" ]; then
+    API="$LIVE_API"
+    ADMIN_PASSWORD="${LIVE_ADMIN_PASSWORD:?LIVE_API needs LIVE_ADMIN_PASSWORD}"
+    echo "1-4/9 using the stack already up at $API"
+    wait_for login 30 || { echo "could not log in at $API" >&2; exit 1; }
+    wait_for "test -n \"\$(camera_id)\"" 90 || { echo "no healthy camera at $API" >&2; exit 1; }
+    echo "    a camera is healthy"
+else
 echo "1/9 building the control plane and the gateway"
 cargo build -q -p vms-api -p vms-gateway
 
@@ -122,12 +150,6 @@ RUST_LOG=warn \
     ./target/debug/vms-gateway >"$work/gateway.log" 2>&1 &
 gw_pid=$!
 
-cookie="$work/cookie"
-login() {
-    curl -fs -c "$cookie" -H 'content-type: application/json' \
-        -d "{\"email\":\"admin@localhost\",\"password\":\"$ADMIN_PASSWORD\"}" \
-        -o /dev/null "$API/api/v1/auth/login"
-}
 wait_for login || { echo "could not log in as the seeded owner" >&2; exit 1; }
 wait_for "curl -fs -b $cookie $API/api/v1/gateways | grep -q check-live" \
     || { echo "the gateway never reported in" >&2; tail -n 5 "$work/gateway.log" >&2; exit 1; }
@@ -154,15 +176,6 @@ setsid bash -c "while :; do cat edge/gateway/fixtures/camera.h264; done \
     >"$work/ffmpeg.log" 2>&1 &
 ff_pid=$!
 
-camera_id() {
-    curl -fs -b "$cookie" "$API/api/v1/cameras" | python3 -c "
-import json, sys
-for camera in json.load(sys.stdin):
-    if camera.get('status') == 'healthy':
-        print(camera['camera_id'])
-        break
-"
-}
 wait_for "test -n \"\$(camera_id)\"" 90 || {
     echo "the pushed stream never became a healthy camera" >&2
     curl -fs -b "$cookie" "$API/api/v1/cameras" >&2 || true
@@ -172,6 +185,7 @@ wait_for "test -n \"\$(camera_id)\"" 90 || {
     exit 1
 }
 echo "    publishing, camera is healthy"
+fi
 
 echo "5/9 serving the dashboard origin on $WEB_PORT"
 # The browser needs one origin for the page and the API: a session cookie is

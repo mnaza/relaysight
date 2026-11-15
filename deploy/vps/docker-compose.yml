@@ -1,0 +1,119 @@
+# The whole thing on one rented server: docs/DEPLOY-VPS.md.
+#
+#   cp .env.example .env    # set DOMAIN and PUBLIC_IP
+#   ./up.sh
+#
+# Only Caddy faces the internet. The API, the RTMP ingest and the gateway's
+# own ports stay on loopback; what crosses the provider's firewall is 80 and
+# 443 for the dashboard, and UDP for live video to and from the gateway.
+
+name: relaysight
+
+services:
+  caddy:
+    # TLS for DOMAIN from Let's Encrypt, renewed by Caddy itself. With DOMAIN
+    # set to localhost it issues from its own internal CA instead, which is
+    # how make check-vps runs this file on a laptop.
+    image: caddy:2.11.7
+    restart: unless-stopped
+    environment:
+      DOMAIN: ${DOMAIN:?set DOMAIN in .env to the name that points at this server}
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+      - "${HTTPS_PORT:-443}:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ../../web:/srv/web:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - api
+
+  api:
+    image: relaysight/api:local
+    build:
+      context: ../..
+      dockerfile: services/api/Dockerfile
+    restart: unless-stopped
+    environment:
+      API_BIND: 0.0.0.0:8080
+      DATABASE_URL: sqlite:/data/vms.db
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@localhost}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?run up.sh, which generates one into .env}
+      GATEWAY_TOKEN: ${GATEWAY_TOKEN:?run up.sh, which generates one into .env}
+      # Everything reaches the API through Caddy over TLS, so the session
+      # cookie is never sent in the clear.
+      AUTH_COOKIE_SECURE: "true"
+      STALE_CAMERA_SECONDS: 75
+      PLUGIN_DIR: /config/plugins.d
+      # `-` and not `:-`: an empty RTC_STUN_URLS means "no STUN" and has to
+      # reach the API as empty rather than be replaced by the default.
+      RTC_STUN_URLS: ${RTC_STUN_URLS-stun:stun.l.google.com:19302}
+      RTC_TURN_URLS: ${RTC_TURN_URLS:-}
+      RTC_TURN_SECRET: ${RTC_TURN_SECRET:-}
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - ./plugins.d:/config/plugins.d:ro
+      - api-data:/data
+    ports:
+      # Loopback only. The gateway beside it is on the host network and
+      # reaches it here; everybody else comes through Caddy.
+      - "127.0.0.1:${API_PORT:-8080}:8080"
+
+  gateway:
+    # A site gateway running on the server itself, so the dashboard has
+    # something to show before any real site is connected. Real sites run
+    # their own gateway on their own LAN and enrol against https://DOMAIN.
+    image: relaysight/gateway:local
+    build:
+      context: ../..
+      dockerfile: edge/gateway/Dockerfile
+    restart: unless-stopped
+    # Host networking, because WebRTC hands the browser this machine's own
+    # addresses as candidates; behind Docker's NAT it would hand out a bridge
+    # address nobody outside can reach.
+    network_mode: host
+    environment:
+      API_URL: http://127.0.0.1:${API_PORT:-8080}
+      GATEWAY_ID: demo-gateway
+      GATEWAY_TOKEN: ${GATEWAY_TOKEN:?run up.sh, which generates one into .env}
+      CUSTOMER_ID: demo-customer
+      CUSTOMER_NAME: Demo customer
+      SITE_ID: demo-site
+      SITE_NAME: Demo site
+      HEARTBEAT_INTERVAL_SECONDS: 10
+      # Nothing to discover on a server: the cameras below push to it.
+      ONVIF_DISCOVERY_SECONDS: 0
+      CAMERA_PROBE_INTERVAL_SECONDS: 30
+      RTMP_LISTEN: 127.0.0.1:${RTMP_PORT:-1935}
+      # The one address to offer browsers. Unset, the gateway offers every
+      # interface, Docker's bridges included, and a browser tries them all.
+      RTC_UDP_ADDRS: ${PUBLIC_IP:-}
+      # A box anybody can reach must not open device web pages for them.
+      TUNNEL_ENABLED: "false"
+      GATEWAY_STATE_DIR: /data
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - gateway-data:/data
+    depends_on:
+      - api
+
+  demo-cameras:
+    # Test patterns with a running clock, pushed over RTMP the way an encoder
+    # pushes. DEMO_CAMERAS=0 to run without them once real sites report.
+    image: relaysight/demo-cameras:local
+    build: ./demo-cameras
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      DEMO_CAMERAS: ${DEMO_CAMERAS:-3}
+      RTMP_URL: rtmp://127.0.0.1:${RTMP_PORT:-1935}/live
+    depends_on:
+      - gateway
+
+volumes:
+  caddy-data:
+  caddy-config:
+  api-data:
+  gateway-data:

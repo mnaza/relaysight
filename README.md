@@ -50,6 +50,9 @@ printf '%s\n' 'the-camera-password' |
   vms-gateway credentials set 192.168.1.50 admin
 ```
 
+On a rented server, with a certificate and demo cameras,
+one script: `docs/DEPLOY-VPS.md`.
+
 Full local demo, API and web and plugins and MinIO and
 gateway:
 
@@ -163,7 +166,7 @@ It is not needed to run this. Nothing here links to it unless
 `docs/VIDEO-SOURCES.md`, `docs/RECORDING.md`, `docs/ALERTS.md`,
 `docs/HEALTH.md`, `docs/USERS.md`, `docs/DEVICE-MATRIX.md`,
 `docs/AUDIT.md`, `docs/TUNNEL.md`, `docs/SSO.md`,
-`docs/OPERATIONS.md`.
+`docs/OPERATIONS.md`, `docs/DEPLOY-VPS.md`.
 
 `docs/TURN-COSTS.md` is the one to read if you are pricing
 relay bandwidth. The finding is that a flat-rate box makes
@@ -171,7 +174,11 @@ it free and a per-GB cloud makes it ruinous.
 
 ## License
 
-GPL-3.0. See `LICENSE` and `NOTICE.md`.
+AGPL-3.0. See `LICENSE` and `NOTICE.md`.
+
+Running it for yourself, or for your own customers, asks
+nothing of you. Changing it and offering it to others over a
+network asks you to offer them your changed source too.
 
 The commercial control plane is a separate private
 repository. The boundary is a service boundary, so there is

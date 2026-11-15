@@ -1,0 +1,27 @@
+# One origin for the dashboard and the API: the session cookie is
+# origin-scoped, and the dashboard calls /api on the page's own host.
+{$DOMAIN} {
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options nosniff
+		Referrer-Policy same-origin
+		-Server
+	}
+
+	@api path /api/* /healthz
+	handle @api {
+		reverse_proxy api:8080
+	}
+
+	handle {
+		root * /srv/web
+		# What web/ carries for its own tests and build, not for a browser.
+		@internal path /tests/* /node_modules/* /package.json /package-lock.json /nginx.conf
+		respond @internal 404
+		file_server {
+			index app.html
+		}
+	}
+}

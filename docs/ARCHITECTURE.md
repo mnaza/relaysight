@@ -3,7 +3,7 @@
 ## Product split
 
 ```text
-Community Self-Hosted (GPL core)               Commercial / managed overlay
+Community Self-Hosted (AGPL core)              Commercial / managed overlay
 
 ┌─────────────────────────────┐                 ┌───────────────────────────┐
 │ Gateway                     │                 │ private control plane     │
