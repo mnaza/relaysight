@@ -185,8 +185,10 @@ can still be recording every camera on it.
   longer cost a session its gathering budget, but their addresses are still in
   the SDP for the browser to try, and they are still the site's internal
   network written down in it.
-- Add session authorization/RBAC before exposing beyond pilot users.
-- Add viewer/session limits and media observability before large fan-out.
+- Who may watch is settled: any login that can see the camera, a customer's
+  own included (`docs/USERS.md`).
+- Add session limits and media observability before large fan-out. Each
+  session dials the camera itself, and nothing caps how many a gateway carries.
 - H.265 requires transcoding or a browser-specific compatibility path and is deliberately out of the zero-transcode MVP.
 
 ## Is it working?

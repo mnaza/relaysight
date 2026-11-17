@@ -9,8 +9,8 @@ cameras meant giving them the whole fleet.
 | | |
 | --- | --- |
 | **owner** | everything: people, plugins, the audit log |
-| **technician** | runs the fleet — enrol gateways, add sources, set recording policies, record, watch, clip, retire cameras |
-| **viewer** | reads: the fleet, incidents, alerts, health, recordings and playback |
+| **technician** | runs the fleet — enrol gateways, add sources, set recording policies, record, clip, retire cameras |
+| **viewer** | looks: the fleet, incidents, alerts, health, live video, recordings and playback |
 
 Three, not thirty. A permission per endpoint is a matrix nobody maintains and
 everybody ends up granting in full.
@@ -32,6 +32,18 @@ access control.
 **A scoped login is a viewer.** A scoped technician is refused at creation:
 scoping covers reading, and an account that could act would be able to touch
 the very fleet the scope exists to keep it away from.
+
+**A viewer watches live.** Until 2026-11-17 live video was the technician's,
+which meant a customer's own login could see that a camera was up and could
+not see what it was pointing at. Live is looking, so it moved to the viewer;
+a scoped login can open its own customer's cameras and gets 404 for anybody
+else's. The answer to a live request is scoped the same way, because it
+carries the site's candidate addresses.
+
+Every session is the gateway dialling the camera again. Nothing yet caps how
+many a gateway will carry at once, so a recorder with no headroom is as
+exposed to a room full of viewers as it is to a technician opening the wall
+with the cap taken off (`docs/LIVE.md`).
 
 ## Upgrading from the single password
 

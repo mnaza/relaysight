@@ -83,11 +83,12 @@ demo sources stay on the roster until they are removed from the dashboard.
 ## Letting somebody look
 
 Add a **viewer** in *People*: a viewer sees the fleet, incidents, alerts,
-health and recordings, and cannot change anything. A viewer cannot open live
-video either — that is the technician's role (`docs/USERS.md`) — so a public
-read-only login shows the fleet but not the pictures. A technician login
-should not be handed to strangers: it can add sources, and a source is an
-address this server's gateway will dial.
+health, live video and recordings, and cannot change anything, so it is the
+login to hand out for a demo. Each viewer watching is a session the gateway
+carries and nothing caps how many (`docs/USERS.md`); on the test patterns that
+costs this server CPU and bandwidth, on a real recorder it costs the recorder.
+A technician login should not be handed to strangers: it can add sources, and
+a source is an address this server's gateway will dial.
 
 ## The password
 

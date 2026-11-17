@@ -312,6 +312,12 @@ fn build_router(state: AppState) -> Router {
         .route("/api/v1/gateways", get(gateways))
         .route("/api/v1/commands/{command_id}", get(command_view))
         .route("/api/v1/rtc/config", get(rtc_config))
+        // Watching is looking. A customer's own login is a viewer, and
+        // the handler holds it to that customer's cameras.
+        .route(
+            "/api/v1/cameras/{camera_id}/live",
+            post(create_live_session),
+        )
         .route(
             "/api/v1/cameras/{camera_id}/recordings",
             get(camera_timeline),
@@ -349,10 +355,6 @@ fn build_router(state: AppState) -> Router {
         .route(
             "/api/v1/gateways/{gateway_id}/cameras/retire",
             post(retire_gateway_cameras),
-        )
-        .route(
-            "/api/v1/cameras/{camera_id}/live",
-            post(create_live_session),
         )
         .route(
             "/api/v1/cameras/{camera_id}/analyze",
@@ -1514,8 +1516,10 @@ async fn enqueue_gateway_command(state: &AppState, command: GatewayCommand) -> C
 async fn create_live_session(
     State(state): State<AppState>,
     Path(camera_id): Path<String>,
+    Extension(who): Extension<crate::store::SessionUser>,
     Json(request): Json<LiveSessionRequest>,
 ) -> Result<(StatusCode, Json<CommandAccepted>), StatusCode> {
+    refuse_unless_visible(&state, &who, &camera_id).await?;
     let gateway_id = gateway_for_camera(&state, &camera_id).await?;
     let now = Utc::now();
     let session_seconds = request.session_seconds.clamp(30, 3600);
@@ -2390,15 +2394,25 @@ async fn gateway_complete_command(
 async fn command_view(
     State(state): State<AppState>,
     Path(command_id): Path<String>,
+    Extension(who): Extension<crate::store::SessionUser>,
 ) -> Result<Json<GatewayCommandView>, StatusCode> {
-    state
+    let view = state
         .commands
         .read()
         .await
         .get(&command_id)
         .cloned()
-        .map(Json)
-        .ok_or(StatusCode::NOT_FOUND)
+        .ok_or(StatusCode::NOT_FOUND)?;
+    // A live answer carries the site's candidate addresses, so a command is
+    // only as visible as the camera it is about.
+    let camera_id = match &view.command.kind {
+        GatewayCommandKind::Record { camera_id, .. }
+        | GatewayCommandKind::Live { camera_id, .. }
+        | GatewayCommandKind::Analyze { camera_id, .. }
+        | GatewayCommandKind::SaveClip { camera_id, .. } => camera_id,
+    };
+    refuse_unless_visible(&state, &who, camera_id).await?;
+    Ok(Json(view))
 }
 
 async fn camera_timeline(
@@ -4012,6 +4026,128 @@ mod tests {
                 "{uri} told them the camera exists"
             );
         }
+    }
+
+    /// Live view is looking, so a viewer may do it — a customer's own login
+    /// is always a viewer, and a customer who cannot watch their own cameras
+    /// has been sold half a product. Only their own, though: another
+    /// customer's camera is a miss, and so is another customer's live
+    /// answer, which carries that site's addresses.
+    #[tokio::test]
+    async fn a_viewer_watches_live_and_only_their_own_customers_cameras() {
+        let state = test_state().await;
+        seed_admin(&state).await;
+        let owner = login_cookie(&state).await;
+        for (customer, gateway, camera, site) in [
+            ("cust-1", "gw-1", "cam-1", "site-1"),
+            ("cust-2", "gw-2", "cam-2", "site-2"),
+        ] {
+            let mut batch = typed_batch(gateway, camera, HealthStatus::Healthy, Utc::now(), None);
+            batch.customer_id = customer.into();
+            batch.site_id = site.into();
+            for camera in &mut batch.cameras {
+                camera.site_id = site.into();
+            }
+            state
+                .store
+                .upsert_fleet_identity(&batch, Utc::now())
+                .await
+                .unwrap();
+            state
+                .camera_batches
+                .write()
+                .await
+                .insert(gateway.to_string(), batch);
+        }
+        let (status, _) = send(
+            &state,
+            with_cookie(
+                post(
+                    "/api/v1/users",
+                    None,
+                    serde_json::json!({
+                        "email": "customer@example.test",
+                        "password": "a perfectly good passphrase",
+                        "role": "viewer",
+                        "customer_id": "cust-1",
+                    }),
+                ),
+                &owner,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let customer = cookie_for(
+            &state,
+            "customer@example.test",
+            "a perfectly good passphrase",
+        )
+        .await;
+        let live = serde_json::json!({ "offer_sdp": "v=0\r\n", "session_seconds": 30 });
+
+        let (status, accepted) = send(
+            &state,
+            with_cookie(
+                post("/api/v1/cameras/cam-1/live", None, live.clone()),
+                &customer,
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "a customer watches their own camera"
+        );
+        let own = accepted["command_id"].as_str().unwrap().to_string();
+        let (status, _) = send(
+            &state,
+            with_cookie(get(&format!("/api/v1/commands/{own}")), &customer),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "and reads the answer to it");
+
+        let (status, _) = send(
+            &state,
+            with_cookie(
+                post("/api/v1/cameras/cam-2/live", None, live.clone()),
+                &customer,
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "another customer's camera does not exist for them"
+        );
+
+        let (_, accepted) = send(
+            &state,
+            with_cookie(
+                post("/api/v1/cameras/cam-2/live", None, live.clone()),
+                &owner,
+            ),
+        )
+        .await;
+        let theirs = accepted["command_id"].as_str().unwrap().to_string();
+        let (status, _) = send(
+            &state,
+            with_cookie(get(&format!("/api/v1/commands/{theirs}")), &customer),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "another customer's live answer is not theirs to read"
+        );
+
+        // A viewer with no customer sees the whole fleet, and watches it.
+        let viewer = user_cookie(&state, "viewer").await;
+        let (status, _) = send(
+            &state,
+            with_cookie(post("/api/v1/cameras/cam-2/live", None, live), &viewer),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
     }
 
     #[tokio::test]
